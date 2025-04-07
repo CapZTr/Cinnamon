@@ -10,6 +10,8 @@
 #include "cinm-mlir/Conversion/MemristorPasses.h"
 #include "cinm-mlir/Conversion/UPMEMPasses.h"
 #include "cinm-mlir/Conversion/UPMEMToLLVM/UPMEMToLLVM.h"
+#include "cinm-mlir/Dialect/Bits/IR/BitsBase.h"
+#include "cinm-mlir/Dialect/Bits/IR/BitsDialect.h"
 #include "cinm-mlir/Dialect/Cim/IR/CimDialect.h"
 #include "cinm-mlir/Dialect/Cim/Transforms/Passes.h"
 #include "cinm-mlir/Dialect/Cinm/IR/CinmDialect.h"
@@ -42,7 +44,8 @@ int main(int argc, char *argv[]) {
   DialectRegistry registry;
   registerAllDialects(registry);
 
-  registry.insert<cinm::CinmDialect,           //
+  registry.insert<mlir::bits::BitsDialect,     //
+                  cinm::CinmDialect,           //
                   cim::CimDialect,             //
                   cnm::CnmDialect,             //
                   memristor::MemristorDialect, //

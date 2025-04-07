@@ -13,6 +13,10 @@ project(cinm-mlir
     LANGUAGES   C CXX
 )
 
+# === Mockturtle integration ===
+set(MOCKTURTLE_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/extern/mockturtle/include)
+include_directories(${MOCKTURTLE_INCLUDE_DIR})
+
 option(CINM_BUILD_GPU_SUPPORT "Enable vulkan runner and GPU libs" OFF)
 option(TORCH_MLIR_DIR "Directory of the Torch-MLIR installation" "")
 option(UPMEM_DIR "Directory of the UPMEM installation" "")
@@ -101,6 +105,7 @@ add_subdirectory(include)
 add_subdirectory(lib)
 add_subdirectory(test)
 add_subdirectory(tools)
+add_subdirectory(extern/mockturtle)
 
 if (TORCH_MLIR_DIR)
     set_property(GLOBAL PROPERTY TORCH_MLIR_ENABLED ON)
