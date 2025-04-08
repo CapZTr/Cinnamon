@@ -30,8 +30,8 @@ private:
   llvm::DenseMap<BitplaneData, std::vector<MIG::signal>> migSignalMap;
 
   void buildInputs(const BitplaneData &data);
-  std::vector<AIG::signal> buildAddInAIG(const AddData &add);
-  std::vector<MIG::signal> buildAddInMIG(const AddData &add);
+  void buildAdd(const BitplaneData &lhs, const BitplaneData &rhs, const BitplaneData &result);
+  void buildSub(const BitplaneData &lhs, const BitplaneData &rhs, const BitplaneData &result);
   void buildOutputs(const BitplaneData &output);
   std::pair<MIG::signal, MIG::signal> createFullAdderInMIG(const MIG::signal a, const MIG::signal b, const MIG::signal cin);
 };

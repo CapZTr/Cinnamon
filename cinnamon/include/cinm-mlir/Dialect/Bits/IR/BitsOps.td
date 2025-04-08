@@ -36,4 +36,15 @@ def AddOp : Bits_Op<"add", [Pure, Commutative]> {
   let hasVerifier = 1;
 }
 
+def SubOp : Bits_Op<"sub", [Pure]> {
+  let summary = "Bit-serial subtraction of two slice operands.";
+  let description = [{}];
+
+  let arguments = (ins SliceType:$lhs, SliceType:$rhs);
+  let results = (outs SliceType:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs) `->` type($result)";
+  let hasVerifier = 1;
+}
+
 #endif

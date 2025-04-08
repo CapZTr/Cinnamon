@@ -23,8 +23,12 @@ module {
     %sa = bits.transpose %a : tensor<64xi32> -> !bits.slice<32x64>
     %sb = bits.transpose %b : tensor<64xi32> -> !bits.slice<32x64>
 
-    %sum = bits.add %sa, %sb : !bits.slice<32x64>, !bits.slice<32x64> -> !bits.slice<32x64>
+    %sum1 = bits.add %sa, %sb : !bits.slice<32x64>, !bits.slice<32x64> -> !bits.slice<32x64>
 
-    return %sum : !bits.slice<32x64>
+    %sum2 = bits.sub %sa, %sb : !bits.slice<32x64>, !bits.slice<32x64> -> !bits.slice<32x64>
+
+    %sum3 = bits.add %sum1, %sum2 : !bits.slice<32x64>, !bits.slice<32x64> -> !bits.slice<32x64>
+
+    return %sum3 : !bits.slice<32x64>
   }
 }
