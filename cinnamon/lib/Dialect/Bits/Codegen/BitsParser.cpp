@@ -1,21 +1,18 @@
 #include "cinm-mlir/Dialect/Bits/Codegen/BitsParser.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
-#include <llvm/ADT/DenseMap.h>
+
 #include <llvm/ADT/DenseSet.h>
-#include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/raw_ostream.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
-#include <mlir/IR/BuiltinOps.h>
-#include <mlir/IR/Value.h>
-
+#include <mlir/IR/Diagnostics.h>
 
 using namespace mlir;
 using namespace mlir::bits;
 
 BitsParser::BitsParser(ModuleOp module) : module(module) {}
 
-void BitsParser::parse() {
+LogicalResult BitsParser::parse() {
   SmallVector<Operation*, 16> pendingBinaryOps;
   llvm::SmallDenseSet<Value, 16> unusedSlices;
 
@@ -35,7 +32,10 @@ void BitsParser::parse() {
 
     for (auto it = pendingBinaryOps.begin(); it != pendingBinaryOps.end();) {
       if (operandsParsed(*it)) {
-        parseBinaryOp(*it);
+        if (failed(parseBinaryOp(*it))) {
+          emitError((*it)->getLoc(), "BitsParser: Failed to parse the binary op.");
+          return failure();
+        }
         it = pendingBinaryOps.erase(it);
         progress = true;
         for (const auto slice : (*it)->getOperands()) {
@@ -49,6 +49,7 @@ void BitsParser::parse() {
 
   if (!pendingBinaryOps.empty()) {
     llvm::errs() << "BitsParser: Some binary ops could not be parsed due to missing operands.\n";
+    return failure();
   }
 
   module->walk([&](func::FuncOp funcOp){
@@ -64,6 +65,8 @@ void BitsParser::parse() {
       }
     });
   });
+
+  return success();
 }
 
 void BitsParser::parseTranspose(TransposeOp op) {
@@ -79,29 +82,7 @@ void BitsParser::parseTranspose(TransposeOp op) {
   inputs[input] = data;
 }
 
-void BitsParser::parseAdd(AddOp op) {
-  auto lhsData = parsed.lookup(op.getLhs());
-  auto rhsData = parsed.lookup(op.getRhs());
-
-  auto result = op.getResult();
-  auto type = dyn_cast<SliceType>(result.getType());
-  auto resultData = BitplaneData{type.getBitWidth(), type.getVectorLength(), result};
-
-  parsed[result] = resultData;
-  const BinaryOpData addData = BinaryOpData{lhsData, rhsData, resultData};
-  binaryOps.push_back(addData);
-  adds.push_back(addData);
-}
-
-void BitsParser::parseBinaryOp(Operation *op) {
-  // auto binaryOp = llvm::dyn_cast<AddOp>(*op);
-  // if (!binaryOp) binaryOp = llvm::dyn_cast<SubOp>(*op);
-
-  // if (!binaryOp) {
-  //   llvm::errs() << "BitsParser: Unknown type of binary operation.\n";
-  //   return;
-  // }
-
+LogicalResult BitsParser::parseBinaryOp(Operation *op) {
   auto lhsData = parsed.lookup(op->getOperand(0));
   auto rhsData = parsed.lookup(op->getOperand(1));
 
@@ -118,22 +99,10 @@ void BitsParser::parseBinaryOp(Operation *op) {
   } else if (auto sub = dyn_cast<SubOp>(*op)) {
     subs.push_back(data);
   } else {
-    llvm::errs() << "BitsParser: Unknown type of binary operation.\n";
+    emitError(op->getLoc(), "BitsParser: Unknown type of binary operation.");
+    return failure();
   }
-}
-
-void BitsParser::parseSub(SubOp op) {
-  auto lhsData = parsed.lookup(op.getLhs());
-  auto rhsData = parsed.lookup(op.getRhs());
-
-  auto result = op.getResult();
-  auto type = dyn_cast<SliceType>(result.getType());
-  auto resultData = BitplaneData{type.getBitWidth(), type.getVectorLength(), result};
-
-  parsed[result] = resultData;
-  const BinaryOpData subData = BinaryOpData{lhsData, rhsData, resultData};
-  binaryOps.push_back(subData);
-  subs.push_back(subData);
+  return success();
 }
 
 bool BitsParser::operandsParsed(Operation *op) const {

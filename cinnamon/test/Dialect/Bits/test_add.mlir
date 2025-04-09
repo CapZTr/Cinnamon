@@ -8,6 +8,7 @@ module {
     %input3 = bits.transpose %arg3 : tensor<64xi32> -> !bits.slice<32x64>
     %result = bits.sub %sum2, %input3 : !bits.slice<32x64>, !bits.slice<32x64> -> !bits.slice<32x64>
 
+    // return %sum1 : !bits.slice<32x64>
     return %result : !bits.slice<32x64>
   }
 }

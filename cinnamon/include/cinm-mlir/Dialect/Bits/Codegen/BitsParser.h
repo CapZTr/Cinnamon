@@ -3,10 +3,10 @@
 
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/Hashing.h"
-#include "mlir/IR/BuiltinAttributes.h"
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/Hashing.h>
 #include <llvm/ADT/SmallVector.h>
+#include <mlir/IR/BuiltinAttributes.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/Value.h>
 
@@ -36,7 +36,7 @@ class BitsParser {
 public:
   explicit BitsParser(ModuleOp module);
 
-  void parse();
+  LogicalResult parse();
 
   const llvm::DenseMap<Value, BitplaneData> &getParsed() const { return parsed; }
   const llvm::DenseMap<Value, BitplaneData> &getInputs() const { return inputs; }
@@ -55,9 +55,7 @@ private:
   llvm::SmallVector<BinaryOpData, 4> subs;
 
   void parseTranspose(TransposeOp op);
-  void parseAdd(AddOp op);
-  void parseSub(SubOp op);
-  void parseBinaryOp(Operation *op);
+  LogicalResult parseBinaryOp(Operation *op);
   bool operandsParsed(Operation *op) const;
 };
 
@@ -67,11 +65,11 @@ namespace llvm {
 template <>
 struct DenseMapInfo<mlir::bits::BitplaneData> {
   static inline mlir::bits::BitplaneData getEmptyKey() {
-    return {~0LL - 1, ~0LL - 1, mlir::Value::getFromOpaquePointer((void*) - 1)};
+    return {~0LL - 1, ~0LL - 1, mlir::Value::getFromOpaquePointer((LogicalResult*) - 1)};
   }
 
   static inline mlir::bits::BitplaneData getTombstoneKey() {
-    return {~0LL - 2, ~0LL - 2, mlir::Value::getFromOpaquePointer((void*) - 2)};
+    return {~0LL - 2, ~0LL - 2, mlir::Value::getFromOpaquePointer((LogicalResult*) - 2)};
   }
 
   static unsigned getHashValue(const mlir::bits::BitplaneData &val) {

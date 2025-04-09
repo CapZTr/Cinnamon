@@ -6,9 +6,9 @@
 #include "mockturtle/networks/mig.hpp"
 
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/Support/LogicalResult.h>
+#include <mlir/IR/BuiltinOps.h>
 #include <string>
-#include <utility>
-#include <vector>
 
 using AIG = mockturtle::aig_network;
 using MIG = mockturtle::mig_network;
@@ -17,23 +17,19 @@ namespace mlir::bits {
 
 class NetworkBuilder {
 public:
-
   explicit NetworkBuilder(ModuleOp module);
 
-  void build(const std::string &filePathAig, const std::string &filePathMig);
+  LogicalResult build(const std::string &filePathAig, const std::string &filePathMig);
 
 private:
   BitsParser parser;
   AIG aig;
   MIG mig;
-  llvm::DenseMap<BitplaneData, std::vector<AIG::signal>> aigSignalMap;
-  llvm::DenseMap<BitplaneData, std::vector<MIG::signal>> migSignalMap;
+  llvm::DenseMap<BitplaneData, AIG::signal> aigSignalMap;
+  llvm::DenseMap<BitplaneData, MIG::signal> migSignalMap;
 
-  void buildInputs(const BitplaneData &data);
   void buildAdd(const BitplaneData &lhs, const BitplaneData &rhs, const BitplaneData &result);
   void buildSub(const BitplaneData &lhs, const BitplaneData &rhs, const BitplaneData &result);
-  void buildOutputs(const BitplaneData &output);
-  std::pair<MIG::signal, MIG::signal> createFullAdderInMIG(const MIG::signal a, const MIG::signal b, const MIG::signal cin);
 };
 
 } // namespace mlir::bits
