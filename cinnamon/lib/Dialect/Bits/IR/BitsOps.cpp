@@ -5,7 +5,10 @@
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 
+#include <llvm/Support/LogicalResult.h>
 #include <mlir/IR/BuiltinTypes.h>
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/Operation.h"
 #include <mlir/IR/OpImplementation.h>
 #include <mlir/Support/LogicalResult.h>
 
@@ -69,6 +72,16 @@ void BitsDialect::registerOps() {
   return success();
 }
 
+::mlir::LogicalResult AddBitOp::verify() {
+  auto lhsTy = cast<BitType>(getLhs().getType());
+  auto rhsTy = cast<BitType>(getRhs().getType());
+
+  if (!lhsTy || !rhsTy)
+    return emitOpError("all operands must be of bits.bit type");
+
+  return mlir::success();
+}
+
 ::mlir::LogicalResult SubOp::verify() {
   auto lhsType = cast<SliceType>(getLhs().getType());
   auto rhsType = cast<SliceType>(getRhs().getType());
@@ -84,4 +97,34 @@ void BitsDialect::registerOps() {
     return emitOpError("vector lengths of operands and result must match");
 
   return success();
+}
+
+::mlir::LogicalResult ExtractOp::verify() {
+  auto sliceType = cast<SliceType>(getSlice().getType());
+  if (!sliceType)
+    return emitOpError("slice must be bits.slice type");
+
+  if (!getBitIndex().getType().isInteger(64))
+    return emitOpError("bitIndex must be i64");
+  if (!getVectorIndex().getType().isInteger(64))
+    return emitOpError("vectorIndex must be i64");
+
+  return mlir::success();
+}
+
+::mlir::LogicalResult InsertOp::verify() {
+  auto sliceType = cast<SliceType>(getSlice().getType());
+  if (!sliceType)
+    return emitOpError("slice must be bits.slice type");
+
+  auto bitType = cast<BitType>(getBit().getType());
+  if (!bitType)
+    return emitOpError("bit must be bits.bit type");
+
+  if (!getBitIndex().getType().isInteger(64))
+    return emitOpError("bitIndex must be i64");
+  if (!getVectorIndex().getType().isInteger(64))
+    return emitOpError("vectorIndex must be i64");
+
+  return mlir::success();
 }

@@ -24,8 +24,6 @@ LogicalResult NetworkBuilder::build(const std::string &filePathAig, const std::s
     migSignalMap[data] = mig.create_pi();
   }
 
-  std::vector<AIG::signal> aigOutputs;
-  std::vector<MIG::signal> migOutputs;
   const auto adds = parser.getAdds();
   const auto subs = parser.getSubs();
   for (const auto &op : parser.getBinaryOps()) {

@@ -11,6 +11,7 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include <cstdint>
 #include <mlir/Analysis/Presburger/IntegerRelation.h>
+#include <mlir/IR/Types.h>
 
 #define DEBUG_TYPE "bits-types"
 

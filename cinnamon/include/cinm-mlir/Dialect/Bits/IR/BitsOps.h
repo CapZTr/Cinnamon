@@ -6,6 +6,10 @@
 
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/OpImplementation.h"
+#include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 //===- Generated includes -------------------------------------------------===//

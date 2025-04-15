@@ -17,4 +17,9 @@ def SliceType : Bits_Type<"Slice"> {
   let hasCustomAssemblyFormat = 1;
 }
 
+def BitType : Bits_Type<"Bit"> {
+  let mnemonic = "bit";
+  let summary = "Represents a single bit within a bit-slice";
+}
+
 #endif

@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "cinm-mlir/Dialect/Bits/IR/BitsBase.h"
+
 #include "cinm-mlir/Dialect/Bits/IR/BitsAttributes.h"
 
 

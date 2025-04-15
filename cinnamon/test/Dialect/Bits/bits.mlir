@@ -1,5 +1,9 @@
 module {
   func.func @add_slices() -> !bits.slice<32x64> {
+    %bw = arith.constant 32 : i64
+    %vl = arith.constant 64 : i64
+    %bi = arith.constant 0 : i64
+    %vi = arith.constant 1 : i64
     %a = arith.constant dense<[0, 1, 2, 3, 4, 5, 6, 7,
                                8, 9, 10, 11, 12, 13, 14, 15,
                                16, 17, 18, 19, 20, 21, 22, 23,
@@ -22,6 +26,14 @@ module {
 
     %sa = bits.transpose %a : tensor<64xi32> -> !bits.slice<32x64>
     %sb = bits.transpose %b : tensor<64xi32> -> !bits.slice<32x64>
+    %sc = bits.create_slice %bw, %vl : i64, i64 -> !bits.slice<32x64>
+    %ba = bits.extract %sa[%bi, %vi] : !bits.slice<32x64>, i64, i64 -> !bits.bit
+    %bb = bits.extract %sb[%bi, %vi] : !bits.slice<32x64>, i64, i64 -> !bits.bit
+    %bc = bits.create_bit : !bits.bit
+
+    %sum_bit, %cout = bits.add_bit %ba, %bb, %bc : !bits.bit, !bits.bit, !bits.bit -> !bits.bit, !bits.bit
+
+    %sd = bits.insert %sum_bit -> %sc[%bi, %vi] : !bits.bit, !bits.slice<32x64>, i64, i64 -> !bits.slice<32x64>
 
     %sum1 = bits.add %sa, %sb : !bits.slice<32x64>, !bits.slice<32x64> -> !bits.slice<32x64>
 
