@@ -12,6 +12,7 @@
 #include "cinm-mlir/Conversion/UPMEMToLLVM/UPMEMToLLVM.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsBase.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsDialect.h"
+#include "cinm-mlir/Dialect/Bits/Transforms/Passes.h"
 #include "cinm-mlir/Dialect/Cim/IR/CimDialect.h"
 #include "cinm-mlir/Dialect/Cim/Transforms/Passes.h"
 #include "cinm-mlir/Dialect/Cinm/IR/CinmDialect.h"
@@ -65,6 +66,7 @@ int main(int argc, char *argv[]) {
   registerCimConversionPasses();
   registerCnmConversionPasses();
   registerMemristorConversionPasses();
+  mlir::bits::registerBitsTransformsPasses();
   cim::registerCimTransformsPasses();
   cnm::registerCnmBufferizationExternalModels(registry);
   cnm::registerCnmTransformsPasses();

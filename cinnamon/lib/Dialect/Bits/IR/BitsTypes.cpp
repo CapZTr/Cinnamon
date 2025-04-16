@@ -9,8 +9,6 @@
 #include "mlir/IR/OpImplementation.h"
 
 #include "llvm/ADT/TypeSwitch.h"
-#include <cstdint>
-#include <mlir/Analysis/Presburger/IntegerRelation.h>
 #include <mlir/IR/Types.h>
 
 #define DEBUG_TYPE "bits-types"
@@ -36,7 +34,7 @@ void BitsDialect::registerTypes() {
         >();
 }
 
-Type mlir::bits::SliceType::parse(mlir::AsmParser &parser) {
+Type SliceType::parse(AsmParser &parser) {
   SmallVector<int64_t> shape;
 
   if (parser.parseLess() ||
@@ -45,9 +43,9 @@ Type mlir::bits::SliceType::parse(mlir::AsmParser &parser) {
     return Type();
   }
 
-  return bits::SliceType::get(parser.getContext(), shape.front(), shape.back());
+  return SliceType::get(parser.getContext(), shape.front(), shape.back());
 }
 
-void mlir::bits::SliceType::print(mlir::AsmPrinter &printer) const {
+void SliceType::print(mlir::AsmPrinter &printer) const {
   printer << "<" << getBitWidth() << "x" << getVectorLength() << ">";
 }
