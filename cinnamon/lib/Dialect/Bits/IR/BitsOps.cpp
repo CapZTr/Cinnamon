@@ -7,8 +7,8 @@
 
 #include <llvm/Support/LogicalResult.h>
 #include <mlir/IR/BuiltinTypes.h>
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/Operation.h"
+#include <mlir/IR/Builders.h>
+#include <mlir/IR/Operation.h>
 #include <mlir/IR/OpImplementation.h>
 #include <mlir/Support/LogicalResult.h>
 
@@ -33,7 +33,7 @@ void BitsDialect::registerOps() {
       >();
 }
 
-::mlir::LogicalResult TransposeOp::verify() {
+LogicalResult TransposeOp::verify() {
   auto inputType = cast<RankedTensorType>(getInput().getType());
   if (!inputType || inputType.getRank() != 1)
     return emitOpError("input must be a 1D ranked tensor");
@@ -47,7 +47,7 @@ void BitsDialect::registerOps() {
     return emitOpError("output must be of SliceType");
 
   if (outputType.getBitWidth() != elemType.getWidth())
-    return emitOpError("bit width mismatch between input element type and output slice");
+    return emitOpError("bit width mismatch between input tensor element and output slice");
 
   if (outputType.getVectorLength() != inputType.getDimSize(0))
     return emitOpError("vector length mismatch between input and output");
@@ -55,7 +55,26 @@ void BitsDialect::registerOps() {
   return success();
 }
 
-::mlir::LogicalResult AddOp::verify() {
+LogicalResult AssembleOp::verify() {
+  auto inputType = cast<SliceType>(getInput().getType());
+  if (!inputType)
+    return emitOpError("input must be of SliceType");
+
+  auto outputType = cast<RankedTensorType>(getOutput().getType());
+  if (!outputType || outputType.getRank() != 1)
+    return emitOpError("output must be a 1D ranked tensor");
+
+  auto elemType = cast<IntegerType>(outputType.getElementType());
+  if (inputType.getBitWidth() != elemType.getWidth())
+    return emitOpError("bit width mismatch between input slice and output tensor element");
+
+  if (inputType.getVectorLength() != outputType.getDimSize(0))
+    return emitOpError("vector length mismatch between input and output");
+
+  return success();
+}
+
+LogicalResult AddOp::verify() {
   auto lhsType = cast<SliceType>(getLhs().getType());
   auto rhsType = cast<SliceType>(getRhs().getType());
   auto resType = cast<SliceType>(getResult().getType());
@@ -72,7 +91,7 @@ void BitsDialect::registerOps() {
   return success();
 }
 
-::mlir::LogicalResult AddBitOp::verify() {
+LogicalResult AddBitOp::verify() {
   auto lhsTy = cast<BitType>(getLhs().getType());
   auto rhsTy = cast<BitType>(getRhs().getType());
 
@@ -82,7 +101,7 @@ void BitsDialect::registerOps() {
   return mlir::success();
 }
 
-::mlir::LogicalResult SubOp::verify() {
+LogicalResult SubOp::verify() {
   auto lhsType = cast<SliceType>(getLhs().getType());
   auto rhsType = cast<SliceType>(getRhs().getType());
   auto resType = cast<SliceType>(getResult().getType());
@@ -99,7 +118,7 @@ void BitsDialect::registerOps() {
   return success();
 }
 
-::mlir::LogicalResult ExtractOp::verify() {
+LogicalResult ExtractOp::verify() {
   auto sliceType = cast<SliceType>(getSlice().getType());
   if (!sliceType)
     return emitOpError("slice must be bits.slice type");
@@ -112,7 +131,7 @@ void BitsDialect::registerOps() {
   return mlir::success();
 }
 
-::mlir::LogicalResult InsertOp::verify() {
+LogicalResult InsertOp::verify() {
   auto sliceType = cast<SliceType>(getSlice().getType());
   if (!sliceType)
     return emitOpError("slice must be bits.slice type");

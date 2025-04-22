@@ -27,8 +27,19 @@ def TransposeOp : Bits_Op<"transpose", [Pure]> {
   let hasVerifier = 1;
 }
 
+def AssembleOp : Bits_Op<"assemble", [Pure]> {
+  let summary = "Assemble a bit-slice to 1-D tensor";
+  let description = [{}];
+
+  let arguments = (ins SliceType:$input);
+  let results = (outs TensorOf<[AnySignlessInteger]>:$output);
+
+  let assemblyFormat = "$input attr-dict `:` qualified(type($input)) `->` type($output)";
+  let hasVerifier = 1;
+}
+
 def AddOp : Bits_Op<"add", [Pure, Commutative]> {
-  let summary = "Bit-serial addition of two slice operands.";
+  let summary = "Bit-serial addition of two slice operands";
   let description = [{}];
 
   let arguments = (ins SliceType:$lhs, SliceType:$rhs);
@@ -39,7 +50,7 @@ def AddOp : Bits_Op<"add", [Pure, Commutative]> {
 }
 
 def AddBitOp : Bits_Op<"add_bit", [Pure]> {
-  let summary = "Bitwise addition of two single bits.";
+  let summary = "Bitwise addition of two single bits";
   let description = [{}];
 
   let arguments = (ins BitType:$lhs, BitType:$rhs, BitType:$cin);
@@ -51,7 +62,7 @@ def AddBitOp : Bits_Op<"add_bit", [Pure]> {
 }
 
 def SubOp : Bits_Op<"sub", [Pure]> {
-  let summary = "Bit-serial subtraction of two slice operands.";
+  let summary = "Bit-serial subtraction of two slice operands";
   let description = [{}];
 
   let arguments = (ins SliceType:$lhs, SliceType:$rhs);
@@ -62,7 +73,7 @@ def SubOp : Bits_Op<"sub", [Pure]> {
 }
 
 def ExtractOp : Bits_Op<"extract", [Pure]> {
-  let summary = "Extract a single bit from a bit-slice.";
+  let summary = "Extract a single bit from a bit-slice";
   let description = [{}];
 
   let arguments = (ins SliceType:$slice, I64:$bitIndex, I64:$vectorIndex);

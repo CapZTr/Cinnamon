@@ -9,8 +9,8 @@
 
 include "mlir/Pass/PassBase.td"
 
-def BitsLowerArithPass: Pass<"bits-lower-arith"> {
-  let summary = "Lower arithmetic operations on slice-level to bit-level.";
+def BitsLowerArithPass: Pass<"bits-lower-arith", operation="mlir::func::FuncOp"> {
+  let summary = "Lower arithmetic operations on slice-level to bit-level";
   let description = [{}];
 
   let dependentDialects = [

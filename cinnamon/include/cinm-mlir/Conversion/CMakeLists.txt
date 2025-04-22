@@ -7,6 +7,12 @@ add_public_tablegen_target(CinmFrontendConversionPassIncGen)
 
 add_mlir_doc(CinmFrontendPasses CinmFrontendConversionPasses ./ -gen-pass-doc)
 
+set(LLVM_TARGET_DEFINITIONS BitsFrontendPasses.td)
+mlir_tablegen(BitsFrontendPasses.h.inc -gen-pass-decls -name BitsFrontendConversion ${TBLGEN_EXTRA})
+add_public_tablegen_target(BitsFrontendConversionPassIncGen)
+
+add_mlir_doc(BitsFrontendPasses BitsFrontendConversionPasses ./ -gen-pass-doc)
+
 set(LLVM_TARGET_DEFINITIONS CinmPasses.td)
 mlir_tablegen(CinmPasses.h.inc -gen-pass-decls -name CinmConversion ${TBLGEN_EXTRA})
 add_public_tablegen_target(CinmConversionPassIncGen)
