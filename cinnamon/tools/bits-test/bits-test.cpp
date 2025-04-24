@@ -2,18 +2,19 @@
 
 #include <mlir/IR/DialectRegistry.h>
 #include <mlir/InitAllExtensions.h>
-#include "mlir/IR/MLIRContext.h"
-#include "mlir/InitAllDialects.h"
-#include "mlir/Parser/Parser.h"
-#include "mlir/Support/FileUtilities.h"
+#include <mlir/IR/MLIRContext.h>
+#include <mlir/InitAllDialects.h>
+#include <mlir/Parser/Parser.h>
+#include <mlir/Support/FileUtilities.h>
 
-#include "llvm/Support/SourceMgr.h"
+#include <llvm/Support/SourceMgr.h>
 #include <iostream>
 
+using namespace mlir;
+
 int main(int argc, char **argv) {
-  mlir::MLIRContext context;
-  // context.loadDialect<mlir::bits::BitsDialect>();
-  mlir::DialectRegistry registry;
+  MLIRContext context;
+  DialectRegistry registry;
   registerAllDialects(registry);
   registry.insert<mlir::bits::BitsDialect>();
   context.appendDialectRegistry(registry);

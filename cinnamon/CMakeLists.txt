@@ -13,9 +13,11 @@ project(cinm-mlir
     LANGUAGES   C CXX
 )
 
-# === Mockturtle integration ===
-set(MOCKTURTLE_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/extern/mockturtle/include)
-include_directories(${MOCKTURTLE_INCLUDE_DIR})
+# ========== lime integration ==========
+set(MOCKTURTLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(MOCKTURTLE_TEST OFF CACHE BOOL "" FORCE)
+set(MOCKTURTLE_EXPERIMENTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(${CMAKE_SOURCE_DIR}/extern/lime)
 
 option(CINM_BUILD_GPU_SUPPORT "Enable vulkan runner and GPU libs" OFF)
 option(TORCH_MLIR_DIR "Directory of the Torch-MLIR installation" "")
@@ -105,7 +107,6 @@ add_subdirectory(include)
 add_subdirectory(lib)
 add_subdirectory(test)
 add_subdirectory(tools)
-add_subdirectory(extern/mockturtle)
 
 if (TORCH_MLIR_DIR)
     set_property(GLOBAL PROPERTY TORCH_MLIR_ENABLED ON)

@@ -1,8 +1,8 @@
 #include "cinm-mlir/Dialect/Bits/Codegen/NetworkBuilder.h"
 
-#include "mockturtle/io/write_aiger.hpp"
-#include "mockturtle/algorithms/cleanup.hpp"
-#include "mockturtle/generators/arithmetic.hpp"
+#include <mockturtle/io/write_aiger.hpp>
+#include <mockturtle/algorithms/cleanup.hpp>
+#include <mockturtle/generators/arithmetic.hpp>
 #include <cassert>
 #include <llvm/ADT/STLExtras.h>
 

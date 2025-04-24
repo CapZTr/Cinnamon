@@ -26,3 +26,6 @@ llvm
 sandbox
 
 python/cinnamon/_resources
+
+# Hide lime temporarily
+/extern/*
