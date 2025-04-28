@@ -20,7 +20,7 @@ LogicalResult BitsParser::parse() {
     if (auto transpose = dyn_cast<TransposeOp>(op)) {
       parseTranspose(transpose);
       unusedSlices.insert(transpose.getResult());
-    } else if (op->getNumOperands() == 2) {
+    } else if (auto add = dyn_cast<AddOp>(op)) {
       pendingBinaryOps.push_back(op);
       unusedSlices.insert(op->getResult(0));
     }
