@@ -1,31 +1,30 @@
 #include "cinm-mlir/Dialect/Bits/Codegen/NetworkBuilder.h"
 
-#include <mockturtle/io/write_aiger.hpp>
 #include <mockturtle/algorithms/cleanup.hpp>
 #include <mockturtle/generators/arithmetic.hpp>
 #include <cassert>
 #include <llvm/ADT/STLExtras.h>
+#include <optional>
+#include <utility>
 
 using namespace mlir;
 using namespace mlir::bits;
 
-using AIG = mockturtle::aig_network;
 using MIG = mockturtle::mig_network;
 
 NetworkBuilder::NetworkBuilder(ModuleOp module) : parser(module) {}
 
-LogicalResult NetworkBuilder::build(const std::string &filePathAig, const std::string &filePathMig) {
+std::optional<MIG> NetworkBuilder::build() {
   if (failed(parser.parse())) {
-    llvm::errs() << "NetworkBuilder: Failed to parse the module.";
-    return failure();
+    llvm::errs() << "NetworkBuilder: Failed to parse the module";
+    return std::nullopt;
   }
+
   for (auto &[val, data] : parser.getInputs()) {
-    aigSignalMap[data] = aig.create_pi();
-    migSignalMap[data] = mig.create_pi();
+    migSignalMap[data.slice] = mig.create_pi();
   }
 
   const auto adds = parser.getAdds();
-  const auto subs = parser.getSubs();
   for (const auto &op : parser.getBinaryOps()) {
     auto lhs = op.lhs;
     auto rhs = op.rhs;
@@ -36,66 +35,85 @@ LogicalResult NetworkBuilder::build(const std::string &filePathAig, const std::s
 
     if (llvm::is_contained(adds, op)) {
       buildAdd(lhs, rhs, result);
-    } else if (llvm::is_contained(subs, op)) {
-      buildSub(lhs, rhs, result);
     } else {
       llvm::errs() << "NetworkBuilder: Unknown type of binary operation.\n";
-      return failure();
+      return std::nullopt;
     }
   }
 
   for (const auto &entry : parser.getOutputs()) {
     auto data = entry.second;
-    aig.create_po(aigSignalMap.lookup(data));
-    mig.create_po(migSignalMap.lookup(data));
+    mig.create_po(migSignalMap.lookup(data.slice));
   }
 
-  auto cleanedAig = mockturtle::cleanup_dangling(aig);
-  mockturtle::write_aiger(cleanedAig, filePathAig);
-
   auto cleanedMig = mockturtle::cleanup_dangling(mig);
-  mockturtle::write_aiger(cleanedMig, filePathMig);
 
-  return success();
+  debugPrintMIGSignals();
+
+  return mig;
 }
 
 void NetworkBuilder::buildAdd(const BitplaneData &lhs, const BitplaneData &rhs, const BitplaneData &result) {
-  // AIG
-  auto aigLhsSignal = aigSignalMap.lookup(lhs);
-  auto aigRhsSignal = aigSignalMap.lookup(rhs);
-  AIG::signal aigCarry = aig.get_constant(false);
-
-  auto [as, ac] = mockturtle::full_adder(aig, aigLhsSignal, aigRhsSignal, aigCarry);
-  aigSignalMap[result] = as;
-
-  // MIG
-  auto migLhsSignal = migSignalMap.lookup(lhs);
-  auto migRhsSignal = migSignalMap.lookup(rhs);
+  auto migLhsSignal = migSignalMap.lookup(lhs.slice);
+  auto migRhsSignal = migSignalMap.lookup(rhs.slice);
   MIG::signal migCarry = mig.get_constant(false);
 
-  auto [ms, mc] = mockturtle::full_adder(mig, migLhsSignal, migRhsSignal, migCarry);
+  // auto [ms, mc] = mockturtle::full_adder(mig, migLhsSignal, migRhsSignal, migCarry);
+  auto [ms, mc] = createFullAdderInMIG(migLhsSignal, migRhsSignal, migCarry);
 
-  migSignalMap[result] = ms;
+  migSignalMap[result.slice] = ms;
 }
 
-void NetworkBuilder::buildSub(const BitplaneData &lhs, const BitplaneData &rhs, const BitplaneData &result) {
-  // AIG
-  auto aigLhsSignal = aigSignalMap.lookup(lhs);
-  auto aigRhsSignal = aigSignalMap.lookup(rhs);
-  AIG::signal aigCarry = aig.get_constant(true);
-  std::vector<AIG::signal> al = {aigLhsSignal};
-  std::vector<AIG::signal> ar = {aigRhsSignal};
-  mockturtle::carry_ripple_subtractor_inplace(aig, al, ar, aigCarry);
+std::pair<MIG::signal, MIG::signal> NetworkBuilder::createFullAdderInMIG(const MIG::signal a, const MIG::signal b, const MIG::signal cin) {
+  auto cout = mig.create_maj(a, b, cin);
+  auto maj = mig.create_maj(a, b, mig.create_not(cin));
+  auto sum = mig.create_maj(maj, cin, mig.create_not(cout));
 
-  aigSignalMap[result] = al[0];
+  return {sum, cout};
+}
 
-  // MIG
-  auto migLhsSignal = migSignalMap.lookup(lhs);
-  auto migRhsSignal = migSignalMap.lookup(rhs);
-  MIG::signal migCarry = mig.get_constant(true);
-  std::vector<MIG::signal> ml = {migLhsSignal};
-  std::vector<MIG::signal> mr = {migRhsSignal};
-  mockturtle::carry_ripple_subtractor_inplace(mig, ml, mr, migCarry);
+void NetworkBuilder::debugPrintMIGSignals(llvm::raw_ostream &os) {
+  os << "\n=== MIG Network Debug Info ===\n";
+  os << "Primary Inputs (PIs): " << mig.num_pis() << "\n";
+  os << "Primary Outputs (POs): " << mig.num_pos() << "\n";
+  os << "Gates: " << mig.num_gates() << "\n";
+  os << "Total Nodes: " << mig.size() << "\n\n";
 
-  migSignalMap[result] = ml[0];
+  os << "=== Input Signal Map ===\n";
+  for (auto &[val, data] : parser.getInputs()) {
+    auto sig = migSignalMap.lookup(data.slice);
+    os << "  Input " << val << " (Bitplane " << data.toString() 
+       << ") -> Node " << mig.get_node(sig) 
+       << (mig.is_complemented(sig) ? " (complemented)" : "") << "\n";
+  }
+
+  os << "\n=== Node Details ===\n";
+  mig.foreach_node([&](auto node) {
+    if (mig.is_constant(node) || mig.is_pi(node)) return;
+
+    os << "  Node " << node << ": ";
+    
+    if (mig.is_maj(node)) {
+      os << "MAJ( ";
+      mig.foreach_fanin(node, [&](auto const& fanin, auto i) {
+        if (i > 0) os << ", ";
+        os << mig.get_node(fanin) 
+           << (mig.is_complemented(fanin) ? "'" : "");
+      });
+      os << " )";
+    }
+    os << "\n";
+  });
+
+  os << "\n=== Output Signal Map ===\n";
+  for (const auto &entry : parser.getOutputs()) {
+    auto val = entry.first;
+    auto data = entry.second;
+    auto sig = migSignalMap.lookup(data.slice);
+    os << "  Output " << val << " (Bitplane " << data.toString() 
+       << ") -> Node " << mig.get_node(sig)
+       << (mig.is_complemented(sig) ? " (complemented)" : "") << "\n";
+  }
+
+  os << "===========================\n\n";
 }

@@ -19,4 +19,8 @@ def BitsLowerArithPass: Pass<"bits-lower-arith", operation="mlir::func::FuncOp">
   ];
 }
 
+def BitsLimeOptimizationPass: Pass<"bits-lime-opt", operation="mlir::func::FuncOp"> {
+  let summary = "Perform optimization in the logic network format by Lime";
+}
+
 #endif // BITS_TRANSFORM_PASSES
