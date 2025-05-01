@@ -21,7 +21,7 @@ std::optional<MIG> NetworkBuilder::build() {
   }
 
   for (auto &[val, data] : parser.getInputs()) {
-    migSignalMap[data.slice] = mig.create_pi();
+    migSignalMap[val] = mig.create_pi();
   }
 
   const auto adds = parser.getAdds();
@@ -30,8 +30,8 @@ std::optional<MIG> NetworkBuilder::build() {
     auto rhs = op.rhs;
     auto result = op.result;
 
-    assert(lhs.bitWidth == rhs.bitWidth && lhs.vectorLength == rhs.vectorLength &&
-           "NetworkBuilder: Operands must have the same shape");
+    assert(lhs.bitWidth == rhs.bitWidth && lhs.vectorLength == rhs.vectorLength
+        && "NetworkBuilder: Operands must have the same shape");
 
     if (llvm::is_contained(adds, op)) {
       buildAdd(lhs, rhs, result);
@@ -42,8 +42,8 @@ std::optional<MIG> NetworkBuilder::build() {
   }
 
   for (const auto &entry : parser.getOutputs()) {
-    auto data = entry.second;
-    mig.create_po(migSignalMap.lookup(data.slice));
+    // auto data = entry.second;
+    mig.create_po(migSignalMap.lookup(entry.first));
   }
 
   auto cleanedMig = mockturtle::cleanup_dangling(mig);
@@ -53,18 +53,20 @@ std::optional<MIG> NetworkBuilder::build() {
   return mig;
 }
 
-void NetworkBuilder::buildAdd(const BitplaneData &lhs, const BitplaneData &rhs, const BitplaneData &result) {
+void NetworkBuilder::buildAdd(const BitplaneData &lhs,
+                              const BitplaneData &rhs,
+                              const BitplaneData &result) {
   auto migLhsSignal = migSignalMap.lookup(lhs.slice);
   auto migRhsSignal = migSignalMap.lookup(rhs.slice);
   MIG::signal migCarry = mig.get_constant(false);
 
-  // auto [ms, mc] = mockturtle::full_adder(mig, migLhsSignal, migRhsSignal, migCarry);
   auto [ms, mc] = createFullAdderInMIG(migLhsSignal, migRhsSignal, migCarry);
 
   migSignalMap[result.slice] = ms;
 }
 
-std::pair<MIG::signal, MIG::signal> NetworkBuilder::createFullAdderInMIG(const MIG::signal a, const MIG::signal b, const MIG::signal cin) {
+std::pair<MIG::signal, MIG::signal> NetworkBuilder::createFullAdderInMIG(
+    const MIG::signal a, const MIG::signal b, const MIG::signal cin) {
   auto cout = mig.create_maj(a, b, cin);
   auto maj = mig.create_maj(a, b, mig.create_not(cin));
   auto sum = mig.create_maj(maj, cin, mig.create_not(cout));

@@ -13,7 +13,7 @@ project(cinm-mlir
     LANGUAGES   C CXX
 )
 
-# ========== lime integration ==========
+# ======== mockturtle & lime integration ========
 set(MOCKTURTLE_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(MOCKTURTLE_TEST OFF CACHE BOOL "" FORCE)
 set(MOCKTURTLE_EXPERIMENTS OFF CACHE BOOL "" FORCE)

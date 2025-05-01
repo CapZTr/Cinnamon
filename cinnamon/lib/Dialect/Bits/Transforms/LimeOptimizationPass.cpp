@@ -43,7 +43,9 @@ struct LimeOptimizationPass
     // std::cout << "num_pis: " << mig.num_pis() << "\n";
     // std::cout << "num_pos: " << mig.num_pos() << "\n";
 
-    ambit_compile_result result = eggmock::send_mig(mig, ambit_compile(ambit_compiler_settings{.print_program = true, .verbose = true}));
+    ambit_compile_result result = eggmock::send_mig(mig,
+        ambit_compile(ambit_compiler_settings{
+            .print_program = true, .verbose = true}));
 
     std::cout << "IC:" << result.instruction_count << std::endl;
     std::cout << "t1:" << result.t_runner << std::endl;
