@@ -1,4 +1,4 @@
-//===- Attributes.td - Bits dialect attributes --------*- tablegen -*-===//
+//===- Attributes.td - Bits dialect attributes -------------*- tablegen -*-===//
 //
 // This is the definitions file for the Bits dialect attributes.
 //

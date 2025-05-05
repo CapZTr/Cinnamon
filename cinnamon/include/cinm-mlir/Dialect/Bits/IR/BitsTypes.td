@@ -1,4 +1,4 @@
-//===- Types.td - Bits dialect types ------------------*- tablegen -*-===//
+//===- Types.td - Bits dialect types -----------------------*- tablegen -*-===//
 //
 // This is the definitions file for the Bits dialect types.
 //

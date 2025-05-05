@@ -1,4 +1,4 @@
-//===- Base.td - Bits dialect base ------------------------*- tablegen -*-===//
+//===- Base.td - Bits dialect base -------------------------*- tablegen -*-===//
 //
 // This is the definitions file for the Bits dialect base.
 //

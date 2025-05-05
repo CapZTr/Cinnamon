@@ -1,4 +1,4 @@
-//===- Ops.td - Bits dialect ops ----------------------*- tablegen -*-===//
+//===- Ops.td - Bits dialect ops ---------------------------*- tablegen -*-===//
 //
 // This is the definitions file for the Bits dialect ops.
 //
