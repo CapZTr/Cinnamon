@@ -13,9 +13,6 @@
 #include "ambit.h"
 #include "eggmock.h"
 
-#include <iostream>
-
-using AIG = mockturtle::aig_network;
 using MIG = mockturtle::mig_network;
 
 //===- Generated passes ---------------------------------------------------===//
@@ -36,14 +33,13 @@ struct LimeOptimizationPass
     }
     const auto mig = builder.getNetwork();
 
-    ambit_compile_result result = eggmock::send_mig(mig,
-        ambit_compile(ambit_compiler_settings{
+    NetworkBuilder::debugPrint(mig);
+
+    const auto optimized = eggmock::rewrite_mig(mig,
+        ambit_rewriter(ambit_compiler_settings{
             .print_program = true, .verbose = true}));
 
-    std::cout << "IC:" << result.instruction_count << std::endl;
-    std::cout << "t1:" << result.t_runner << std::endl;
-    std::cout << "t2:" << result.t_extractor << std::endl;
-    std::cout << "t3:" << result.t_compiler << std::endl;
+    NetworkBuilder::debugPrint(optimized);
   }
 };
 } // namespace mlir::bits

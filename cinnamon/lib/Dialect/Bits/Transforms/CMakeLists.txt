@@ -1,5 +1,5 @@
 add_mlir_dialect_library(BitsTransforms
-  LowerArithPass.cpp
+  SliceToBitPass.cpp
   LimeOptimizationPass.cpp
 
   DEPENDS

@@ -21,7 +21,7 @@
 
 //===- Generated passes ---------------------------------------------------===//
 
-#define GEN_PASS_DEF_BITSLOWERARITHPASS
+#define GEN_PASS_DEF_BITSSLICETOBITPASS
 #include "cinm-mlir/Dialect/Bits/Transforms/Passes.h.inc"
 
 //===----------------------------------------------------------------------===//
@@ -84,8 +84,8 @@ struct LowerAddOpPattern : public OpRewritePattern<AddOp> {
   }
 };
 
-struct BitsLowerArithPass 
-    : public ::impl::BitsLowerArithPassBase<BitsLowerArithPass> {
+struct BitsSliceToBitPass 
+    : public ::impl::BitsSliceToBitPassBase<BitsSliceToBitPass> {
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
     patterns.add<LowerAddOpPattern>(&getContext());
@@ -98,7 +98,7 @@ struct BitsLowerArithPass
 
 } // namespace mlir::bits
 
-std::unique_ptr<mlir::Pass> mlir::bits::createBitsLowerArithPass() {
-  return std::make_unique<BitsLowerArithPass>();
+std::unique_ptr<mlir::Pass> mlir::bits::createBitsSliceToBitPass() {
+  return std::make_unique<BitsSliceToBitPass>();
 }
 
