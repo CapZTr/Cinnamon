@@ -8,6 +8,8 @@
 #include <mlir/IR/Diagnostics.h>
 #include <mlir/IR/Value.h>
 
+#include <mockturtle/algorithms/cleanup.hpp>
+
 using namespace mlir;
 using namespace mlir::bits;
 
@@ -62,6 +64,8 @@ LogicalResult NetworkBuilder::build() {
   for (auto assemble : assembles) {
     mig.create_po(migSignalMap.lookup(assemble.getInput()));
   }
+
+  mig = mockturtle::cleanup_dangling(mig);
 
   debugPrint();
 
