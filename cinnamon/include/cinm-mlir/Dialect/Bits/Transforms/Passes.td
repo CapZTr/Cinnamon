@@ -14,8 +14,8 @@ def BitsSliceToBitPass: Pass<"bits-slice-to-bit", operation="mlir::func::FuncOp"
   let description = [{}];
 
   let dependentDialects = [
+    "mlir::affine::AffineDialect",
     "mlir::arith::ArithDialect",
-    "mlir::scf::SCFDialect",
   ];
 }
 

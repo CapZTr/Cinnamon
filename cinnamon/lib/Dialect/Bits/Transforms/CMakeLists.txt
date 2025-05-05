@@ -8,8 +8,8 @@ add_mlir_dialect_library(BitsTransforms
   
   LINK_LIBS PUBLIC
     MLIRIR
+    MLIRAffineDialect
     MLIRArithDialect
-    MLIRSCFDialect
 )
 
 target_include_directories(BitsTransforms PRIVATE
