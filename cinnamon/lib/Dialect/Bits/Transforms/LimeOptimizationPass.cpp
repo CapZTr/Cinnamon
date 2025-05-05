@@ -31,17 +31,10 @@ struct LimeOptimizationPass
     : public ::impl::BitsLimeOptimizationPassBase<LimeOptimizationPass> {
   void runOnOperation() override {
     NetworkBuilder builder(getOperation()->getParentOfType<ModuleOp>());
-
-    auto ntks = builder.build();
-    if (!ntks) {
+    if (failed(builder.build())) {
       signalPassFailure();
     }
-    auto mig = *ntks;
-
-    // std::cout << "MIG network created.\n";
-    // std::cout << "num_gates: " << mig.num_gates() << "\n";
-    // std::cout << "num_pis: " << mig.num_pis() << "\n";
-    // std::cout << "num_pos: " << mig.num_pos() << "\n";
+    const auto mig = builder.getNetwork();
 
     ambit_compile_result result = eggmock::send_mig(mig,
         ambit_compile(ambit_compiler_settings{

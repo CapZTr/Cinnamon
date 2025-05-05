@@ -1,80 +1,94 @@
 #include "cinm-mlir/Dialect/Bits/Codegen/NetworkBuilder.h"
+#include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 
-#include <mockturtle/algorithms/cleanup.hpp>
-#include <mockturtle/generators/arithmetic.hpp>
-#include <cassert>
-#include <llvm/ADT/STLExtras.h>
-#include <optional>
-#include <utility>
+#include <llvm/ADT/DenseSet.h>
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/Support/LogicalResult.h>
+#include <mlir/IR/BuiltinOps.h>
+#include <mlir/IR/Diagnostics.h>
+#include <mlir/IR/Value.h>
 
 using namespace mlir;
 using namespace mlir::bits;
 
 using MIG = mockturtle::mig_network;
 
-NetworkBuilder::NetworkBuilder(ModuleOp module) : parser(module) {}
+NetworkBuilder::NetworkBuilder(ModuleOp module) : module(module) {}
 
-std::optional<MIG> NetworkBuilder::build() {
-  if (failed(parser.parse())) {
-    llvm::errs() << "NetworkBuilder: Failed to parse the module";
-    return std::nullopt;
-  }
+LogicalResult NetworkBuilder::build() {
+  SmallVector<Operation *> pendingBinaryOps;
+  SmallVector<AssembleOp> assembles;
 
-  for (auto &[val, data] : parser.getInputs()) {
-    migSignalMap[val] = mig.create_pi();
-  }
+  module.walk([&](Operation *op) {
+    if (auto transpose = dyn_cast<TransposeOp>(op)) {
+      migSignalMap[transpose.getOutput()] = mig.create_pi();
+    } else if (auto add = dyn_cast<AddOp>(op)) {
+      if (operandsBuilt(op)) {
+        buildAdd(add);
+      } else {
+        pendingBinaryOps.push_back(op);
+      }
+    } else if (auto assemble = dyn_cast<AssembleOp>(op)) {
+      assembles.push_back(assemble);
+    }
+  });
 
-  const auto adds = parser.getAdds();
-  for (const auto &op : parser.getBinaryOps()) {
-    auto lhs = op.lhs;
-    auto rhs = op.rhs;
-    auto result = op.result;
+  bool progress = true;
+  while (progress && !pendingBinaryOps.empty()) {
+    progress = false;
 
-    assert(lhs.bitWidth == rhs.bitWidth && lhs.vectorLength == rhs.vectorLength
-        && "NetworkBuilder: Operands must have the same shape");
-
-    if (llvm::is_contained(adds, op)) {
-      buildAdd(lhs, rhs, result);
-    } else {
-      llvm::errs() << "NetworkBuilder: Unknown type of binary operation.\n";
-      return std::nullopt;
+    for (auto it = pendingBinaryOps.begin(); it != pendingBinaryOps.end();) {
+      if (operandsBuilt(*it)) {
+        if (auto add = dyn_cast<AddOp>(*it)) {
+          buildAdd(add);
+          it = pendingBinaryOps.erase(it);
+          progress = true;
+        } else {
+          emitError((*it)->getLoc(),
+                    "NetworkBuilder: Unsupported type of binary op");
+          return failure();
+        }
+      } else {
+        ++it;
+      }
     }
   }
 
-  for (const auto &entry : parser.getOutputs()) {
-    // auto data = entry.second;
-    mig.create_po(migSignalMap.lookup(entry.first));
+  if (!pendingBinaryOps.empty()) {
+    llvm::errs() << "NetworkBuilder: Some binary ops could not be parsed due to missing operands\n";
+    return failure();
   }
 
-  auto cleanedMig = mockturtle::cleanup_dangling(mig);
+  for (auto assemble : assembles) {
+    mig.create_po(migSignalMap.lookup(assemble.getInput()));
+  }
 
-  debugPrintMIGSignals();
+  debugPrint();
 
-  return mig;
+  return success();
 }
 
-void NetworkBuilder::buildAdd(const BitplaneData &lhs,
-                              const BitplaneData &rhs,
-                              const BitplaneData &result) {
-  auto migLhsSignal = migSignalMap.lookup(lhs.slice);
-  auto migRhsSignal = migSignalMap.lookup(rhs.slice);
-  MIG::signal migCarry = mig.get_constant(false);
+void NetworkBuilder::buildAdd(AddOp add) {
+  auto lhs = migSignalMap.lookup(add.getLhs());
+  auto rhs = migSignalMap.lookup(add.getRhs());
+  auto cin = mig.get_constant(false);
 
-  auto [ms, mc] = createFullAdderInMIG(migLhsSignal, migRhsSignal, migCarry);
-
-  migSignalMap[result.slice] = ms;
-}
-
-std::pair<MIG::signal, MIG::signal> NetworkBuilder::createFullAdderInMIG(
-    const MIG::signal a, const MIG::signal b, const MIG::signal cin) {
-  auto cout = mig.create_maj(a, b, cin);
-  auto maj = mig.create_maj(a, b, mig.create_not(cin));
+  auto cout = mig.create_maj(lhs, rhs, cin);
+  auto maj = mig.create_maj(lhs, rhs, mig.create_not(cin));
   auto sum = mig.create_maj(maj, cin, mig.create_not(cout));
 
-  return {sum, cout};
+  migSignalMap[add.getResult()] = sum;
 }
 
-void NetworkBuilder::debugPrintMIGSignals(llvm::raw_ostream &os) {
+bool NetworkBuilder::operandsBuilt(Operation *op) const {
+  for (auto operand : op->getOperands()) {
+    if (!migSignalMap.count(operand))
+      return false;
+  }
+  return true;
+}
+
+void NetworkBuilder::debugPrint(llvm::raw_ostream &os) {
   os << "\n=== MIG Network Debug Info ===\n";
   os << "Primary Inputs (PIs): " << mig.num_pis() << "\n";
   os << "Primary Outputs (POs): " << mig.num_pos() << "\n";
@@ -82,16 +96,13 @@ void NetworkBuilder::debugPrintMIGSignals(llvm::raw_ostream &os) {
   os << "Total Nodes: " << mig.size() << "\n\n";
 
   os << "=== Input Signal Map ===\n";
-  for (auto &[val, data] : parser.getInputs()) {
-    auto sig = migSignalMap.lookup(data.slice);
-    os << "  Input " << val << " (Bitplane " << data.toString() 
-       << ") -> Node " << mig.get_node(sig) 
-       << (mig.is_complemented(sig) ? " (complemented)" : "") << "\n";
-  }
+  mig.foreach_pi([&](auto input) {
+    os << "  Input: Node " << input << "\n";
+  });
 
   os << "\n=== Node Details ===\n";
   mig.foreach_node([&](auto node) {
-    if (mig.is_constant(node) || mig.is_pi(node)) return;
+    if (mig.is_pi(node)) return;
 
     os << "  Node " << node << ": ";
     
@@ -103,19 +114,16 @@ void NetworkBuilder::debugPrintMIGSignals(llvm::raw_ostream &os) {
            << (mig.is_complemented(fanin) ? "'" : "");
       });
       os << " )";
+    } else if (mig.is_constant(node)) {
+      os << "Const";
     }
     os << "\n";
   });
 
   os << "\n=== Output Signal Map ===\n";
-  for (const auto &entry : parser.getOutputs()) {
-    auto val = entry.first;
-    auto data = entry.second;
-    auto sig = migSignalMap.lookup(data.slice);
-    os << "  Output " << val << " (Bitplane " << data.toString() 
-       << ") -> Node " << mig.get_node(sig)
-       << (mig.is_complemented(sig) ? " (complemented)" : "") << "\n";
-  }
+  mig.foreach_po([&](auto output) {
+    os << "  Output: Node " << mig.get_node(output) << "\n";
+  });
 
   os << "===========================\n\n";
 }
