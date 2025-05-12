@@ -25,4 +25,4 @@ foreach(dir ${LIB_DIRS})
   endif()
 endforeach()
 
-target_link_libraries(BitsTransforms PRIVATE lime_base)
+target_link_libraries(BitsTransforms PRIVATE lime_base fmt-local)

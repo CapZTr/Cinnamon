@@ -10,6 +10,10 @@
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/Pass/Pass.h>
 
+#include <iostream>
+#include <mockturtle/generators/arithmetic.hpp>
+#include <mockturtle/io/write_dot.hpp>
+
 #include "ambit.h"
 #include "eggmock.h"
 
@@ -32,14 +36,21 @@ struct LimeOptimizationPass
       signalPassFailure();
     }
     const auto mig = builder.getNetwork();
+    
 
     NetworkBuilder::debugPrint(mig);
+
+    std::cout << " ===== Generated Network ===== \n";
+    mockturtle::write_dot(mig, std::cout);
 
     const auto optimized = eggmock::rewrite_mig(mig,
         ambit_rewriter(ambit_compiler_settings{
             .print_program = true, .verbose = true}));
 
     NetworkBuilder::debugPrint(optimized);
+
+    std::cout << " ===== Optimized Network ===== \n";
+    mockturtle::write_dot(optimized, std::cout);
   }
 };
 } // namespace mlir::bits

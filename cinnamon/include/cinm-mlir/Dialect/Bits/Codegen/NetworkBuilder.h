@@ -66,8 +66,12 @@ private:
   ModuleOp module;
   MIG mig;
   DenseMap<Value, MIG::signal> migSignalMap;
+  DenseMap<AddOp, MIG::signal> coutMap;
 
-  void buildAdd(AddOp add);
+  std::optional<MIG::signal> findCarryIn(AddOp add);
+  std::pair<MIG::signal, MIG::signal> buildAdd(MIG::signal const& lhs,
+                                               MIG::signal const& rhs,
+                                               MIG::signal const& cin);
 
   bool operandsBuilt(Operation *op) const;
 };
