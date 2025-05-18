@@ -8,3 +8,4 @@ add_subdirectory(Memristor)
 add_subdirectory(UPMEM)
 
 add_subdirectory(Bits)
+add_subdirectory(PuD)

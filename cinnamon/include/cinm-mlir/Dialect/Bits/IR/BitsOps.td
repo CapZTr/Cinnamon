@@ -8,8 +8,8 @@
 #define BITS_OPS
 
 
-include "cinm-mlir/Dialect/Bits/IR/BitsBase.td"
-include "cinm-mlir/Dialect/Bits/IR/BitsTypes.td"
+include "BitsBase.td"
+include "BitsTypes.td"
 
 include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/OpBase.td"

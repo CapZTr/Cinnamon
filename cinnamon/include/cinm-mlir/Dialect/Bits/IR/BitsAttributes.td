@@ -7,6 +7,6 @@
 #ifndef BITS_ATTRIBUTES
 #define BITS_ATTRIBUTES
 
-include "cinm-mlir/Dialect/Bits/IR/BitsBase.td"
+include "BitsBase.td"
 
 #endif

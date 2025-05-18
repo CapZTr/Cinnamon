@@ -11,7 +11,7 @@ include "BitsBase.td"
 
 def SliceType : Bits_Type<"Slice"> {
   let mnemonic = "slice";
-  let summary = "Represents a bit-sliced data type.";
+  let summary = "Represents a bit-sliced data type";
 
   let parameters = (ins "int64_t":$bitWidth, "int64_t":$vectorLength);
   let hasCustomAssemblyFormat = 1;

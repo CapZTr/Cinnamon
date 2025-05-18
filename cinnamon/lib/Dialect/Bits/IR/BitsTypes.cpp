@@ -46,6 +46,6 @@ Type SliceType::parse(AsmParser &parser) {
   return SliceType::get(parser.getContext(), shape.front(), shape.back());
 }
 
-void SliceType::print(mlir::AsmPrinter &printer) const {
+void SliceType::print(AsmPrinter &printer) const {
   printer << "<" << getBitWidth() << "x" << getVectorLength() << ">";
 }
