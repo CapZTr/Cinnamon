@@ -22,6 +22,8 @@
 #include "cinm-mlir/Dialect/Cnm/Transforms/Passes.h"
 #include "cinm-mlir/Dialect/Memristor/IR/MemristorDialect.h"
 #include "cinm-mlir/Dialect/Memristor/Transforms/Passes.h"
+#include "cinm-mlir/Dialect/PuD/IR/PuDBase.h"
+#include "cinm-mlir/Dialect/PuD/IR/PuDDialect.h"
 #include "cinm-mlir/Dialect/UPMEM/IR/UPMEMDialect.h"
 #include "cinm-mlir/Dialect/UPMEM/Transforms/Passes.h"
 
@@ -51,6 +53,7 @@ int main(int argc, char *argv[]) {
                   cim::CimDialect,             //
                   cnm::CnmDialect,             //
                   memristor::MemristorDialect, //
+                  pud::PuDDialect,             //
                   upmem::UPMEMDialect>();
 
 #ifdef CINM_TORCH_MLIR_ENABLED

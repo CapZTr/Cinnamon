@@ -31,56 +31,6 @@ struct LowerAddOpPattern : public OpRewritePattern<AddOp> {
   using OpRewritePattern<AddOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(bits::AddOp op, PatternRewriter &rewriter) const override {
-    // auto loc = op.getLoc();
-    // Value lhs = op.getLhs();
-    // Value rhs = op.getRhs();
-    // auto resultType = cast<SliceType>(op.getResult().getType());
-    // auto bitType = BitType::get(rewriter.getContext());
-    // Value bitWidth = rewriter.create<arith::ConstantIntOp>(loc, resultType.getBitWidth(), rewriter.getI64Type());
-    // Value vectorLength = rewriter.create<arith::ConstantIntOp>(loc, resultType.getVectorLength(), rewriter.getI64Type());
-    // Value resultSlice = rewriter.create<CreateSliceOp>(loc, resultType, bitWidth, vectorLength);
-
-    // Value lower = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    // Value step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    // Value outerUpper = rewriter.create<arith::ConstantIndexOp>(loc, resultType.getVectorLength());
-    // Value innerUpper = rewriter.create<arith::ConstantIndexOp>(loc, resultType.getBitWidth());
-
-    // auto outerLoop = rewriter.create<scf::ForOp>(
-    //     loc, lower, outerUpper, step, ValueRange{resultSlice});
-
-    // rewriter.setInsertionPointToStart(outerLoop.getBody());
-
-    // Value vecIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), outerLoop.getInductionVar());
-    // Value slice = outerLoop.getRegionIterArgs()[0];
-    // Value carry = rewriter.create<CreateBitOp>(loc, bitType);
-
-    // auto innerLoop = rewriter.create<scf::ForOp>(
-    //     loc, lower, innerUpper, step, ValueRange{slice, carry});
-
-    // rewriter.setInsertionPointToStart(innerLoop.getBody());
-
-    // Value bitIdx = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), innerLoop.getInductionVar());
-    // Value accSlice = innerLoop.getRegionIterArgs()[0];
-    // Value cin = innerLoop.getRegionIterArgs()[1];
-
-    // Value lhsBit = rewriter.create<ExtractOp>(loc, bitType, lhs, bitIdx, vecIdx);
-    // Value rhsBit = rewriter.create<ExtractOp>(loc, bitType, rhs, bitIdx, vecIdx);
-    
-    // auto addBit = rewriter.create<AddBitOp>(loc, TypeRange{bitType, bitType}, lhsBit, rhsBit, cin);
-    // auto sumBit = addBit.getResult(0);
-    // auto cout = addBit.getResult(1);
-
-    // Value updatedSlice = rewriter.create<InsertOp>(loc, resultType, accSlice, sumBit, bitIdx, vecIdx);
-
-    // rewriter.create<scf::YieldOp>(loc, ValueRange{updatedSlice, cout});
-
-    // rewriter.setInsertionPointAfter(innerLoop);
-    // rewriter.create<scf::YieldOp>(loc, innerLoop.getResult(0));
-
-    // rewriter.setInsertionPointAfter(outerLoop);
-
-    // rewriter.replaceOp(op, outerLoop.getResult(0));
-
     Location loc = op.getLoc();
     Value lhs = op.getLhs();
     Value rhs = op.getRhs();
