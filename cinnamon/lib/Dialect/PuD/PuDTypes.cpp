@@ -55,7 +55,6 @@ Type RowAddressType::parse(AsmParser &parser) {
 }
 
 void RowAddressType::print(AsmPrinter &printer) const {
-  printer << "<" << stringifyEnum(getGroup()) << ", ";
-  printer.printAttribute(getIndex());
-  printer << ">";
+  printer << "<" << stringifyEnum(getGroup()) << ", "
+      << getIndex().getInt() << ">";
 }

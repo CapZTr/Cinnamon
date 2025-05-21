@@ -1,0 +1,6 @@
+[submodule "cinnamon/extern/lime"]
+	path = cinnamon/extern/lime
+	url = https://github.com/jungnitz/lime.git
+[submodule "cinnamon/extern/eggmock"]
+	path = cinnamon/extern/eggmock
+	url = https://github.com/jungnitz/eggmock.git
