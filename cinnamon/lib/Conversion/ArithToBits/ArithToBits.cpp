@@ -4,8 +4,12 @@
 #include "cinm-mlir/Dialect/Bits/IR/BitsDialect.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
+
+#include <cstddef>
 #include <cstdint>
+#include <llvm/Support/ErrorHandling.h>
 #include <memory>
+#include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/BuiltinTypes.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
@@ -23,6 +27,63 @@ using namespace mlir::bits;
 #include <cinm-mlir/Conversion/BitsFrontendPasses.h.inc>
 
 namespace {
+
+struct RowAddress {
+  int64_t bank;
+  int64_t subarray;
+  int64_t row;
+};
+
+class AddressAllocator {
+public:
+  AddressAllocator() = default;
+
+  RowAddress allocate(int64_t numRows) {
+    if (currentRow + numRows > MAX_ROW) {
+      currentRow = 0;
+      ++currentSubarray;
+      if (currentSubarray > MAX_SUBARRAY) {
+        currentSubarray = 0;
+        ++currentBank;
+        if (currentBank > MAX_BANK)
+          llvm::report_fatal_error(
+              "AddressAllocator: DRAM address space exhausted");
+      }
+    }
+    RowAddress addr = {currentBank, currentSubarray, currentRow};
+    currentRow += numRows;
+    return addr;
+  }
+
+private:
+  const int64_t MAX_BANK = 15;
+  const int64_t MAX_SUBARRAY = 31;
+  const int64_t MAX_ROW = 1005;
+  int64_t currentBank = 0;
+  int64_t currentSubarray = 0;
+  int64_t currentRow = 0;
+};
+
+struct GlobalAddressAllocator {
+  static AddressAllocator &get() {
+    static AddressAllocator allocator;
+    return allocator;
+  }
+};
+
+struct InputCache {
+  static llvm::DenseMap<Value, Value> &get() {
+    static llvm::DenseMap<Value, Value> cache;
+    return cache;
+  }
+};
+
+struct SliceCache {
+  static llvm::DenseMap<Operation*, Value> &get() {
+    static llvm::DenseMap<Operation*, Value> cache;
+    return cache;
+  }
+};
 
 template<typename SourceOp, typename TargetOp>
 struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
@@ -50,13 +111,50 @@ struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
     if (!elemType.isSignlessInteger())
       return rewriter.notifyMatchFailure(op, "Tensor elements must be signless integer");
 
+    auto ctx = rewriter.getContext();
+    int64_t bitWidth = elemType.getIntOrFloatBitWidth();
+    int64_t vectorLen = lhsType.getShape()[0];
+
+    auto &inputCache = InputCache::get();
+    auto &sliceCache = SliceCache::get();
+
+    auto getOrCreateSlice = [&](Value operand) -> Value {
+      Operation* defOp = operand.getDefiningOp();
+      if (defOp) {
+        auto it = sliceCache.find(defOp);
+        if (it != sliceCache.end())
+          return it->second;
+      }
+
+      auto it = inputCache.find(operand);
+      if (it != inputCache.end())
+        return it->second;
+
+      auto &allocator = GlobalAddressAllocator::get();
+      RowAddress addr = allocator.allocate(bitWidth);
+      auto addrType = RowAddressType::get(
+          ctx, addr.bank, addr.subarray, addr.row);
+      auto sliceType = SliceType::get(
+          ctx, bitWidth, vectorLen, addrType);
+      Value slice = rewriter.create<TransposeOp>(loc, sliceType, operand);
+
+      inputCache[operand] = slice;
+
+      return slice;
+    };
+
+    Value lhsSlice = getOrCreateSlice(lhs);
+    Value rhsSlice = getOrCreateSlice(rhs);
+
+    auto &allocator = GlobalAddressAllocator::get();
+    RowAddress addr = allocator.allocate(bitWidth);
+    auto addrType = RowAddressType::get(
+        ctx, addr.bank, addr.subarray, addr.row);
     auto sliceType = SliceType::get(
-      rewriter.getContext(),
-      elemType.getIntOrFloatBitWidth(),
-      lhsType.getShape()[0]);
-    Value lhsSlice = rewriter.create<TransposeOp>(loc, sliceType, lhs);
-    Value rhsSlice = rewriter.create<TransposeOp>(loc, sliceType, rhs);
+        ctx, bitWidth, vectorLen, addrType);
     Value resultSlice = rewriter.create<TargetOp>(loc, sliceType, lhsSlice, rhsSlice);
+
+    sliceCache[op] = resultSlice;
 
     Value result = rewriter.create<AssembleOp>(loc, lhsType, resultSlice);
 
@@ -86,7 +184,28 @@ struct ConvertArithToBits
       signalPassFailure();
     }
 
-    simplify(func);
+    // simplify(func);
+    removeUnnecessaryAssembles(func);
+  }
+
+  static void removeUnnecessaryAssembles(func::FuncOp func) {
+    llvm::SmallPtrSet<Value, 8> returnedValues;
+    func.walk([&](func::ReturnOp returnOp) {
+      for (Value operand : returnOp.getOperands())
+        returnedValues.insert(operand);
+    });
+
+    SmallVector<Operation *> toErase;
+    func.walk([&](bits::AssembleOp assembleOp) {
+      Value result = assembleOp.getResult();
+
+      if (!returnedValues.contains(result) && result.use_empty()) {
+        toErase.push_back(assembleOp);
+      }
+    });
+
+    for (Operation *op : toErase)
+      op->erase();
   }
 
   static void simplify(func::FuncOp func) {
