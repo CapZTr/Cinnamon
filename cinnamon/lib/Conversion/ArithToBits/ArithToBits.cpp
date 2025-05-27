@@ -5,7 +5,6 @@
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 
-#include <cstddef>
 #include <cstdint>
 #include <llvm/Support/ErrorHandling.h>
 #include <memory>
