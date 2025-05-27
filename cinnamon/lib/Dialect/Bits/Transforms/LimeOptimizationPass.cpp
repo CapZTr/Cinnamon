@@ -35,7 +35,7 @@ struct LimeOptimizationPass
     if (failed(builder.build())) {
       signalPassFailure();
     }
-    const auto mig = builder.getNetwork();
+    auto mig = builder.getNetwork();
     
 
     NetworkBuilder::debugPrint(mig);
@@ -43,9 +43,17 @@ struct LimeOptimizationPass
     std::cout << " ===== Generated Network ===== \n";
     mockturtle::write_dot(mig, std::cout);
 
-    const auto optimized = eggmock::rewrite_mig(mig,
-        ambit_rewriter(ambit_compiler_settings{
-            .print_program = true, .verbose = true}));
+    const auto settings = ambit_compiler_settings{
+        .print_program = true,
+        .verbose = true,
+        .preoptimize = true,
+        .rewrite = false,
+    };
+
+    auto [optimized, result] = ambit_rewrite(settings, mig);
+    // const auto optimized = eggmock::rewrite_mig(mig,
+    //     ambit_rewriter(ambit_compiler_settings{
+    //         .print_program = true, .verbose = true}));
 
     NetworkBuilder::debugPrint(optimized);
 

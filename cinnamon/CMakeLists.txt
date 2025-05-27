@@ -14,6 +14,7 @@ project(cinm-mlir
 )
 
 # ======== mockturtle & lime integration ========
+add_compile_options(-fexceptions)
 set(MOCKTURTLE_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(MOCKTURTLE_TEST OFF CACHE BOOL "" FORCE)
 set(MOCKTURTLE_EXPERIMENTS OFF CACHE BOOL "" FORCE)
