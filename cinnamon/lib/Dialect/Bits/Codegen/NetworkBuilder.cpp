@@ -28,7 +28,9 @@ LogicalResult NetworkBuilder::build() {
 
   module.walk([&](Operation *op) {
     if (auto transpose = dyn_cast<TransposeOp>(op)) {
-      migSignalMap[transpose.getOutput()] = mig.create_pi();
+      auto slice = transpose.getOutput();
+      migSignalMap[slice] = mig.create_pi();
+      inputSlices.push_back(slice);
     } else if (auto add = dyn_cast<AddOp>(op)) {
       pendingBinaryOps.push_back(op);
     } else if (auto assembleOp = dyn_cast<AssembleOp>(op)) {

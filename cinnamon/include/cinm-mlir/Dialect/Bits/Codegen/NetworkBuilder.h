@@ -22,6 +22,8 @@ public:
 
   const MIG &getNetwork() const { return mig; }
 
+  const SmallVector<Value> &getInputSlices() const { return inputSlices; }
+
   static void debugPrint(MIG const &mig, llvm::raw_ostream &os = llvm::errs()) {
     os << "\n=== MIG Network Debug Info ===\n";
     os << "Primary Inputs (PIs): " << mig.num_pis() << "\n";
@@ -31,7 +33,7 @@ public:
 
     os << "=== Input Signal Map ===\n";
     mig.foreach_pi([&](auto input) {
-      os << "  Input: Node " << input << "\n";
+      os << "  Input: Node " << input << " : " << mig.pi_index(input) << "\n";
     });
 
     os << "\n=== Node Details ===\n";
@@ -67,6 +69,7 @@ private:
   MIG mig;
   DenseMap<Value, MIG::signal> migSignalMap;
   DenseMap<AddOp, MIG::signal> coutMap;
+  SmallVector<Value> inputSlices;
 
   std::optional<MIG::signal> findCarryIn(AddOp add);
   std::pair<MIG::signal, MIG::signal> buildAdd(MIG::signal const& lhs,
