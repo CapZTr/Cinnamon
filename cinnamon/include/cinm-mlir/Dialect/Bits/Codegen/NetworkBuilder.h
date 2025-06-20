@@ -20,7 +20,7 @@ public:
 
   LogicalResult build();
 
-  const MIG &getNetwork() const { return mig; }
+  const MIG& getNetwork() const { return mig; }
 
   const SmallVector<Value> &getInputSlices() const { return inputSlices; }
 

@@ -3,9 +3,11 @@
 #include "cinm-mlir/Dialect/Bits/Transforms/Passes.h"
 
 #include "cinm-mlir/Dialect/Bits/Codegen/NetworkBuilder.h"
+#include "cinm-mlir/Dialect/Bits/Codegen/ProgramParser.h"
 
 #include <cstdint>
 #include <llvm/Support/ErrorHandling.h>
+#include <llvm/Support/LogicalResult.h>
 #include <llvm/Support/raw_ostream.h>
 #include <memory>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
@@ -15,6 +17,7 @@
 #include <iostream>
 #include <mockturtle/generators/arithmetic.hpp>
 #include <mockturtle/io/write_dot.hpp>
+#include <vector>
 
 #include "ambit.h"
 
@@ -95,12 +98,10 @@ struct LimeOptimizationPass
     }
     auto mig = builder.getNetwork();
 
-    std::cout << builder.getInputSlices().size() << "\n";
+    // NetworkBuilder::debugPrint(mig);
 
-    NetworkBuilder::debugPrint(mig);
-
-    std::cout << " ===== Generated Network ===== \n";
-    mockturtle::write_dot(mig, std::cout);
+    // std::cout << " ===== Generated Network ===== \n";
+    // mockturtle::write_dot(mig, std::cout);
 
     const auto settings = ambit_compiler_settings{
         .print_program = false,
@@ -113,10 +114,17 @@ struct LimeOptimizationPass
     auto [optimized, result] = ambit_rewrite(settings, mig, program_str);
     std::cout << "Generated program:\n" << program_str.str() << "\n";
 
-    NetworkBuilder::debugPrint(optimized);
+    ProgramParser parser(program_str.str());
+    if (failed(parser.parse())) {
+      signalPassFailure();
+    }
+    std::vector<Instruction> program = parser.getProgram();
+    std::cout << " ===== Parsed " << program.size() << " instructions =====" << "\n";
 
-    std::cout << " ===== Optimized Network ===== \n";
-    mockturtle::write_dot(optimized, std::cout);
+    // NetworkBuilder::debugPrint(optimized);
+
+    // std::cout << " ===== Optimized Network ===== \n";
+    // mockturtle::write_dot(optimized, std::cout);
   }
 };
 } // namespace mlir::bits
