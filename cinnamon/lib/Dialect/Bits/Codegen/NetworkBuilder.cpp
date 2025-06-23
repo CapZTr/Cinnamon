@@ -26,7 +26,7 @@ LogicalResult NetworkBuilder::build() {
   auto cin = mig.create_pi();
   bool cinUsed = false;
 
-  module.walk([&](Operation *op) {
+  module.walk([&](Operation* op) {
     if (auto transpose = dyn_cast<TransposeOp>(op)) {
       auto slice = transpose.getOutput();
       migSignalMap[slice] = mig.create_pi();
@@ -130,7 +130,7 @@ std::pair<MIG::signal, MIG::signal> NetworkBuilder::buildAdd(MIG::signal const& 
   return {sum, cout};
 }
 
-bool NetworkBuilder::operandsBuilt(Operation *op) const {
+bool NetworkBuilder::operandsBuilt(Operation* op) const {
   for (auto operand : op->getOperands()) {
     if (!migSignalMap.count(operand))
       return false;

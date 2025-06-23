@@ -66,12 +66,6 @@ void ProgramParser::advance() {
   }
 }
 
-llvm::LogicalResult ProgramParser::expect(char c) {
-  if (peek() != c) return llvm::failure();
-  advance();
-  return llvm::success();
-}
-
 int ProgramParser::parseNumber() {
   int val = 0;
   while (std::isdigit(peek())) {

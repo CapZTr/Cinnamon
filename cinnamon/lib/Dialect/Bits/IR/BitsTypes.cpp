@@ -54,29 +54,34 @@ void RowAddressType::print(AsmPrinter &printer) const {
 }
 
 Type SliceType::parse(AsmParser &parser) {
-  if (parser.parseLess())
-    return Type();
+  // if (parser.parseLess())
+  //   return Type();
 
   SmallVector<int64_t> shape;
-  Type rowAddrType;
+  // Type rowAddrType;
 
   if (parser.parseLess() ||
       parser.parseDimensionList(shape, /*allowDynamic=*/false, /*withTrailingX=*/false) ||
-      parser.parseGreater() ||
-      parser.parseComma() ||
-      parser.parseType(rowAddrType) ||
-      !mlir::isa<RowAddressType>(rowAddrType) ||
+      // parser.parseGreater() ||
+      // parser.parseComma() ||
+      // parser.parseType(rowAddrType) ||
+      // !mlir::isa<RowAddressType>(rowAddrType) ||
       parser.parseGreater()) {
     return Type();
   }
 
-  auto firstRow = mlir::cast<RowAddressType>(rowAddrType);
+  // auto firstRow = mlir::cast<RowAddressType>(rowAddrType);
 
-  return SliceType::get(parser.getContext(), shape.front(), shape.back(), firstRow);
+  // return SliceType::get(parser.getContext(), shape.front(), shape.back(), firstRow);
+  return SliceType::get(parser.getContext(), shape.front(), shape.back());
 }
 
+// void SliceType::print(AsmPrinter &printer) const {
+//   printer << "<" 
+//       << "<" << getBitWidth() << "x" << getVectorLength() << ">"
+//       << ", " << getFirstRowAddr() << ">";
+// }
+
 void SliceType::print(AsmPrinter &printer) const {
-  printer << "<" 
-      << "<" << getBitWidth() << "x" << getVectorLength() << ">"
-      << ", " << getFirstRowAddr() << ">";
+  printer << "<" << getBitWidth() << "x" << getVectorLength() << ">";
 }

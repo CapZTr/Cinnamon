@@ -83,8 +83,8 @@ struct InputCache {
 };
 
 struct SliceCache {
-  static llvm::DenseMap<Operation*, Value> &get() {
-    static llvm::DenseMap<Operation*, Value> cache;
+  static llvm::DenseMap<Operation *, Value> &get() {
+    static llvm::DenseMap<Operation *, Value> cache;
     return cache;
   }
 };

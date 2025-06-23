@@ -32,7 +32,7 @@ public:
 
   llvm::LogicalResult parse();
 
-  const std::vector<Instruction>& getProgram() const { return program; }
+  const std::vector<Instruction> &getProgram() const { return program; }
 
 private:
   std::vector<Instruction> program;
@@ -43,7 +43,6 @@ private:
   void skipWhitespace();
   char peek() const;
   void advance();
-  llvm::LogicalResult expect(char c);
   int parseNumber();
   Address parseAddress();
   BitwiseOperand parseBitwiseOperand();

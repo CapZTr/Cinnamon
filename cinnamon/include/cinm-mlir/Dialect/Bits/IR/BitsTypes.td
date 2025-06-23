@@ -27,9 +27,9 @@ def SliceType : Bits_Type<"Slice"> {
 
   let parameters = (ins
       "int64_t":$bitWidth,
-      "int64_t":$vectorLength,
-      RowAddressType:$firstRowAddr
-  );
+      "int64_t":$vectorLength);
+      // RowAddressType:$firstRowAddr
+  // );
   let hasCustomAssemblyFormat = 1;
 }
 

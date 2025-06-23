@@ -1,6 +1,4 @@
-#ifndef CINM_MLIR_DIALECT_BITS_CODEGEN_NETWORKBUILDER_H
-#define CINM_MLIR_DIALECT_BITS_CODEGEN_NETWORKBUILDER_H
-
+#pragma once
 
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 
@@ -9,6 +7,7 @@
 #include <mlir/IR/BuiltinOps.h>
 
 #include <mockturtle/networks/mig.hpp>
+
 
 using MIG = mockturtle::mig_network;
 
@@ -20,7 +19,7 @@ public:
 
   LogicalResult build();
 
-  const MIG& getNetwork() const { return mig; }
+  const MIG &getNetwork() const { return mig; }
 
   const SmallVector<Value> &getInputSlices() const { return inputSlices; }
 
@@ -76,9 +75,7 @@ private:
                                                MIG::signal const& rhs,
                                                MIG::signal const& cin);
 
-  bool operandsBuilt(Operation *op) const;
+  bool operandsBuilt(Operation* op) const;
 };
 
 }
-
-#endif // CINM_MLIR_DIALECT_BITS_CODEGEN_NETWORKBUILDER_H

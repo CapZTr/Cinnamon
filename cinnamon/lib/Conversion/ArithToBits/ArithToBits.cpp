@@ -78,8 +78,8 @@ struct InputCache {
 };
 
 struct SliceCache {
-  static llvm::DenseMap<Operation*, Value> &get() {
-    static llvm::DenseMap<Operation*, Value> cache;
+  static llvm::DenseMap<Operation *, Value> &get() {
+    static llvm::DenseMap<Operation *, Value> cache;
     return cache;
   }
 };
@@ -129,12 +129,11 @@ struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
       if (it != inputCache.end())
         return it->second;
 
-      auto &allocator = GlobalAddressAllocator::get();
-      RowAddress addr = allocator.allocate(bitWidth);
-      auto addrType = RowAddressType::get(
-          ctx, addr.bank, addr.subarray, addr.row);
-      auto sliceType = SliceType::get(
-          ctx, bitWidth, vectorLen, addrType);
+      // auto &allocator = GlobalAddressAllocator::get();
+      // RowAddress addr = allocator.allocate(bitWidth);
+      // auto addrType = RowAddressType::get(
+      //     ctx, addr.bank, addr.subarray, addr.row);
+      auto sliceType = SliceType::get(ctx, bitWidth, vectorLen);
       Value slice = rewriter.create<TransposeOp>(loc, sliceType, operand);
 
       inputCache[operand] = slice;
@@ -145,12 +144,11 @@ struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
     Value lhsSlice = getOrCreateSlice(lhs);
     Value rhsSlice = getOrCreateSlice(rhs);
 
-    auto &allocator = GlobalAddressAllocator::get();
-    RowAddress addr = allocator.allocate(bitWidth);
-    auto addrType = RowAddressType::get(
-        ctx, addr.bank, addr.subarray, addr.row);
-    auto sliceType = SliceType::get(
-        ctx, bitWidth, vectorLen, addrType);
+    // auto &allocator = GlobalAddressAllocator::get();
+    // RowAddress addr = allocator.allocate(bitWidth);
+    // auto addrType = RowAddressType::get(
+    //     ctx, addr.bank, addr.subarray, addr.row);
+    auto sliceType = SliceType::get(ctx, bitWidth, vectorLen);
     Value resultSlice = rewriter.create<TargetOp>(loc, sliceType, lhsSlice, rhsSlice);
 
     sliceCache[op] = resultSlice;
@@ -203,7 +201,7 @@ struct ConvertArithToBits
       }
     });
 
-    for (Operation *op : toErase)
+    for (Operation* op : toErase)
       op->erase();
   }
 
@@ -214,7 +212,7 @@ struct ConvertArithToBits
     func->walk([&](AssembleOp assemble) {
       bool usedByReturn = false;
 
-      for (Operation *user : assemble->getUsers()) {
+      for (Operation* user : assemble->getUsers()) {
         if (auto returnOp = dyn_cast<func::ReturnOp>(user)) {
           usedByReturn = true;
           break;
@@ -226,7 +224,7 @@ struct ConvertArithToBits
 
       SmallVector<Operation *, 2> transposesToErase;
       unsigned userCount = 0;
-      for (Operation *user : assemble->getUsers()) {
+      for (Operation* user : assemble->getUsers()) {
         ++userCount;
         auto transpose = dyn_cast<TransposeOp>(user);
         // if (!transpose || transpose->hasOneUse())
