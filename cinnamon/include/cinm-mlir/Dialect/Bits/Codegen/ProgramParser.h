@@ -46,4 +46,5 @@ private:
   int parseNumber();
   Address parseAddress();
   BitwiseOperand parseBitwiseOperand();
+  void normalizeBitwiseAddress(Address &addr);
 };

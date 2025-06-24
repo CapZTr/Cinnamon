@@ -5,6 +5,7 @@
 /// @author      Clément Fournier (clement.fournier@tu-dresden.de)
 
 #include "cinm-mlir/Conversion/BitsFrontendPasses.h"
+#include "cinm-mlir/Conversion/BitsPasses.h"
 #include "cinm-mlir/Conversion/CimPasses.h"
 #include "cinm-mlir/Conversion/CinmPasses.h"
 #include "cinm-mlir/Conversion/CnmPasses.h"
@@ -67,6 +68,7 @@ int main(int argc, char *argv[]) {
 #ifdef CINM_TORCH_MLIR_ENABLED
   registerCinmFrontendConversionPasses();
 #endif
+  // registerBitsConversionPasses();
   registerCinmConversionPasses();
   registerCimConversionPasses();
   registerCnmConversionPasses();

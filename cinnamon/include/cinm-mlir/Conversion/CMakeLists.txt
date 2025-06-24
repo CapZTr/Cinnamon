@@ -13,6 +13,12 @@ add_public_tablegen_target(BitsFrontendConversionPassIncGen)
 
 add_mlir_doc(BitsFrontendPasses BitsFrontendConversionPasses ./ -gen-pass-doc)
 
+set(LLVM_TARGET_DEFINITIONS BitsPasses.td)
+mlir_tablegen(BitsPasses.h.inc -gen-pass-decls -name BitsConversion ${TBLGEN_EXTRA})
+add_public_tablegen_target(BitsConversionPassIncGen)
+
+add_mlir_doc(BitsPasses BitsConversionPasses ./ -gen-pass-doc)
+
 set(LLVM_TARGET_DEFINITIONS CinmPasses.td)
 mlir_tablegen(CinmPasses.h.inc -gen-pass-decls -name CinmConversion ${TBLGEN_EXTRA})
 add_public_tablegen_target(CinmConversionPassIncGen)

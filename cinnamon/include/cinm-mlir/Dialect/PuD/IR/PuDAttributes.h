@@ -9,7 +9,6 @@
 
 //===- Generated includes -------------------------------------------------===//
 
-#include "cinm-mlir/Dialect/PuD/IR/PuDEnums.h.inc"
 #define GET_ATTRDEF_CLASSES
 #include "cinm-mlir/Dialect/PuD/IR/PuDAttributes.h.inc"
 

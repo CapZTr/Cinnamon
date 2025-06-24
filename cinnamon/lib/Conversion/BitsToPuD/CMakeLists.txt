@@ -1,12 +1,12 @@
-add_mlir_conversion_library(MLIRArithToBits
-  ArithToBits.cpp
+add_mlir_conversion_library(MLIRBitsToPuD
+  BitsToPuD.cpp
 
   ADDITIONAL_HEADER_DIRS
-    ${MLIR_MAIN_INCLUDE_DIR}/bits_frontend/Conversion/ArithToBits
+    ${MLIR_MAIN_INCLUDE_DIR}/bits/Conversion/BitsToPuD
 
   DEPENDS
-    BitsFrontendConversionPassIncGen
-    BitsIncGen
+    BitsConversionPassIncGen
+    PuDIncGen
   
   LINK_COMPONENTS
     Core
@@ -19,4 +19,5 @@ add_mlir_conversion_library(MLIRArithToBits
     MLIRTensorDialect
     MLIRTransformUtils
     MLIRReconcileUnrealizedCasts
+    PuDIR
 )

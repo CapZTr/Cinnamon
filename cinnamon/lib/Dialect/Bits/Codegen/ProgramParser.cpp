@@ -4,6 +4,7 @@
 #include <cctype>
 #include <llvm/Support/LogicalResult.h>
 #include <utility>
+#include <variant>
 #include <vector>
 
 
@@ -139,6 +140,8 @@ Address ProgramParser::parseAddress() {
     addr.data = std::vector<BitwiseOperand>{operand};
   }
 
+  if (addr.type == AddressType::Bitwise) normalizeBitwiseAddress(addr);
+
   return addr;
 }
 
@@ -157,4 +160,86 @@ BitwiseOperand ProgramParser::parseBitwiseOperand() {
   }
 
   return operand;
+}
+
+void ProgramParser::normalizeBitwiseAddress(Address &addr) {
+  assert(addr.type == AddressType::Bitwise &&
+      std::holds_alternative<std::vector<BitwiseOperand>>(addr.data));
+  
+  auto &data = std::get<std::vector<BitwiseOperand>>(addr.data);
+
+  switch (data.size()) {
+
+    case 1: {
+      auto operand = data[0];
+      if (operand.type == BitwiseOperandType::T) {
+        assert(!operand.inverted);
+        addr.data = operand.index;
+      } else {
+        if (operand.inverted) {
+          if (operand.index == 0) addr.data = 5;
+          else addr.data = 7;
+        } else {
+          if (operand.index == 0) addr.data = 4;
+          else addr.data = 6;
+        }
+      }
+      break;
+    }
+
+    case 2: {
+      auto operand0 = data[0];
+      auto operand1 = data[1];
+      if (operand0.type == BitwiseOperandType::T) {
+        assert(!operand0.inverted && !operand1.inverted && operand1.index == 3);
+        if (operand0.index == 2) addr.data = 10;
+        else {
+          assert(operand0.index == 0);
+          addr.data = 11;
+        }
+      } else {
+        assert(operand0.inverted &&
+            operand1.type == BitwiseOperandType::T &&
+            !operand1.inverted);
+        if (operand0.index == 0) {
+          assert(operand1.index == 0);
+          addr.data = 8;
+        } else {
+          assert(operand1.index == 1);
+          addr.data = 9;
+        }
+      }
+      break;
+    }
+
+    case 3: {
+      auto operand0 = data[0];
+      auto operand1 = data[1];
+      auto operand2 = data[2];
+      assert(!operand0.inverted && !operand1.inverted && !operand2.inverted);
+      assert(operand1.type == BitwiseOperandType::T &&
+          operand2.type == BitwiseOperandType::T);
+      if (operand0.type == BitwiseOperandType::T) {
+        if (operand0.index == 0) {
+          assert(operand1.index == 1 && operand2.index == 2);
+          addr.data = 12;
+        } else {
+          assert(operand0.index == 1 && operand1.index == 2 && operand2.index ==3);
+          addr.data = 13;
+        }
+      } else {
+        if (operand0.index == 0) {
+          assert(operand1.index == 1 && operand2.index == 2);
+          addr.data = 14;
+        } else {
+          assert(operand0.index == 1 && operand1.index == 0 && operand2.index == 3);
+          addr.data = 15;
+        }
+      }
+      break;
+    }
+
+    default:
+      return;
+  }
 }

@@ -33,22 +33,3 @@ void PuDDialect::registerOps() {
 #include "cinm-mlir/Dialect/PuD/IR/PuDOps.cpp.inc"
       >();
 }
-
-LogicalResult AAPOp::verify() {
-  auto srcAddrType = cast<RowAddressType>(getSrcAddr().getType());
-  auto dstAddrType = cast<RowAddressType>(getDstAddr().getType());
-
-  if (!srcAddrType || !dstAddrType)
-    return emitOpError("Addresses of AAP must be RowAddressType");
-
-  return success();
-}
-
-LogicalResult APOp::verify() {
-  auto addrType = cast<RowAddressType>(getAddr().getType());
-
-  if (!addrType)
-    return emitOpError("Address of AAP must be RowAddressType");
-
-  return success();
-}

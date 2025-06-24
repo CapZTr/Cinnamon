@@ -35,26 +35,63 @@ void PuDDialect::registerTypes() {
         >();
 }
 
-Type RowAddressType::parse(AsmParser &parser) {
-  StringRef groupStr;
-  IntegerAttr indexAttr;
+Type BitwiseRowAddressType::parse(AsmParser &parser) {
+  if (parser.parseLess()) return Type();
 
-  if (parser.parseLess() ||
-      parser.parseKeyword(&groupStr) ||
-      parser.parseComma() ||
-      parser.parseAttribute(indexAttr) ||
-      parser.parseGreater()) {
+  int64_t bankID, subarrayID, rowID;
+  if (parser.parseInteger(bankID) || parser.parseComma() ||
+      parser.parseInteger(subarrayID) || parser.parseComma() ||
+      parser.parseInteger(rowID) || parser.parseGreater()) {
     return Type();
   }
 
-  auto group = symbolizeEnum<RowGroup>(groupStr);
-  if (!group)
-    return parser.emitError(parser.getNameLoc(), "invalid RowGroup enum value: ") << groupStr, Type();
-
-  return RowAddressType::get(parser.getContext(), *group, indexAttr);
+  return BitwiseRowAddressType::get(parser.getContext(), bankID, subarrayID, rowID);
 }
 
-void RowAddressType::print(AsmPrinter &printer) const {
-  printer << "<" << stringifyEnum(getGroup()) << ", "
-      << getIndex().getInt() << ">";
+void BitwiseRowAddressType::print(AsmPrinter &printer) const {
+  printer << "<"
+      << getBankID() << ", "
+      << getSubarrayID() << ", "
+      << "B" << getRowID() << ">";
+}
+
+Type ControlRowAddressType::parse(AsmParser &parser) {
+  if (parser.parseLess()) return Type();
+
+  int64_t bankID, subarrayID, rowID;
+  if (parser.parseInteger(bankID) || parser.parseComma() ||
+      parser.parseInteger(subarrayID) || parser.parseComma() ||
+      parser.parseInteger(rowID) || parser.parseGreater()) {
+    return Type();
+  }
+
+  return ControlRowAddressType::get(parser.getContext(), bankID, subarrayID, rowID == 1);
+}
+
+void ControlRowAddressType::print(AsmPrinter &printer) const {
+  int rowID = getRowID() ? 1 : 0;
+  printer << "<"
+      << getBankID() << ", "
+      << getSubarrayID() << ", "
+      << "C" << rowID << ">";
+}
+
+Type DataRowAddressType::parse(AsmParser &parser) {
+  if (parser.parseLess()) return Type();
+
+  int64_t bankID, subarrayID, rowID;
+  if (parser.parseInteger(bankID) || parser.parseComma() ||
+      parser.parseInteger(subarrayID) || parser.parseComma() ||
+      parser.parseInteger(rowID) || parser.parseGreater()) {
+    return Type();
+  }
+
+  return DataRowAddressType::get(parser.getContext(), bankID, subarrayID, rowID);
+}
+
+void DataRowAddressType::print(AsmPrinter &printer) const {
+  printer << "<"
+      << getBankID() << ", "
+      << getSubarrayID() << ", "
+      << "D" << getRowID() << ">";
 }

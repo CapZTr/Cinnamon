@@ -9,17 +9,4 @@
 
 include "PuDBase.td"
 
-include "mlir/IR/CommonAttrConstraints.td"
-include "mlir/IR/EnumAttr.td"
-
-def PuDRowGroupAttr : I64EnumAttr<
-    "RowGroup", "",
-    [
-      I64EnumAttrCase<"B", 0, "B">,
-      I64EnumAttrCase<"C", 1, "C">,
-      I64EnumAttrCase<"D", 2, "D">
-    ]> {
-  let cppNamespace = "mlir::pud";
-}
-
 #endif
