@@ -7,19 +7,7 @@
 #ifndef BITS_TYPES
 #define BITS_TYPES
 
-include "BitsBase.td"
-
-def RowAddressType : Bits_Type<"RowAddress"> {
-  let mnemonic = "row_address";
-  let summary = "Represents a row within a DRAM subarray";
-
-  let parameters = (ins
-      "int64_t":$bankID,
-      "int64_t":$subarrayID,
-      "int64_t":$rowID
-  );
-  let hasCustomAssemblyFormat = 1;
-}
+include "cinm-mlir/Dialect/Bits/IR/BitsBase.td"
 
 def SliceType : Bits_Type<"Slice"> {
   let mnemonic = "slice";
@@ -33,11 +21,27 @@ def SliceType : Bits_Type<"Slice"> {
   let hasCustomAssemblyFormat = 1;
 }
 
-// ===== To Be Modified =====
+
+
+
+
+// ===== USELESS: To Be Modified =====
 
 def BitType : Bits_Type<"Bit"> {
   let mnemonic = "bit";
   let summary = "Represents a single bit within a bit-slice";
+}
+
+def RowAddressType : Bits_Type<"RowAddress"> {
+  let mnemonic = "row_address";
+  let summary = "Represents a row within a DRAM subarray";
+
+  let parameters = (ins
+      "int64_t":$bankID,
+      "int64_t":$subarrayID,
+      "int64_t":$rowID
+  );
+  let hasCustomAssemblyFormat = 1;
 }
 
 #endif

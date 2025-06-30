@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 #include "cinm-mlir/Dialect/PuD/IR/PuDTypes.h"
 
 #include "mlir/IR/BuiltinOps.h"

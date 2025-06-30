@@ -23,8 +23,8 @@ LogicalResult NetworkBuilder::build() {
   SmallVector<Operation *> pendingBinaryOps;
   AssembleOp assemble;
 
-  auto cin = mig.create_pi();
-  bool cinUsed = false;
+  // auto cin = mig.create_pi();
+  // bool cinUsed = false;
 
   module.walk([&](Operation* op) {
     if (auto transpose = dyn_cast<TransposeOp>(op)) {
@@ -53,12 +53,13 @@ LogicalResult NetworkBuilder::build() {
           if (found) {
             carryIn = *found;
           } else {
-            if (!cinUsed) {
-              carryIn = cin;
-              cinUsed = true;
-            } else {
-              carryIn = mig.get_constant(false);
-            }
+            // if (!cinUsed) {
+            //   carryIn = cin;
+            //   cinUsed = true;
+            // } else {
+            //   carryIn = mig.get_constant(false);
+            // }
+            carryIn = mig.get_constant(false);
           }
 
           auto [sum, cout] = buildAdd(lhs, rhs, carryIn);
@@ -85,10 +86,11 @@ LogicalResult NetworkBuilder::build() {
 
   auto result = assemble.getInput();
   mig.create_po(migSignalMap.lookup(result));
+  // outputSlices.push_back(result);
 
-  auto finalAdd = dyn_cast<AddOp>(result.getDefiningOp());
-  assert(coutMap.count(finalAdd) == 1);
-  mig.create_po(coutMap.lookup(finalAdd));
+  // auto finalAdd = dyn_cast<AddOp>(result.getDefiningOp());
+  // assert(coutMap.count(finalAdd) == 1);
+  // mig.create_po(coutMap.lookup(finalAdd));
 
   mig = mockturtle::cleanup_dangling(mig);
 

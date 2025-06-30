@@ -18,6 +18,7 @@ enum class AddressType { In, Out, Spill, Const, Bitwise };
 struct Address {
   AddressType type;
   std::variant<int, bool, std::vector<BitwiseOperand>> data;
+  std::string str_repr;
 };
 
 struct Instruction {

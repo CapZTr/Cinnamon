@@ -68,7 +68,7 @@ int main(int argc, char *argv[]) {
 #ifdef CINM_TORCH_MLIR_ENABLED
   registerCinmFrontendConversionPasses();
 #endif
-  // registerBitsConversionPasses();
+  registerBitsConversionPasses();
   registerCinmConversionPasses();
   registerCimConversionPasses();
   registerCnmConversionPasses();

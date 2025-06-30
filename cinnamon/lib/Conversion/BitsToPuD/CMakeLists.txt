@@ -21,3 +21,18 @@ add_mlir_conversion_library(MLIRBitsToPuD
     MLIRReconcileUnrealizedCasts
     PuDIR
 )
+
+target_include_directories(MLIRBitsToPuD PRIVATE
+  ${CMAKE_SOURCE_DIR}/extern/lime/mockturtle/include
+  ${CMAKE_SOURCE_DIR}/extern/lime/src
+)
+
+file(GLOB LIB_DIRS "${CMAKE_SOURCE_DIR}/extern/lime/mockturtle/lib/*")
+
+foreach(dir ${LIB_DIRS})
+  if(IS_DIRECTORY "${dir}")
+    target_include_directories(MLIRBitsToPuD PRIVATE ${dir})
+  endif()
+endforeach()
+
+target_link_libraries(MLIRBitsToPuD PRIVATE lime_base fmt-local)

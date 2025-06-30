@@ -1,11 +1,14 @@
 #pragma once
 
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
+#include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/LogicalResult.h>
 #include <mlir/IR/BuiltinOps.h>
 
+#include <mlir/IR/Value.h>
 #include <mockturtle/networks/mig.hpp>
 
 
@@ -21,7 +24,9 @@ public:
 
   const MIG &getNetwork() const { return mig; }
 
-  const SmallVector<Value> &getInputSlices() const { return inputSlices; }
+  const SmallVector<TypedValue<SliceType>> &getInputSlices() const { return inputSlices; }
+
+  // const SmallVector<TypedValue<SliceType>> &getOutputSlices() const { return outputSlices; }
 
   static void debugPrint(MIG const &mig, llvm::raw_ostream &os = llvm::errs()) {
     os << "\n=== MIG Network Debug Info ===\n";
@@ -68,7 +73,8 @@ private:
   MIG mig;
   DenseMap<Value, MIG::signal> migSignalMap;
   DenseMap<AddOp, MIG::signal> coutMap;
-  SmallVector<Value> inputSlices;
+  SmallVector<TypedValue<SliceType>> inputSlices;
+  // SmallVector<TypedValue<SliceType>> outputSlices;
 
   std::optional<MIG::signal> findCarryIn(AddOp add);
   std::pair<MIG::signal, MIG::signal> buildAdd(MIG::signal const& lhs,

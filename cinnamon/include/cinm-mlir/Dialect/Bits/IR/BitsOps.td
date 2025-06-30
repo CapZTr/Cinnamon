@@ -49,6 +49,13 @@ def AddOp : Bits_Op<"add", [Pure, Commutative]> {
   let hasVerifier = 1;
 }
 
+
+
+
+
+
+// ===== USELESS: To Be Modified =====
+
 def AddBitOp : Bits_Op<"add_bit", [Pure]> {
   let summary = "Bitwise addition of two single bits";
   let description = [{}];

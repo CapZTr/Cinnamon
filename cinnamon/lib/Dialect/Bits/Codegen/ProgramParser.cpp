@@ -2,6 +2,8 @@
 
 #include <cassert>
 #include <cctype>
+#include <format>
+#include <iostream>
 #include <llvm/Support/LogicalResult.h>
 #include <utility>
 #include <variant>
@@ -33,6 +35,7 @@ llvm::LogicalResult ProgramParser::parse() {
       instruction.operand1 = parseAddress();
     } else {
       assert(instr == "AP");
+      instruction.type = Instruction::Type::AP;
       skipWhitespace();
       instruction.operand0 = parseAddress();
     }
@@ -87,14 +90,17 @@ Address ProgramParser::parseAddress() {
     addr.type = (c == 'I') ? AddressType::In :
         (c == 'O') ? AddressType::Out : AddressType::Spill;
     addr.data = index;
+    addr.str_repr = std::format("{}{}", c, index);
   } else if (c == 'C') {
     advance();
     addr.type = AddressType::Const;
     if (peek() == '0') {
       addr.data = false;
+      addr.str_repr = std::format("{}{}", c, 0);
     } else {
       assert(peek() == '1');
       addr.data = true;
+      addr.str_repr = std::format("{}{}", c, 1);
     }
     advance();
   } else if (c == '~') {
@@ -168,20 +174,21 @@ void ProgramParser::normalizeBitwiseAddress(Address &addr) {
   
   auto &data = std::get<std::vector<BitwiseOperand>>(addr.data);
 
+  int index = -1;
   switch (data.size()) {
 
     case 1: {
       auto operand = data[0];
       if (operand.type == BitwiseOperandType::T) {
         assert(!operand.inverted);
-        addr.data = operand.index;
+        index = operand.index;
       } else {
         if (operand.inverted) {
-          if (operand.index == 0) addr.data = 5;
-          else addr.data = 7;
+          if (operand.index == 0) index = 5;
+          else index = 7;
         } else {
-          if (operand.index == 0) addr.data = 4;
-          else addr.data = 6;
+          if (operand.index == 0) index = 4;
+          else index = 6;
         }
       }
       break;
@@ -192,10 +199,10 @@ void ProgramParser::normalizeBitwiseAddress(Address &addr) {
       auto operand1 = data[1];
       if (operand0.type == BitwiseOperandType::T) {
         assert(!operand0.inverted && !operand1.inverted && operand1.index == 3);
-        if (operand0.index == 2) addr.data = 10;
+        if (operand0.index == 2) index = 10;
         else {
           assert(operand0.index == 0);
-          addr.data = 11;
+          index = 11;
         }
       } else {
         assert(operand0.inverted &&
@@ -203,10 +210,10 @@ void ProgramParser::normalizeBitwiseAddress(Address &addr) {
             !operand1.inverted);
         if (operand0.index == 0) {
           assert(operand1.index == 0);
-          addr.data = 8;
+          index = 8;
         } else {
           assert(operand1.index == 1);
-          addr.data = 9;
+          index = 9;
         }
       }
       break;
@@ -222,18 +229,18 @@ void ProgramParser::normalizeBitwiseAddress(Address &addr) {
       if (operand0.type == BitwiseOperandType::T) {
         if (operand0.index == 0) {
           assert(operand1.index == 1 && operand2.index == 2);
-          addr.data = 12;
+          index = 12;
         } else {
           assert(operand0.index == 1 && operand1.index == 2 && operand2.index ==3);
-          addr.data = 13;
+          index = 13;
         }
       } else {
         if (operand0.index == 0) {
           assert(operand1.index == 1 && operand2.index == 2);
-          addr.data = 14;
+          index = 14;
         } else {
           assert(operand0.index == 1 && operand1.index == 0 && operand2.index == 3);
-          addr.data = 15;
+          index = 15;
         }
       }
       break;
@@ -242,4 +249,8 @@ void ProgramParser::normalizeBitwiseAddress(Address &addr) {
     default:
       return;
   }
+
+  assert(index >= 0);
+  addr.data = index;
+  addr.str_repr = std::format("{}{}", 'B', index);
 }
