@@ -381,7 +381,7 @@ struct ConvertBitsToPuD
           } else {
             assert(inst.type == Instruction::Type::AAP);
 
-            Value addr0, addr1;
+            TypedValue<RowType> addr0, addr1;
 
             auto operand0 = inst.operand0;
             if (operand0.type == AddressType::Bitwise) {
@@ -435,8 +435,8 @@ struct ConvertBitsToPuD
       Value val0 = getOrCreateI64Val(0);
       Value val1 = getOrCreateI64Val(1);
 
-      Value c0 = opBuilder.create<GetRowOp>(loc, cRowType, val0, val0, val0);
-      Value c1 = opBuilder.create<GetRowOp>(loc, cRowType, val0, val0, val1);
+      TypedValue<RowType> c0 = opBuilder.create<GetRowOp>(loc, cRowType, val0, val0, val0);
+      TypedValue<RowType> c1 = opBuilder.create<GetRowOp>(loc, cRowType, val0, val0, val1);
 
       auto loop = opBuilder.create<affine::AffineForOp>(loc, 0, bitWidth, 1);
 
@@ -446,7 +446,7 @@ struct ConvertBitsToPuD
 
       for (auto &inst : program) {
         auto operand0 = inst.operand0;
-        Value addr0;
+        TypedValue<RowType> addr0;
         if (operand0.type == AddressType::Bitwise) {
           auto index = std::get<int>(operand0.data);
           addr0 = opBuilder.create<GetRowOp>(
@@ -478,7 +478,7 @@ struct ConvertBitsToPuD
         assert(inst.type == Instruction::Type::AAP);
 
         auto operand1 = *inst.operand1;
-        Value addr1;
+        TypedValue<RowType> addr1;
 
         if (operand1.type == AddressType::Bitwise) {
           auto index = std::get<int>(operand1.data);

@@ -24,6 +24,7 @@ def AAPOp : PuD_Op<"AAP", [Pure]> {
   let arguments = (ins RowType:$srcAddr, RowType:$dstAddr);
 
   let assemblyFormat = "$srcAddr `,` $dstAddr attr-dict `:` qualified(type($srcAddr)) `,` qualified(type($dstAddr))";
+  let hasVerifier = 1;
 }
 
 def APOp : PuD_Op<"AP", [Pure]> {
@@ -33,6 +34,7 @@ def APOp : PuD_Op<"AP", [Pure]> {
   let arguments = (ins RowType:$addr);
 
   let assemblyFormat = "$addr attr-dict `:` qualified(type($addr))";
+  let hasVerifier = 1;
 }
 
 def StoreOp : PuD_Op<"store", [Pure]> {
@@ -42,6 +44,7 @@ def StoreOp : PuD_Op<"store", [Pure]> {
   let arguments = (ins SliceType:$slice, RowType:$firstRow);
 
   let assemblyFormat = "$slice `,` $firstRow attr-dict `:` qualified(type($slice)) `,` qualified(type($firstRow))";
+  let hasVerifier = 1;
 }
 
 def LoadOp : PuD_Op<"load", [Pure]> {
@@ -52,6 +55,7 @@ def LoadOp : PuD_Op<"load", [Pure]> {
   let results = (outs SliceType:$slice);
 
   let assemblyFormat = "$firstRow `,` $rowNum attr-dict `:` qualified(type($firstRow)) `,` type($rowNum) `->` qualified(type($slice))";
+  let hasVerifier = 1;
 }
 
 def GetRowOp : PuD_Op<"get_row", [Pure]> {
