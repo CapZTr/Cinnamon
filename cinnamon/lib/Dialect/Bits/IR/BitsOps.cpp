@@ -91,16 +91,6 @@ LogicalResult AddOp::verify() {
   return success();
 }
 
-LogicalResult AddBitOp::verify() {
-  auto lhsTy = cast<BitType>(getLhs().getType());
-  auto rhsTy = cast<BitType>(getRhs().getType());
-
-  if (!lhsTy || !rhsTy)
-    return emitOpError("all operands must be of bits.bit type");
-
-  return mlir::success();
-}
-
 LogicalResult SubOp::verify() {
   auto lhsType = cast<SliceType>(getLhs().getType());
   auto rhsType = cast<SliceType>(getRhs().getType());
@@ -116,34 +106,4 @@ LogicalResult SubOp::verify() {
     return emitOpError("vector lengths of operands and result must match");
 
   return success();
-}
-
-LogicalResult ExtractOp::verify() {
-  auto sliceType = cast<SliceType>(getSlice().getType());
-  if (!sliceType)
-    return emitOpError("slice must be bits.slice type");
-
-  if (!getBitIndex().getType().isInteger(64))
-    return emitOpError("bitIndex must be i64");
-  if (!getVectorIndex().getType().isInteger(64))
-    return emitOpError("vectorIndex must be i64");
-
-  return mlir::success();
-}
-
-LogicalResult InsertOp::verify() {
-  auto sliceType = cast<SliceType>(getSlice().getType());
-  if (!sliceType)
-    return emitOpError("slice must be bits.slice type");
-
-  auto bitType = cast<BitType>(getBit().getType());
-  if (!bitType)
-    return emitOpError("bit must be bits.bit type");
-
-  if (!getBitIndex().getType().isInteger(64))
-    return emitOpError("bitIndex must be i64");
-  if (!getVectorIndex().getType().isInteger(64))
-    return emitOpError("vectorIndex must be i64");
-
-  return mlir::success();
 }

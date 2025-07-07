@@ -1,3 +1,5 @@
+#pragma once
+
 #include "cinm-mlir/Dialect/Bits/IR/BitsDialect.h"
 
 #include <memory>

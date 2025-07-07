@@ -7,7 +7,6 @@
 #ifndef BITS_OPS
 #define BITS_OPS
 
-
 include "BitsBase.td"
 include "BitsTypes.td"
 
@@ -49,25 +48,6 @@ def AddOp : Bits_Op<"add", [Pure, Commutative]> {
   let hasVerifier = 1;
 }
 
-
-
-
-
-
-// ===== USELESS: To Be Modified =====
-
-def AddBitOp : Bits_Op<"add_bit", [Pure]> {
-  let summary = "Bitwise addition of two single bits";
-  let description = [{}];
-
-  let arguments = (ins BitType:$lhs, BitType:$rhs, BitType:$cin);
-
-  let results = (outs BitType:$sum, BitType:$cout);
-
-  let assemblyFormat = "$lhs `,` $rhs `,` $cin attr-dict `:` qualified(type($lhs)) `,` qualified(type($rhs)) `,` qualified(type($cin)) `->` qualified(type($sum)) `,` qualified(type($cout))";
-  let hasVerifier = 1;
-}
-
 def SubOp : Bits_Op<"sub", [Pure]> {
   let summary = "Bit-serial subtraction of two slice operands";
   let description = [{}];
@@ -77,47 +57,6 @@ def SubOp : Bits_Op<"sub", [Pure]> {
 
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` qualified(type($lhs)) `,` qualified(type($rhs)) `->` qualified(type($result))";
   let hasVerifier = 1;
-}
-
-def ExtractOp : Bits_Op<"extract", [Pure]> {
-  let summary = "Extract a single bit from a bit-slice";
-  let description = [{}];
-
-  let arguments = (ins SliceType:$slice, I64:$bitIndex, I64:$vectorIndex);
-  let results = (outs BitType:$bit);
-
-  let assemblyFormat = "$slice `[` $bitIndex `,` $vectorIndex `]` attr-dict `:` qualified(type($slice)) `,` type($bitIndex) `,` type($vectorIndex) `->` qualified(type($bit))";
-  let hasVerifier = 1;
-}
-
-def InsertOp : Bits_Op<"insert", [Pure]> {
-  let summary = "Insert a bit into a bit-slice at a position encoded in BitType";
-  let description = [{}];
-
-  let arguments = (ins SliceType:$slice, BitType:$bit, I64:$bitIndex, I64:$vectorIndex);
-  let results = (outs SliceType:$result);
-
-  let assemblyFormat = "$bit `->` $slice `[` $bitIndex `,` $vectorIndex `]` attr-dict `:` qualified(type($bit)) `,` qualified(type($slice)) `,` type($bitIndex) `,` type($vectorIndex) `->` qualified(type($result))";
-  let hasVerifier = 1;
-}
-
-def CreateSliceOp : Bits_Op<"create_slice", [Pure]> {
-  let summary = "Create a zero-valued Slice";
-  let description = [{}];
-
-  let arguments = (ins I64:$bitWidth, I64:$vectorLength);
-  let results = (outs SliceType:$slice);
-
-  let assemblyFormat = "$bitWidth `,` $vectorLength attr-dict `:` type($bitWidth) `,` type($vectorLength) `->` qualified(type($slice))";
-}
-
-def CreateBitOp : Bits_Op<"create_bit", [Pure]> {
-  let summary = "Create a zero-valued Bit";
-  let description = [{}];
-
-  let results = (outs BitType:$bit);
-
-  let assemblyFormat = "attr-dict `:` qualified(type($bit))";
 }
 
 #endif

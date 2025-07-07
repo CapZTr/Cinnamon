@@ -16,20 +16,7 @@ def SliceType : Bits_Type<"Slice"> {
   let parameters = (ins
       "int64_t":$bitWidth,
       "int64_t":$vectorLength);
-      // RowAddressType:$firstRowAddr
-  // );
   let hasCustomAssemblyFormat = 1;
-}
-
-
-
-
-
-// ===== USELESS: To Be Modified =====
-
-def BitType : Bits_Type<"Bit"> {
-  let mnemonic = "bit";
-  let summary = "Represents a single bit within a bit-slice";
 }
 
 #endif
