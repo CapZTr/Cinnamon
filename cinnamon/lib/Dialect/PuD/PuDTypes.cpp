@@ -5,6 +5,7 @@
 #include "cinm-mlir/Dialect/PuD/IR/PuDTypes.h"
 #include "cinm-mlir/Dialect/PuD/IR/PuDAttributes.h"
 
+#include <cstdint>
 #include <llvm/ADT/TypeSwitch.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinAttributes.h>
@@ -35,63 +36,32 @@ void PuDDialect::registerTypes() {
         >();
 }
 
-// Type BitwiseRowAddressType::parse(AsmParser &parser) {
-//   if (parser.parseLess()) return Type();
+Type RowType::parse(AsmParser &parser) {
+  StringRef key;
 
-//   int64_t bankID, subarrayID, rowID;
-//   if (parser.parseInteger(bankID) || parser.parseComma() ||
-//       parser.parseInteger(subarrayID) || parser.parseComma() ||
-//       parser.parseInteger(rowID) || parser.parseGreater()) {
-//     return Type();
-//   }
+  if (parser.parseLess() || parser.parseKeyword(&key) || parser.parseGreater())
+    return Type();
+  
+  int64_t group;
+  if (key == "B") group = 0;
+  else if (key == "C") group = 1;
+  else if (key == "D") group = 2;
+  else {
+    parser.emitError(parser.getCurrentLocation(),
+        "expected: <B>, <C> or <D>");
+    return Type();
+  }
 
-//   return BitwiseRowAddressType::get(parser.getContext(), bankID, subarrayID, rowID);
-// }
+  return RowType::get(parser.getContext(), group);
+}
 
-// void BitwiseRowAddressType::print(AsmPrinter &printer) const {
-//   printer << "<"
-//       << getBankID() << ", "
-//       << getSubarrayID() << ", "
-//       << "B" << getRowID() << ">";
-// }
-
-// Type ControlRowAddressType::parse(AsmParser &parser) {
-//   if (parser.parseLess()) return Type();
-
-//   int64_t bankID, subarrayID, rowID;
-//   if (parser.parseInteger(bankID) || parser.parseComma() ||
-//       parser.parseInteger(subarrayID) || parser.parseComma() ||
-//       parser.parseInteger(rowID) || parser.parseGreater()) {
-//     return Type();
-//   }
-
-//   return ControlRowAddressType::get(parser.getContext(), bankID, subarrayID, rowID == 1);
-// }
-
-// void ControlRowAddressType::print(AsmPrinter &printer) const {
-//   int rowID = getRowID() ? 1 : 0;
-//   printer << "<"
-//       << getBankID() << ", "
-//       << getSubarrayID() << ", "
-//       << "C" << rowID << ">";
-// }
-
-// Type DataRowAddressType::parse(AsmParser &parser) {
-//   if (parser.parseLess()) return Type();
-
-//   int64_t bankID, subarrayID, rowID;
-//   if (parser.parseInteger(bankID) || parser.parseComma() ||
-//       parser.parseInteger(subarrayID) || parser.parseComma() ||
-//       parser.parseInteger(rowID) || parser.parseGreater()) {
-//     return Type();
-//   }
-
-//   return DataRowAddressType::get(parser.getContext(), bankID, subarrayID, rowID);
-// }
-
-// void DataRowAddressType::print(AsmPrinter &printer) const {
-//   printer << "<"
-//       << getBankID() << ", "
-//       << getSubarrayID() << ", "
-//       << "D" << getRowID() << ">";
-// }
+void RowType::print(AsmPrinter &printer) const {
+  printer << "<";
+  switch (getGroup()) {
+    case 0: printer << "B"; break;
+    case 1: printer << "C"; break;
+    case 2: printer << "D"; break;
+    default: printer << "Invalid"; break;
+  }
+  printer << ">";
+}

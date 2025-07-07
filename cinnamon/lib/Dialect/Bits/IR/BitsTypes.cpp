@@ -33,54 +33,17 @@ void BitsDialect::registerTypes() {
         >();
 }
 
-Type RowAddressType::parse(AsmParser &parser) {
-  if (parser.parseLess())
-    return Type();
-
-  int64_t bankID, subarrayID, rowID;
-  if (parser.parseInteger(bankID) || parser.parseComma() ||
-      parser.parseInteger(subarrayID) || parser.parseComma() ||
-      parser.parseInteger(rowID) || parser.parseGreater()) {
-    return Type();
-  }
-
-  return RowAddressType::get(parser.getContext(), bankID, subarrayID, rowID);
-}
-
-void RowAddressType::print(AsmPrinter &printer) const {
-  printer << "<" << getBankID() << ", "
-      << getSubarrayID() << ", "
-      << getRowID() << ">";
-}
-
 Type SliceType::parse(AsmParser &parser) {
-  // if (parser.parseLess())
-  //   return Type();
-
   SmallVector<int64_t> shape;
-  // Type rowAddrType;
 
   if (parser.parseLess() ||
       parser.parseDimensionList(shape, /*allowDynamic=*/false, /*withTrailingX=*/false) ||
-      // parser.parseGreater() ||
-      // parser.parseComma() ||
-      // parser.parseType(rowAddrType) ||
-      // !mlir::isa<RowAddressType>(rowAddrType) ||
       parser.parseGreater()) {
     return Type();
   }
 
-  // auto firstRow = mlir::cast<RowAddressType>(rowAddrType);
-
-  // return SliceType::get(parser.getContext(), shape.front(), shape.back(), firstRow);
   return SliceType::get(parser.getContext(), shape.front(), shape.back());
 }
-
-// void SliceType::print(AsmPrinter &printer) const {
-//   printer << "<" 
-//       << "<" << getBitWidth() << "x" << getVectorLength() << ">"
-//       << ", " << getFirstRowAddr() << ">";
-// }
 
 void SliceType::print(AsmPrinter &printer) const {
   printer << "<" << getBitWidth() << "x" << getVectorLength() << ">";

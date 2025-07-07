@@ -32,16 +32,4 @@ def BitType : Bits_Type<"Bit"> {
   let summary = "Represents a single bit within a bit-slice";
 }
 
-def RowAddressType : Bits_Type<"RowAddress"> {
-  let mnemonic = "row_address";
-  let summary = "Represents a row within a DRAM subarray";
-
-  let parameters = (ins
-      "int64_t":$bankID,
-      "int64_t":$subarrayID,
-      "int64_t":$rowID
-  );
-  let hasCustomAssemblyFormat = 1;
-}
-
 #endif
