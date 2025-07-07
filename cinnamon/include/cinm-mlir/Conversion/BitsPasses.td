@@ -13,9 +13,14 @@ def ConvertBitsToPuD : Pass<"convert-bits-to-pud", operation="func::FuncOp"> {
   let summary = "Convert Bits dialect to PuD Dialect";
   let constructor = "mlir::bits::createConvertBitsToPuDPass()";
   let dependentDialects = [
+    "mlir::affine::AffineDialect",
+    "mlir::arith::ArithDialect",
     "mlir::bits::BitsDialect",
     "mlir::func::FuncDialect",
     "mlir::pud::PuDDialect"
+  ];
+  let options = [
+    Option<"unroll", "unroll", "bool", "false", "Unroll the loops">
   ];
 }
 

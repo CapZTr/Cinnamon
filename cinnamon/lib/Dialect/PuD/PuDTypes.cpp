@@ -35,63 +35,63 @@ void PuDDialect::registerTypes() {
         >();
 }
 
-Type BitwiseRowAddressType::parse(AsmParser &parser) {
-  if (parser.parseLess()) return Type();
+// Type BitwiseRowAddressType::parse(AsmParser &parser) {
+//   if (parser.parseLess()) return Type();
 
-  int64_t bankID, subarrayID, rowID;
-  if (parser.parseInteger(bankID) || parser.parseComma() ||
-      parser.parseInteger(subarrayID) || parser.parseComma() ||
-      parser.parseInteger(rowID) || parser.parseGreater()) {
-    return Type();
-  }
+//   int64_t bankID, subarrayID, rowID;
+//   if (parser.parseInteger(bankID) || parser.parseComma() ||
+//       parser.parseInteger(subarrayID) || parser.parseComma() ||
+//       parser.parseInteger(rowID) || parser.parseGreater()) {
+//     return Type();
+//   }
 
-  return BitwiseRowAddressType::get(parser.getContext(), bankID, subarrayID, rowID);
-}
+//   return BitwiseRowAddressType::get(parser.getContext(), bankID, subarrayID, rowID);
+// }
 
-void BitwiseRowAddressType::print(AsmPrinter &printer) const {
-  printer << "<"
-      << getBankID() << ", "
-      << getSubarrayID() << ", "
-      << "B" << getRowID() << ">";
-}
+// void BitwiseRowAddressType::print(AsmPrinter &printer) const {
+//   printer << "<"
+//       << getBankID() << ", "
+//       << getSubarrayID() << ", "
+//       << "B" << getRowID() << ">";
+// }
 
-Type ControlRowAddressType::parse(AsmParser &parser) {
-  if (parser.parseLess()) return Type();
+// Type ControlRowAddressType::parse(AsmParser &parser) {
+//   if (parser.parseLess()) return Type();
 
-  int64_t bankID, subarrayID, rowID;
-  if (parser.parseInteger(bankID) || parser.parseComma() ||
-      parser.parseInteger(subarrayID) || parser.parseComma() ||
-      parser.parseInteger(rowID) || parser.parseGreater()) {
-    return Type();
-  }
+//   int64_t bankID, subarrayID, rowID;
+//   if (parser.parseInteger(bankID) || parser.parseComma() ||
+//       parser.parseInteger(subarrayID) || parser.parseComma() ||
+//       parser.parseInteger(rowID) || parser.parseGreater()) {
+//     return Type();
+//   }
 
-  return ControlRowAddressType::get(parser.getContext(), bankID, subarrayID, rowID == 1);
-}
+//   return ControlRowAddressType::get(parser.getContext(), bankID, subarrayID, rowID == 1);
+// }
 
-void ControlRowAddressType::print(AsmPrinter &printer) const {
-  int rowID = getRowID() ? 1 : 0;
-  printer << "<"
-      << getBankID() << ", "
-      << getSubarrayID() << ", "
-      << "C" << rowID << ">";
-}
+// void ControlRowAddressType::print(AsmPrinter &printer) const {
+//   int rowID = getRowID() ? 1 : 0;
+//   printer << "<"
+//       << getBankID() << ", "
+//       << getSubarrayID() << ", "
+//       << "C" << rowID << ">";
+// }
 
-Type DataRowAddressType::parse(AsmParser &parser) {
-  if (parser.parseLess()) return Type();
+// Type DataRowAddressType::parse(AsmParser &parser) {
+//   if (parser.parseLess()) return Type();
 
-  int64_t bankID, subarrayID, rowID;
-  if (parser.parseInteger(bankID) || parser.parseComma() ||
-      parser.parseInteger(subarrayID) || parser.parseComma() ||
-      parser.parseInteger(rowID) || parser.parseGreater()) {
-    return Type();
-  }
+//   int64_t bankID, subarrayID, rowID;
+//   if (parser.parseInteger(bankID) || parser.parseComma() ||
+//       parser.parseInteger(subarrayID) || parser.parseComma() ||
+//       parser.parseInteger(rowID) || parser.parseGreater()) {
+//     return Type();
+//   }
 
-  return DataRowAddressType::get(parser.getContext(), bankID, subarrayID, rowID);
-}
+//   return DataRowAddressType::get(parser.getContext(), bankID, subarrayID, rowID);
+// }
 
-void DataRowAddressType::print(AsmPrinter &printer) const {
-  printer << "<"
-      << getBankID() << ", "
-      << getSubarrayID() << ", "
-      << "D" << getRowID() << ">";
-}
+// void DataRowAddressType::print(AsmPrinter &printer) const {
+//   printer << "<"
+//       << getBankID() << ", "
+//       << getSubarrayID() << ", "
+//       << "D" << getRowID() << ">";
+// }
