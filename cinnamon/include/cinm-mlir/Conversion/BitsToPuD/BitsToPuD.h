@@ -7,4 +7,5 @@
 
 namespace mlir::bits {
 std::unique_ptr<Pass> createConvertBitsToPuDPass();
+std::unique_ptr<Pass> createConvertBitsToPuDPass(bool doUnroll);
 } // namespace mlir::bits

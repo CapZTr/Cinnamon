@@ -27,49 +27,6 @@ using namespace mlir::bits;
 
 namespace {
 
-struct RowAddress {
-  int64_t bank;
-  int64_t subarray;
-  int64_t row;
-};
-
-class AddressAllocator {
-public:
-  AddressAllocator() = default;
-
-  RowAddress allocate(int64_t numRows) {
-    if (currentRow + numRows > MAX_ROW) {
-      currentRow = 0;
-      ++currentSubarray;
-      if (currentSubarray > MAX_SUBARRAY) {
-        currentSubarray = 0;
-        ++currentBank;
-        if (currentBank > MAX_BANK)
-          llvm::report_fatal_error(
-              "AddressAllocator: DRAM address space exhausted");
-      }
-    }
-    RowAddress addr = {currentBank, currentSubarray, currentRow};
-    currentRow += numRows;
-    return addr;
-  }
-
-private:
-  const int64_t MAX_BANK = 15;
-  const int64_t MAX_SUBARRAY = 31;
-  const int64_t MAX_ROW = 1005;
-  int64_t currentBank = 0;
-  int64_t currentSubarray = 0;
-  int64_t currentRow = 0;
-};
-
-struct GlobalAddressAllocator {
-  static AddressAllocator &get() {
-    static AddressAllocator allocator;
-    return allocator;
-  }
-};
-
 struct InputCache {
   static llvm::DenseMap<Value, Value> &get() {
     static llvm::DenseMap<Value, Value> cache;
@@ -129,10 +86,6 @@ struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
       if (it != inputCache.end())
         return it->second;
 
-      // auto &allocator = GlobalAddressAllocator::get();
-      // RowAddress addr = allocator.allocate(bitWidth);
-      // auto addrType = RowAddressType::get(
-      //     ctx, addr.bank, addr.subarray, addr.row);
       auto sliceType = SliceType::get(ctx, bitWidth, vectorLen);
       Value slice = rewriter.create<TransposeOp>(loc, sliceType, operand);
 
@@ -144,10 +97,6 @@ struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
     Value lhsSlice = getOrCreateSlice(lhs);
     Value rhsSlice = getOrCreateSlice(rhs);
 
-    // auto &allocator = GlobalAddressAllocator::get();
-    // RowAddress addr = allocator.allocate(bitWidth);
-    // auto addrType = RowAddressType::get(
-    //     ctx, addr.bank, addr.subarray, addr.row);
     auto sliceType = SliceType::get(ctx, bitWidth, vectorLen);
     Value resultSlice = rewriter.create<TargetOp>(loc, sliceType, lhsSlice, rhsSlice);
 

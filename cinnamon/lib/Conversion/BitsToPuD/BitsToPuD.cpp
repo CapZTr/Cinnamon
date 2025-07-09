@@ -77,8 +77,8 @@ public:
   }
 
 private:
-  const int64_t MAX_BANK = 15;
-  const int64_t MAX_SUBARRAY = 31;
+  const int64_t MAX_BANK = 31;
+  const int64_t MAX_SUBARRAY = 63;
   const int64_t MAX_ROW = 1005;
   int64_t currentBank = 0;
   int64_t currentSubarray = 0;
@@ -141,7 +141,7 @@ struct ConvertBitsToPuD
 
     ProgramString program_str;
     auto [optimized, result] = ambit_rewrite(settings, mig, program_str);
-    std::cout << "Generated program:\n" << program_str.str() << "\n";
+    // std::cout << "Generated program:\n" << program_str.str() << "\n";
 
     // NetworkBuilder::debugPrint(optimized);
 
@@ -158,7 +158,7 @@ struct ConvertBitsToPuD
       signalPassFailure();
     }
     std::vector<Instruction> program = parser.getProgram();
-    std::cout << " ===== Parsed " << program.size() << " instructions =====" << "\n";
+    // std::cout << " ===== Parsed " << program.size() << " instructions =====" << "\n";
 
 
     // =========================================================================
@@ -525,10 +525,20 @@ struct ConvertBitsToPuD
     return allocator.allocate(numRows);
   }
 
+  void setUnroll(bool doUnroll) {
+    this->unroll = doUnroll;
+  }
+
 };
 
 } // namespace
 
 std::unique_ptr<Pass> mlir::bits::createConvertBitsToPuDPass() {
   return std::make_unique<ConvertBitsToPuD>();
+}
+
+std::unique_ptr<Pass> mlir::bits::createConvertBitsToPuDPass(bool doUnroll) {
+  auto pass = std::make_unique<ConvertBitsToPuD>();
+  pass->setUnroll(doUnroll);
+  return pass;
 }
