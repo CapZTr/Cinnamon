@@ -93,7 +93,7 @@ int main(int argc, char **argv) {
   DenseMap<mlir::TypedValue<IntegerType>, int64_t> indices;
   DenseMap<mlir::TypedValue<pud::RowType>, std::string> addrs;
   
-  int cycle = 0;
+  int cycle = 1;
 
   auto getAddressAsStr = [&indices, &addrs](mlir::TypedValue<pud::RowType> rowAddr)
       -> std::string {
