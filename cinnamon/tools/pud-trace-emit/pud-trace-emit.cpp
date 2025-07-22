@@ -39,10 +39,16 @@
 
 using namespace mlir;
 
+const int NUM_RANK_PER_CHANNEL = 2;
+const int NUM_BANK_PER_RANK = 8;
+const int NUM_SUBARRAY_PER_BANK = 64;
 const int NUM_ROW_PER_SUBARRAY = 1024;
+const int64_t NUM_ROW_PER_BANK = NUM_ROW_PER_SUBARRAY * NUM_SUBARRAY_PER_BANK;
+const int64_t NUM_ROW_PER_RANK = NUM_ROW_PER_BANK * NUM_BANK_PER_RANK;
+const int64_t NUM_ROW_PER_CHANEL = NUM_ROW_PER_RANK * NUM_RANK_PER_CHANNEL;
 const std::string DUMMY_DATA = "b186649dd2c40617e1df8669b90acd6389c0e5f8e5c059c5a4ea4f9eb6409eaacf4380666a43bcc792e0d3f2a7b88eca6067d625801408a3df929bb8b4136b68";
 
-std::string intToHex(const int v) {
+std::string intToHex(const int64_t v) {
   std::stringstream ss;
   ss << "0x" << std::hex << v;
   return ss.str();
@@ -85,22 +91,24 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // std::cout << "Successfully ran passes\n";
-
   std::vector<std::string> trace;
   trace.push_back(">");
 
   DenseMap<mlir::TypedValue<IntegerType>, int64_t> indices;
   DenseMap<mlir::TypedValue<pud::RowType>, std::string> addrs;
+  DenseMap<mlir::TypedValue<pud::RowType>, int64_t> saMap;
   
   int cycle = 1;
 
-  auto getAddressAsStr = [&indices, &addrs](mlir::TypedValue<pud::RowType> rowAddr)
+  auto getAddressAsStr = [&indices, &addrs, &saMap](mlir::TypedValue<pud::RowType> rowAddr)
       -> std::string {
     if (!addrs.contains(rowAddr)) {
+      assert(!saMap.contains(rowAddr));
       auto op = rowAddr.getDefiningOp();
       assert(isa<pud::GetRowOp>(*op));
       auto getRow = cast<pud::GetRowOp>(*op);
+      auto channel = indices.lookup(getRow.getChannelID());
+      auto rank = indices.lookup(getRow.getRankID());
       auto bank = indices.lookup(getRow.getBankID());
       auto subarray = indices.lookup(getRow.getSubarrayID());
       auto row = indices.lookup(getRow.getRowID());
@@ -112,8 +120,12 @@ int main(int argc, char **argv) {
       } else {
         assert(group == 2);
       }
-      auto addrAsInt = subarray * NUM_ROW_PER_SUBARRAY + row;
-      addrs[rowAddr] = intToHex(addrAsInt);
+      auto firstRowInSa = channel * NUM_ROW_PER_CHANEL
+          + rank * NUM_ROW_PER_RANK
+          + bank * NUM_ROW_PER_BANK
+          + subarray * NUM_ROW_PER_SUBARRAY;
+      saMap[rowAddr] = firstRowInSa;
+      addrs[rowAddr] = intToHex(firstRowInSa + row);
     }
     return addrs.lookup(rowAddr);
   };
@@ -156,12 +168,19 @@ int main(int argc, char **argv) {
         int rowNum1 = 1;
         if (row1.getType().getGroup() == 0)
           rowNum1 = getRowNum(row1);
-        auto maxNum = std::max(rowNum0, rowNum1);
-        const std::string opName = maxNum == 1 ? "O"
-            : maxNum == 2 ? "ODRA"
-            : "OTRA";
-        trace.push_back(getTraceLine(cycle, opName, addr0, std::make_optional(addr1)));
-        cycle++;
+        if (saMap.lookup(row0) == saMap.lookup(row1)) {
+          auto maxNum = std::max(rowNum0, rowNum1);
+          const std::string opName = maxNum == 1 ? "O"
+              : maxNum == 2 ? "ODRA"
+              : "OTRA";
+          trace.push_back(getTraceLine(cycle, opName, addr0, std::make_optional(addr1)));
+          cycle++;
+        } else {
+          trace.push_back(getTraceLine(cycle, "R", addr0, std::nullopt));
+          cycle++;
+          trace.push_back(getTraceLine(cycle, "W", addr1, std::nullopt));
+          cycle++;
+        }
       }
     });
   });
