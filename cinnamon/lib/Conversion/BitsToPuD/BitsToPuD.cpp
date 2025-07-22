@@ -105,9 +105,6 @@ public:
             currentRank = 0;
             ++currentChannel;
             if (currentChannel > MAX_CHANNEL) {
-              // loops
-              // llvm::report_fatal_error(
-              //     "AddressAllocator: DRAM address space exhausted");
             }
           }
         }
@@ -139,7 +136,8 @@ public:
         rank, 
         bank, 
         sa, 
-        row};
+        row
+    };
 
     int64_t saToUpdate = channel * 2 + rank * 2 + bank * 8 + sa;
     int64_t rest = MAX_ROW - row - numRows;
@@ -152,6 +150,14 @@ public:
     auto rowID = base.row + offset;
     assert(rowID <= MAX_ROW);
     return {base.channel, base.rank, base.bank, base.subarray, rowID};
+  }
+
+  void reset() {
+    currentChannel = 0;
+    currentRank = 0;
+    currentBank = 0;
+    currentSubarray = 0;
+    currentRow = 0;
   }
 
 private:
@@ -187,19 +193,6 @@ struct GlobalAddressAllocator {
   }
 };
 
-// struct InputCache {
-//   static llvm::DenseMap<Value, Value> &get() {
-//     static llvm::DenseMap<Value, Value> cache;
-//     return cache;
-//   }
-// };
-
-// struct SliceCache {
-//   static llvm::DenseMap<Operation *, Value> &get() {
-//     static llvm::DenseMap<Operation *, Value> cache;
-//     return cache;
-//   }
-// };
 
 struct ConvertBitsToPuD
     : public ConvertBitsToPuDBase<ConvertBitsToPuD> {
@@ -253,6 +246,7 @@ struct ConvertBitsToPuD
       signalPassFailure();
     }
     std::vector<Instruction> program = parser.getProgram();
+    parser.printProgram();
     // std::cout << " ===== Parsed " << program.size() << " instructions =====" << "\n";
 
 

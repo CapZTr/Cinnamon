@@ -1,6 +1,8 @@
 #pragma once
 
 #include <llvm/Support/LogicalResult.h>
+
+#include <iostream>
 #include <optional>
 #include <string>
 #include <variant>
@@ -34,6 +36,20 @@ public:
   llvm::LogicalResult parse();
 
   const std::vector<Instruction> &getProgram() const { return program; }
+
+  void printProgram() const {
+    std::cout << "\n========== Program ==========\n";
+    for (const auto &inst : program) {
+      std::string s = inst.type == Instruction::Type::AP ? "AP  " : "AAP ";
+      s += inst.operand0.str_repr;
+      if (inst.operand1.has_value()) {
+        s += " ";
+        s += inst.operand1->str_repr;
+      }
+      std::cout << s << '\n';
+    }
+    std::cout << "=============================\n\n";
+  }
 
 private:
   std::vector<Instruction> program;
