@@ -29,6 +29,7 @@
 #include <mlir/Support/LLVM.h>
 #include <mlir/Transforms/DialectConversion.h>
 
+#include <format>
 #include <iostream>
 #include <mockturtle/generators/arithmetic.hpp>
 #include <mockturtle/io/write_dot.hpp>
@@ -50,9 +51,27 @@ using MIG = mockturtle::mig_network;
 namespace {
 
 struct RowAddress {
+  int64_t channel;
+  int64_t rank;
   int64_t bank;
   int64_t subarray;
   int64_t row;
+
+  bool inSameSubArray(const RowAddress &other) {
+    return this->channel == other.channel
+        && this->rank == other.rank
+        && this->bank == other.bank
+        && this->subarray == other.subarray;
+  }
+
+  std::string str() {
+    return std::format("{} {} {} {} {}",
+        channel,
+        rank,
+        bank,
+        subarray,
+        row);
+  }
 };
 
 class AddressAllocator {
@@ -60,29 +79,105 @@ public:
   AddressAllocator() = default;
 
   RowAddress allocate(int64_t numRows) {
-    if (currentRow + numRows > MAX_ROW) {
+    assert(numRows <= MAX_ROW);
+
+    auto subArrayID = checkSpace(numRows);
+    auto saLocalID = subArrayID % 64;
+
+    int64_t channel = currentChannel;
+    int64_t rank = currentRank;
+    int64_t bank = currentBank;
+    int64_t sa = currentSubarray;
+    int64_t row = currentRow;
+    if (saLocalID == currentBank) {
+      currentRow += numRows;
+      row = currentRow;
+    } else if (subArrayID == -1) {
       currentRow = 0;
       ++currentSubarray;
       if (currentSubarray > MAX_SUBARRAY) {
         currentSubarray = 0;
         ++currentBank;
-        if (currentBank > MAX_BANK)
-          llvm::report_fatal_error(
-              "AddressAllocator: DRAM address space exhausted");
+        if (currentBank > MAX_BANK) {
+          currentBank = 0;
+          ++currentRank;
+          if (currentRank > MAX_RANK) {
+            currentRank = 0;
+            ++currentChannel;
+            if (currentChannel > MAX_CHANNEL) {
+              // loops
+              // llvm::report_fatal_error(
+              //     "AddressAllocator: DRAM address space exhausted");
+            }
+          }
+        }
       }
+      channel = currentChannel;
+      rank = currentRank;
+      bank = currentRank;
+      sa = currentSubarray;
+      row = currentRow;
+    } else {
+      int64_t channelSANum = 2 * 8 * 64;
+      channel = subArrayID < channelSANum ? 0 : 1;
+
+      auto saChannelID = subArrayID % channelSANum;
+      int64_t rankSANum = 8 * 64;
+
+      rank = saChannelID < rankSANum ? 0 : 1;
+      auto saRankID = saChannelID % rankSANum;
+
+      bank = saRankID / 8;
+
+      sa = saLocalID;
+      auto space = restSpace.lookup(subArrayID);
+      row = MAX_ROW - space;
     }
-    RowAddress addr = {currentBank, currentSubarray, currentRow};
-    currentRow += numRows;
+
+    RowAddress addr = { 
+        channel, 
+        rank, 
+        bank, 
+        sa, 
+        row};
+
+    int64_t saToUpdate = channel * 2 + rank * 2 + bank * 8 + sa;
+    int64_t rest = MAX_ROW - row - numRows;
+    restSpace[saToUpdate] = rest;
+
     return addr;
   }
 
+  RowAddress getRowFromOffset(const RowAddress &base, const int64_t offset) {
+    auto rowID = base.row + offset;
+    assert(rowID <= MAX_ROW);
+    return {base.channel, base.rank, base.bank, base.subarray, rowID};
+  }
+
 private:
-  const int64_t MAX_BANK = 31;
+  const int64_t MAX_CHANNEL = 1;
+  const int64_t MAX_RANK = 1;
+  const int64_t MAX_BANK = 7;
   const int64_t MAX_SUBARRAY = 63;
   const int64_t MAX_ROW = 1005;
+  const int64_t MAX_COLUMN = 8192;
+
+  int64_t currentChannel = 0;
+  int64_t currentRank = 0;
   int64_t currentBank = 0;
   int64_t currentSubarray = 0;
   int64_t currentRow = 0;
+
+  DenseMap<int64_t, int64_t> restSpace;
+
+  int checkSpace(int64_t numRows) const {
+    int subArrayID = -1;
+    for (const auto &pair : restSpace) {
+      if (numRows <= pair.second)
+        subArrayID = pair.first;
+    }
+    return subArrayID;
+  }
 };
 
 struct GlobalAddressAllocator {
@@ -92,19 +187,19 @@ struct GlobalAddressAllocator {
   }
 };
 
-struct InputCache {
-  static llvm::DenseMap<Value, Value> &get() {
-    static llvm::DenseMap<Value, Value> cache;
-    return cache;
-  }
-};
+// struct InputCache {
+//   static llvm::DenseMap<Value, Value> &get() {
+//     static llvm::DenseMap<Value, Value> cache;
+//     return cache;
+//   }
+// };
 
-struct SliceCache {
-  static llvm::DenseMap<Operation *, Value> &get() {
-    static llvm::DenseMap<Operation *, Value> cache;
-    return cache;
-  }
-};
+// struct SliceCache {
+//   static llvm::DenseMap<Operation *, Value> &get() {
+//     static llvm::DenseMap<Operation *, Value> cache;
+//     return cache;
+//   }
+// };
 
 struct ConvertBitsToPuD
     : public ConvertBitsToPuDBase<ConvertBitsToPuD> {
@@ -212,20 +307,93 @@ struct ConvertBitsToPuD
     DenseMap<int64_t, Value> i64Vals;
     auto getOrCreateI64Val = [&opBuilder, &loc, &i64Type, &i64Vals](int64_t num) -> Value {
       if (!i64Vals.contains(num)) {
-        Value val = opBuilder.create<arith::ConstantOp>(loc, i64Type, opBuilder.getI64IntegerAttr(num));
+        Value val = opBuilder.create<arith::ConstantOp>(
+            loc, i64Type, opBuilder.getI64IntegerAttr(num));
         i64Vals[num] = val;
       }
       return i64Vals.lookup(num);
     };
+
+    // =========================================================================
+    // ========== Address Allocation ==========
+    // =========================================================================
+
+    auto &allocator = GlobalAddressAllocator::get();
     
     llvm::StringMap<RowAddress> allocated;
     llvm::StringMap<TypedValue<RowType>> firstRows;
+    llvm::StringMap<TypedValue<RowType>> rowMap;
 
     SmallVector<TypedValue<RowType>> outputs;
 
     auto bRowType = RowType::get(ctx, 0);
     auto cRowType = RowType::get(ctx, 1);
     auto dRowType = RowType::get(ctx, 2);
+
+    auto getOrCreateDRow = [&loc, &opBuilder, &dRowType, &rowMap, &getOrCreateI64Val]
+        (RowAddress addr) -> TypedValue<RowType> {
+      auto addrStr = addr.str();
+      if (!rowMap.contains(addrStr)) {
+        Value rowVal = opBuilder.create<GetRowOp>(
+            loc,
+            dRowType,
+            getOrCreateI64Val(addr.channel),
+            getOrCreateI64Val(addr.rank),
+            getOrCreateI64Val(addr.bank),
+            getOrCreateI64Val(addr.subarray),
+            getOrCreateI64Val(addr.row)
+        );
+        rowMap[addrStr] = cast<TypedValue<RowType>>(rowVal);
+      }
+      return rowMap.lookup(addrStr);
+    };
+
+    const Value zero = getOrCreateI64Val(0);
+
+    // =========================================================================
+    // ========== Bitwise & Control Rows Generation ==========
+    // TODO: This is a workaround.
+    //       Currently we use B and C group rows from subarry (0, 0, 0, 0) only.
+    //       We need an algorithm to find the optimality with lowest latency of
+    //       inter-subarray row clone.
+    // =========================================================================
+
+    SmallVector<TypedValue<RowType>, 16> bRows;
+    for (int i = 0; i < 16; ++i) {
+      Value bRow = opBuilder.create<GetRowOp>(
+          loc,
+          bRowType,
+          zero,
+          zero,
+          zero,
+          zero,
+          getOrCreateI64Val(i)
+      );
+      bRows.push_back(cast<TypedValue<RowType>>(bRow));
+    }
+
+    const TypedValue<RowType> c0 = opBuilder.create<GetRowOp>(
+        loc,
+        cRowType,
+        zero,
+        zero,
+        zero,
+        zero,
+        zero
+    );
+    const TypedValue<RowType> c1 = opBuilder.create<GetRowOp>(
+        loc,
+        cRowType,
+        zero,
+        zero,
+        zero,
+        zero,
+        getOrCreateI64Val(1)
+    );
+
+    // =========================================================================
+    // ========== Data rows Allocation ==========
+    // =========================================================================
 
     for (auto &inst : program) {
       if (inst.type == Instruction::Type::AAP) {
@@ -236,17 +404,11 @@ struct ConvertBitsToPuD
             assert(mapping.contains(inputSlices[data]));
             auto mapped = mapping.lookup(inputSlices[data]);
             auto newSlice = cast<TypedValue<SliceType>>(mapped);
-            auto addr = allocate(bitWidth);
+            auto addr = allocate(newSlice.getType().getBitWidth());
             allocated[operand0.str_repr] = addr;
-            Value firstRow = opBuilder.create<GetRowOp>(
-                loc,
-                dRowType,
-                getOrCreateI64Val(addr.bank),
-                getOrCreateI64Val(addr.subarray),
-                getOrCreateI64Val(addr.row)
-            );
+            auto firstRow = getOrCreateDRow(addr);
             auto store = opBuilder.create<StoreOp>(loc, newSlice, firstRow);
-            firstRows[operand0.str_repr] = cast<TypedValue<RowType>>(firstRow);
+            firstRows[operand0.str_repr] = firstRow;
           }
         } else if (operand0.type == AddressType::Spill) {
           assert(allocated.contains(operand0.str_repr));
@@ -257,117 +419,21 @@ struct ConvertBitsToPuD
           if (!allocated.contains(operand1.str_repr)) {
             auto addr = allocate(bitWidth);
             allocated[operand1.str_repr] = addr;
-            Value firstRow = opBuilder.create<GetRowOp>(
-                loc,
-                dRowType,
-                getOrCreateI64Val(addr.bank),
-                getOrCreateI64Val(addr.subarray),
-                getOrCreateI64Val(addr.row)
-            );
-            firstRows[operand1.str_repr] = cast<TypedValue<RowType>>(firstRow);
+            auto firstRow = getOrCreateDRow(addr);
+            firstRows[operand1.str_repr] = firstRow;
             if (operand1.type == AddressType::Out)
-              outputs.push_back(cast<TypedValue<RowType>>(firstRow));
+              outputs.push_back(firstRow);
           }
+        } else if (operand1.type == AddressType::Bitwise) {
         }
+      } else {
+        assert(inst.type == Instruction::Type::AP);
       }
     }
 
     if (this->unroll) {
 
       int64_t iterIndex = 0;
-      int64_t currentBank = 0;
-      int64_t currentSubarray = 0;
-      SmallVector<SmallVector<DenseMap<int64_t, Value>>> bitwiseAddrs;
-      SmallVector<SmallVector<DenseMap<int, Value>>> controlAddrs;
-      SmallVector<SmallVector<DenseMap<int64_t, Value>>> dataAddrs;
-
-      auto getBitwiseAddress = [&loc, &opBuilder, &bRowType, &bitwiseAddrs, &currentBank, &currentSubarray, &getOrCreateI64Val]
-          (int index) -> TypedValue<RowType> {
-        Value bAddr;
-
-        if (bitwiseAddrs.size() <= static_cast<size_t>(currentBank)) {
-          bitwiseAddrs.push_back(SmallVector<DenseMap<int64_t, Value>>());
-        }
-
-        auto &subarrays = bitwiseAddrs[currentBank];
-        if (subarrays.size() <= static_cast<size_t>(currentSubarray)) {
-          subarrays.push_back(DenseMap<int64_t, Value>());
-        }
-
-        auto &addrs = subarrays[currentSubarray];
-        if (!addrs.contains(index)) {
-          Value addr = opBuilder.create<GetRowOp>(
-              loc,
-              bRowType,
-              getOrCreateI64Val(currentBank),
-              getOrCreateI64Val(currentSubarray),
-              getOrCreateI64Val(index)
-          );
-          addrs[index] = addr;
-        }
-
-        bAddr = addrs.lookup(index);
-        return cast<TypedValue<RowType>>(bAddr);
-      };
-
-      auto getControlAddress = [&loc, &opBuilder, &cRowType, &controlAddrs, &currentBank, &currentSubarray, &getOrCreateI64Val]
-          (int val) -> TypedValue<RowType> {
-        Value cAddr;
-
-        if (controlAddrs.size() <= static_cast<size_t>(currentBank)) {
-          controlAddrs.push_back(SmallVector<DenseMap<int, Value>>());
-        }
-
-        auto &subarrays = controlAddrs[currentBank];
-        if (subarrays.size() <= static_cast<size_t>(currentSubarray)) {
-          subarrays.push_back(DenseMap<int, Value>());
-        }
-
-        auto &addrs = subarrays[currentSubarray];
-        if (!addrs.contains(val)) {
-          Value addr = opBuilder.create<GetRowOp>(
-              loc,
-              cRowType,
-              getOrCreateI64Val(currentBank),
-              getOrCreateI64Val(currentSubarray),
-              getOrCreateI64Val(val)
-          );
-          addrs[val] = addr;
-        }
-
-        cAddr = addrs.lookup(val);
-        return cast<TypedValue<RowType>>(cAddr);
-      };
-
-      auto getDataAddress = [&loc, &opBuilder, &dRowType, &dataAddrs, &currentBank, &currentSubarray, &getOrCreateI64Val]
-          (int64_t index) -> TypedValue<RowType> {
-        Value dAddr;
-
-        if (dataAddrs.size() <= static_cast<size_t>(currentBank)) {
-          dataAddrs.push_back(SmallVector<DenseMap<int64_t, Value>>());
-        }
-
-        auto &subarrays = dataAddrs[currentBank];
-        if (subarrays.size() <= static_cast<size_t>(currentSubarray)) {
-          subarrays.push_back(DenseMap<int64_t, Value>());
-        }
-
-        auto &addrs = subarrays[currentSubarray];
-        if (!addrs.contains(index)) {
-          Value addr = opBuilder.create<GetRowOp>(
-              loc,
-              dRowType,
-              getOrCreateI64Val(currentBank),
-              getOrCreateI64Val(currentSubarray),
-              getOrCreateI64Val(index)
-          );
-          addrs[index] = addr;
-        }
-
-        dAddr = addrs.lookup(index);
-        return cast<TypedValue<RowType>>(dAddr);
-      };
-
       while (iterIndex < bitWidth) {
 
         for (auto &inst : program) {
@@ -375,54 +441,48 @@ struct ConvertBitsToPuD
           if (inst.type == Instruction::Type::AP) {
             assert(inst.operand0.type == AddressType::Bitwise);
             auto index = std::get<int>(inst.operand0.data);
-            auto addr = getBitwiseAddress(index);
-            auto ap = opBuilder.create<APOp>(loc, addr);
-
+            auto ap = opBuilder.create<APOp>(loc, bRows[index]);
           } else {
             assert(inst.type == Instruction::Type::AAP);
 
             TypedValue<RowType> addr0, addr1;
 
             auto operand0 = inst.operand0;
+            auto operand1 = *inst.operand1;
+
             if (operand0.type == AddressType::Bitwise) {
               auto index = std::get<int>(operand0.data);
-              addr0 = getBitwiseAddress(index);
+              addr0 = bRows[index];
             } else if (operand0.type == AddressType::Const) {
-              auto val = std::get<bool>(operand0.data) ? 1 : 0;
-              addr0 = getControlAddress(val);
+              addr0 = std::get<bool>(operand0.data) ? c1 : c0;
             } else {
               assert(operand0.type == AddressType::In || operand0.type == AddressType::Spill);
               auto firstRow = allocated[operand0.str_repr];
-              currentBank = firstRow.bank;
-              currentSubarray = firstRow.subarray;
-              auto rowId = firstRow.row;
               if (iterIndex == 0) {
                 assert(firstRows.contains(operand0.str_repr));
                 addr0 = firstRows.lookup(operand0.str_repr);
               } else {
-                addr0 = getDataAddress(iterIndex + rowId);
+                addr0 = getOrCreateDRow(allocator.getRowFromOffset(firstRow, iterIndex));
               }
             }
 
-            auto operand1 = *inst.operand1;
             if (operand1.type == AddressType::Bitwise) {
               auto index = std::get<int>(operand1.data);
-              addr1 = getBitwiseAddress(index);
+              addr1 = bRows[index];
             } else {
               assert(operand1.type == AddressType::Out || operand1.type == AddressType::Spill);
               auto firstRow = allocated[operand1.str_repr];
-              currentBank = firstRow.bank;
-              currentSubarray = firstRow.subarray;
               auto rowId = firstRow.row;
               if (iterIndex == 0) {
                 assert(firstRows.contains(operand1.str_repr));
                 addr1 = firstRows.lookup(operand1.str_repr);
               } else {
-                addr1 = getDataAddress(iterIndex + rowId);
+                addr1 = getOrCreateDRow(allocator.getRowFromOffset(firstRow, iterIndex));
               }
             }
 
             auto aap = opBuilder.create<AAPOp>(loc, addr0, addr1);
+
           }
         }
 
@@ -431,12 +491,6 @@ struct ConvertBitsToPuD
       }
 
     } else {
-
-      Value val0 = getOrCreateI64Val(0);
-      Value val1 = getOrCreateI64Val(1);
-
-      TypedValue<RowType> c0 = opBuilder.create<GetRowOp>(loc, cRowType, val0, val0, val0);
-      TypedValue<RowType> c1 = opBuilder.create<GetRowOp>(loc, cRowType, val0, val0, val1);
 
       auto loop = opBuilder.create<affine::AffineForOp>(loc, 0, bitWidth, 1);
 
@@ -449,13 +503,7 @@ struct ConvertBitsToPuD
         TypedValue<RowType> addr0;
         if (operand0.type == AddressType::Bitwise) {
           auto index = std::get<int>(operand0.data);
-          addr0 = opBuilder.create<GetRowOp>(
-              loc,
-              bRowType,
-              getOrCreateI64Val(0),
-              getOrCreateI64Val(0),
-              getOrCreateI64Val(index)
-          );
+          addr0 = bRows[index];
           if (inst.type == Instruction::Type::AP) {
             auto ap = opBuilder.create<APOp>(loc, addr0);
             continue;
@@ -469,6 +517,8 @@ struct ConvertBitsToPuD
           addr0 = opBuilder.create<GetRowOp>(
               loc,
               dRowType,
+              getOrCreateI64Val(row.channel),
+              getOrCreateI64Val(row.rank),
               getOrCreateI64Val(row.bank),
               getOrCreateI64Val(row.subarray),
               rowID
@@ -482,13 +532,7 @@ struct ConvertBitsToPuD
 
         if (operand1.type == AddressType::Bitwise) {
           auto index = std::get<int>(operand1.data);
-          addr1 = opBuilder.create<GetRowOp>(
-              loc,
-              bRowType,
-              getOrCreateI64Val(0),
-              getOrCreateI64Val(0),
-              getOrCreateI64Val(index)
-          );
+          addr1 = bRows[index];
         } else {
           assert(operand1.type == AddressType::Out || operand1.type == AddressType::Spill);
           auto row = allocated.lookup(operand1.str_repr);
@@ -496,6 +540,8 @@ struct ConvertBitsToPuD
           addr1 = opBuilder.create<GetRowOp>(
               loc,
               dRowType,
+              getOrCreateI64Val(row.channel),
+              getOrCreateI64Val(row.rank),
               getOrCreateI64Val(row.bank),
               getOrCreateI64Val(row.subarray),
               rowID

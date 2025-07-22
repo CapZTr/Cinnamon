@@ -63,13 +63,15 @@ def GetRowOp : PuD_Op<"get_row", [Pure]> {
   let description = [{}];
 
   let arguments = (ins
+    I64:$channelID,
+    I64:$rankID,
     I64:$bankID,
     I64:$subarrayID,
     I64:$rowID
   );
   let results = (outs RowType:$addr);
 
-  let assemblyFormat = "$bankID `,` $subarrayID `,` $rowID attr-dict `:` type($bankID) `,` type($subarrayID) `,` type($rowID) `->` qualified(type($addr))";
+  let assemblyFormat = "$channelID `,` $rankID `,` $bankID `,` $subarrayID `,` $rowID attr-dict `:` type($channelID) `,` type($rankID) `,` type($bankID) `,` type($subarrayID) `,` type($rowID) `->` qualified(type($addr))";
 }
 
 #endif
