@@ -3,6 +3,8 @@
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 #include "cinm-mlir/Dialect/PuD/IR/PuDDialect.h"
+#include "cinm-mlir/Dialect/PuD/IR/PuDOps.h"
+#include "cinm-mlir/Dialect/PuD/IR/PuDTypes.h"
 
 #include "cinm-mlir/Dialect/Bits/Codegen/NetworkBuilder.h"
 #include "cinm-mlir/Dialect/Bits/Codegen/ProgramParser.h"
@@ -13,6 +15,7 @@
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringMap.h>
+#include <llvm/ADT/StringSet.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <memory>
 #include <mlir/IR/Builders.h>
@@ -36,8 +39,6 @@
 #include <vector>
 
 #include "ambit.h"
-#include "cinm-mlir/Dialect/PuD/IR/PuDOps.h"
-#include "cinm-mlir/Dialect/PuD/IR/PuDTypes.h"
 
 using namespace mlir;
 using namespace mlir::bits;
@@ -160,6 +161,10 @@ public:
     currentRow = 0;
   }
 
+  int64_t getMaxColumnNum() const {
+    return MAX_COLUMN;
+  }
+
 private:
   const int64_t MAX_CHANNEL = 1;
   const int64_t MAX_RANK = 1;
@@ -278,6 +283,8 @@ struct ConvertBitsToPuD
     OpBuilder opBuilder(newEntry, newEntry->begin());
     auto ctx = opBuilder.getContext();
 
+    auto resultSliceType = SliceType::get(ctx, bitWidth, vecLen);
+
     Type i64Type = opBuilder.getIntegerType(64);
 
     IRMapping mapping;
@@ -318,7 +325,12 @@ struct ConvertBitsToPuD
     llvm::StringMap<TypedValue<RowType>> firstRows;
     llvm::StringMap<TypedValue<RowType>> rowMap;
 
-    SmallVector<TypedValue<RowType>> outputs;
+    SmallVector<TypedValue<RowType>, 2> outputs;
+    SmallVector<SmallVector<TypedValue<SliceType>>, 2> outputSlices;
+    for (int i = 0; i < 2; ++i) {
+      SmallVector<TypedValue<SliceType>> slices;
+      outputSlices.push_back(slices);
+    }
 
     auto bRowType = RowType::get(ctx, 0);
     auto cRowType = RowType::get(ctx, 1);
@@ -389,170 +401,232 @@ struct ConvertBitsToPuD
     // ========== Data rows Allocation ==========
     // =========================================================================
 
-    for (auto &inst : program) {
-      if (inst.type == Instruction::Type::AAP) {
-        auto operand0 = inst.operand0;
-        if (operand0.type == AddressType::In) {
-          if (!allocated.contains(operand0.str_repr)) {
-            auto data = std::get<int>(operand0.data);
-            assert(mapping.contains(inputSlices[data]));
-            auto mapped = mapping.lookup(inputSlices[data]);
-            auto newSlice = cast<TypedValue<SliceType>>(mapped);
-            auto addr = allocate(newSlice.getType().getBitWidth());
-            allocated[operand0.str_repr] = addr;
-            auto firstRow = getOrCreateDRow(addr);
-            auto store = opBuilder.create<StoreOp>(loc, newSlice, firstRow);
-            firstRows[operand0.str_repr] = firstRow;
-          }
-        } else if (operand0.type == AddressType::Spill) {
-          assert(allocated.contains(operand0.str_repr));
-        }
-
-        auto operand1 = *inst.operand1;
-        if (operand1.type == AddressType::Out || operand1.type == AddressType::Spill) {
-          if (!allocated.contains(operand1.str_repr)) {
-            auto addr = allocate(bitWidth);
-            allocated[operand1.str_repr] = addr;
-            auto firstRow = getOrCreateDRow(addr);
-            firstRows[operand1.str_repr] = firstRow;
-            if (operand1.type == AddressType::Out)
-              outputs.push_back(firstRow);
-          }
-        } else if (operand1.type == AddressType::Bitwise) {
-        }
-      } else {
-        assert(inst.type == Instruction::Type::AP);
+    auto maxColNum = allocator.getMaxColumnNum();
+    int lastSliceVecLen = vecLen % maxColNum;
+    if (lastSliceVecLen == 0)
+      lastSliceVecLen = maxColNum;
+    int round = (vecLen - 1) / maxColNum + 1;
+    Value maxColVal = getOrCreateI64Val(maxColNum);
+    auto standardSliceType = SliceType::get(ctx, bitWidth, maxColNum);
+    
+    SmallVector<SmallVector<TypedValue<SliceType>>> slicesToStore;
+    for (auto &oldSlice : inputSlices) {
+      assert(mapping.contains(oldSlice));
+      auto newSlice = cast<TypedValue<SliceType>>(mapping.lookup(oldSlice));
+      SmallVector<TypedValue<SliceType>> v;
+      v.push_back(newSlice);
+      for (int roundIdx = 0; roundIdx < round - 1; ++roundIdx) {
+        auto toSplit = v[roundIdx];
+        auto secondColNum = toSplit.getType().getVectorLength() - maxColNum;
+        if (roundIdx + 2 == round)
+          assert(secondColNum <= maxColNum);
+        auto secondType = SliceType::get(ctx, bitWidth, secondColNum);
+        auto splitOp = opBuilder.create<SplitSliceVerticallyOp>(
+            loc,
+            standardSliceType,
+            secondType,
+            toSplit,
+            maxColVal
+        );
+        v[roundIdx] = splitOp.getFirst();
+        v.push_back(splitOp.getSecond());
       }
+      slicesToStore.push_back(v);
     }
 
-    if (this->unroll) {
 
-      int64_t iterIndex = 0;
-      while (iterIndex < bitWidth) {
-
-        for (auto &inst : program) {
-
-          if (inst.type == Instruction::Type::AP) {
-            assert(inst.operand0.type == AddressType::Bitwise);
-            auto index = std::get<int>(inst.operand0.data);
-            auto ap = opBuilder.create<APOp>(loc, bRows[index]);
-          } else {
-            assert(inst.type == Instruction::Type::AAP);
-
-            TypedValue<RowType> addr0, addr1;
-
-            auto operand0 = inst.operand0;
-            auto operand1 = *inst.operand1;
-
-            if (operand0.type == AddressType::Bitwise) {
-              auto index = std::get<int>(operand0.data);
-              addr0 = bRows[index];
-            } else if (operand0.type == AddressType::Const) {
-              addr0 = std::get<bool>(operand0.data) ? c1 : c0;
-            } else {
-              assert(operand0.type == AddressType::In || operand0.type == AddressType::Spill);
-              auto firstRow = allocated[operand0.str_repr];
-              if (iterIndex == 0) {
-                assert(firstRows.contains(operand0.str_repr));
-                addr0 = firstRows.lookup(operand0.str_repr);
-              } else {
-                addr0 = getOrCreateDRow(allocator.getRowFromOffset(firstRow, iterIndex));
-              }
-            }
-
-            if (operand1.type == AddressType::Bitwise) {
-              auto index = std::get<int>(operand1.data);
-              addr1 = bRows[index];
-            } else {
-              assert(operand1.type == AddressType::Out || operand1.type == AddressType::Spill);
-              auto firstRow = allocated[operand1.str_repr];
-              auto rowId = firstRow.row;
-              if (iterIndex == 0) {
-                assert(firstRows.contains(operand1.str_repr));
-                addr1 = firstRows.lookup(operand1.str_repr);
-              } else {
-                addr1 = getOrCreateDRow(allocator.getRowFromOffset(firstRow, iterIndex));
-              }
-            }
-
-            auto aap = opBuilder.create<AAPOp>(loc, addr0, addr1);
-
-          }
-        }
-
-        iterIndex++;
-
-      }
-
-    } else {
-
-      auto loop = opBuilder.create<affine::AffineForOp>(loc, 0, bitWidth, 1);
-
-      opBuilder.setInsertionPointToStart(loop.getBody());
-
-      Value iterIndex = opBuilder.create<arith::IndexCastOp>(loc, i64Type, loop.getInductionVar());
+    for (int roundIdx = 0; roundIdx < round; ++roundIdx) {
+      allocator.reset();
+      StringSet<> stored;
 
       for (auto &inst : program) {
-        auto operand0 = inst.operand0;
-        TypedValue<RowType> addr0;
-        if (operand0.type == AddressType::Bitwise) {
-          auto index = std::get<int>(operand0.data);
-          addr0 = bRows[index];
-          if (inst.type == Instruction::Type::AP) {
-            auto ap = opBuilder.create<APOp>(loc, addr0);
-            continue;
+        if (inst.type == Instruction::Type::AAP) {
+          auto operand0 = inst.operand0;
+          if (operand0.type == AddressType::In) {
+            if (!allocated.contains(operand0.str_repr)) {
+              assert(roundIdx == 0);
+              auto addr = allocate(bitWidth);
+              allocated[operand0.str_repr] = addr;
+              auto firstRow = getOrCreateDRow(addr);
+              firstRows[operand0.str_repr] = firstRow;
+            }
+            if (!stored.contains(operand0.str_repr)) {
+              auto data = std::get<int>(operand0.data);
+              auto toStore = slicesToStore[data][roundIdx];
+              assert(firstRows.contains(operand0.str_repr));
+              auto store = opBuilder.create<StoreOp>(loc, toStore, firstRows.lookup(operand0.str_repr));
+              stored.insert(operand0.str_repr);
+            }
+          } else if (operand0.type == AddressType::Spill) {
+            assert(allocated.contains(operand0.str_repr));
           }
-        } else if (operand0.type == AddressType::Const) {
-          addr0 = std::get<bool>(operand0.data) ? c1 : c0;
+
+          auto operand1 = *inst.operand1;
+          if (operand1.type == AddressType::Out || operand1.type == AddressType::Spill) {
+            if (!allocated.contains(operand1.str_repr)) {
+              assert(roundIdx == 0);
+              auto addr = allocate(bitWidth);
+              allocated[operand1.str_repr] = addr;
+              auto firstRow = getOrCreateDRow(addr);
+              firstRows[operand1.str_repr] = firstRow;
+              if (operand1.type == AddressType::Out)
+                outputs.push_back(firstRow);
+            }
+          } else if (operand1.type == AddressType::Bitwise) {
+          }
         } else {
-          assert(operand0.type == AddressType::In || operand0.type == AddressType::Spill);
-          auto row = allocated.lookup(operand0.str_repr);
-          Value rowID = opBuilder.create<arith::AddIOp>(loc, i64Type, getOrCreateI64Val(row.row), iterIndex);
-          addr0 = opBuilder.create<GetRowOp>(
-              loc,
-              dRowType,
-              getOrCreateI64Val(row.channel),
-              getOrCreateI64Val(row.rank),
-              getOrCreateI64Val(row.bank),
-              getOrCreateI64Val(row.subarray),
-              rowID
-          );
+          assert(inst.type == Instruction::Type::AP);
         }
-
-        assert(inst.type == Instruction::Type::AAP);
-
-        auto operand1 = *inst.operand1;
-        TypedValue<RowType> addr1;
-
-        if (operand1.type == AddressType::Bitwise) {
-          auto index = std::get<int>(operand1.data);
-          addr1 = bRows[index];
-        } else {
-          assert(operand1.type == AddressType::Out || operand1.type == AddressType::Spill);
-          auto row = allocated.lookup(operand1.str_repr);
-          Value rowID = opBuilder.create<arith::AddIOp>(loc, i64Type, getOrCreateI64Val(row.row), iterIndex);
-          addr1 = opBuilder.create<GetRowOp>(
-              loc,
-              dRowType,
-              getOrCreateI64Val(row.channel),
-              getOrCreateI64Val(row.rank),
-              getOrCreateI64Val(row.bank),
-              getOrCreateI64Val(row.subarray),
-              rowID
-          );
-        }
-
-        auto aap = opBuilder.create<AAPOp>(loc, addr0, addr1);
       }
 
-      opBuilder.setInsertionPointAfter(loop);
+      if (this->unroll) {
+
+        int64_t iterIndex = 0;
+        while (iterIndex < bitWidth) {
+
+          for (auto &inst : program) {
+
+            if (inst.type == Instruction::Type::AP) {
+              assert(inst.operand0.type == AddressType::Bitwise);
+              auto index = std::get<int>(inst.operand0.data);
+              auto ap = opBuilder.create<APOp>(loc, bRows[index]);
+            } else {
+              assert(inst.type == Instruction::Type::AAP);
+
+              TypedValue<RowType> addr0, addr1;
+
+              auto operand0 = inst.operand0;
+              auto operand1 = *inst.operand1;
+
+              if (operand0.type == AddressType::Bitwise) {
+                auto index = std::get<int>(operand0.data);
+                addr0 = bRows[index];
+              } else if (operand0.type == AddressType::Const) {
+                addr0 = std::get<bool>(operand0.data) ? c1 : c0;
+              } else {
+                assert(operand0.type == AddressType::In || operand0.type == AddressType::Spill);
+                auto firstRow = allocated[operand0.str_repr];
+                if (iterIndex == 0) {
+                  assert(firstRows.contains(operand0.str_repr));
+                  addr0 = firstRows.lookup(operand0.str_repr);
+                } else {
+                  addr0 = getOrCreateDRow(allocator.getRowFromOffset(firstRow, iterIndex));
+                }
+              }
+
+              if (operand1.type == AddressType::Bitwise) {
+                auto index = std::get<int>(operand1.data);
+                addr1 = bRows[index];
+              } else {
+                assert(operand1.type == AddressType::Out || operand1.type == AddressType::Spill);
+                auto firstRow = allocated[operand1.str_repr];
+                auto rowId = firstRow.row;
+                if (iterIndex == 0) {
+                  assert(firstRows.contains(operand1.str_repr));
+                  addr1 = firstRows.lookup(operand1.str_repr);
+                } else {
+                  addr1 = getOrCreateDRow(allocator.getRowFromOffset(firstRow, iterIndex));
+                }
+              }
+
+              auto aap = opBuilder.create<AAPOp>(loc, addr0, addr1);
+
+            }
+          }
+
+          iterIndex++;
+
+        }
+
+      } else {
+
+        auto loop = opBuilder.create<affine::AffineForOp>(loc, 0, bitWidth, 1);
+
+        opBuilder.setInsertionPointToStart(loop.getBody());
+
+        Value iterIndex = opBuilder.create<arith::IndexCastOp>(loc, i64Type, loop.getInductionVar());
+
+        for (auto &inst : program) {
+          auto operand0 = inst.operand0;
+          TypedValue<RowType> addr0;
+          if (operand0.type == AddressType::Bitwise) {
+            auto index = std::get<int>(operand0.data);
+            addr0 = bRows[index];
+            if (inst.type == Instruction::Type::AP) {
+              auto ap = opBuilder.create<APOp>(loc, addr0);
+              continue;
+            }
+          } else if (operand0.type == AddressType::Const) {
+            addr0 = std::get<bool>(operand0.data) ? c1 : c0;
+          } else {
+            assert(operand0.type == AddressType::In || operand0.type == AddressType::Spill);
+            auto row = allocated.lookup(operand0.str_repr);
+            Value rowID = opBuilder.create<arith::AddIOp>(loc, i64Type, getOrCreateI64Val(row.row), iterIndex);
+            addr0 = opBuilder.create<GetRowOp>(
+                loc,
+                dRowType,
+                getOrCreateI64Val(row.channel),
+                getOrCreateI64Val(row.rank),
+                getOrCreateI64Val(row.bank),
+                getOrCreateI64Val(row.subarray),
+                rowID
+            );
+          }
+
+          assert(inst.type == Instruction::Type::AAP);
+
+          auto operand1 = *inst.operand1;
+          TypedValue<RowType> addr1;
+
+          if (operand1.type == AddressType::Bitwise) {
+            auto index = std::get<int>(operand1.data);
+            addr1 = bRows[index];
+          } else {
+            assert(operand1.type == AddressType::Out || operand1.type == AddressType::Spill);
+            auto row = allocated.lookup(operand1.str_repr);
+            Value rowID = opBuilder.create<arith::AddIOp>(loc, i64Type, getOrCreateI64Val(row.row), iterIndex);
+            addr1 = opBuilder.create<GetRowOp>(
+                loc,
+                dRowType,
+                getOrCreateI64Val(row.channel),
+                getOrCreateI64Val(row.rank),
+                getOrCreateI64Val(row.bank),
+                getOrCreateI64Val(row.subarray),
+                rowID
+            );
+          }
+
+          auto aap = opBuilder.create<AAPOp>(loc, addr0, addr1);
+        }
+
+        opBuilder.setInsertionPointAfter(loop);
+
+      }
+
+      auto firstRow = outputs[0];
+      SliceType sType = standardSliceType;
+      if (roundIdx + 1 == round) {
+        sType = SliceType::get(ctx, bitWidth, lastSliceVecLen);
+      }
+      TypedValue<SliceType> slice = opBuilder.create<LoadOp>(loc, sType, firstRow, getOrCreateI64Val(bitWidth));
+      outputSlices[0].push_back(slice);
 
     }
 
-    auto sliceType = SliceType::get(ctx, bitWidth, vecLen);
-    auto firstRow = outputs[0];
-
-    Value resultSlice = opBuilder.create<LoadOp>(loc, sliceType, firstRow, getOrCreateI64Val(bitWidth));
+    auto resultSlice = outputSlices[0][0];
+    if (round > 1) {
+      for (int i = 1; i < round; ++i) {
+        auto second = outputSlices[0][i];
+        auto vecLen = resultSlice.getType().getVectorLength() + second.getType().getVectorLength();
+        auto sType = SliceType::get(ctx, bitWidth, vecLen);
+        resultSlice = opBuilder.create<MergeSliceVerticallyOp>(
+            loc,
+            sType,
+            resultSlice,
+            second
+        );
+      }
+    }
 
     Value resultTensor = opBuilder.create<AssembleOp>(loc, tensorType, resultSlice);
 

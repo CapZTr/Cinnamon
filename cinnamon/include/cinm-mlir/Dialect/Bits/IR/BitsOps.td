@@ -37,6 +37,37 @@ def AssembleOp : Bits_Op<"assemble", [Pure]> {
   let hasVerifier = 1;
 }
 
+def SplitSliceVerticallyOp : Bits_Op<"split_vertically", [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let arguments = (ins
+    SliceType:$slice,
+    I64:$columnNum
+  );
+  let results = (outs
+    SliceType:$first,
+    SliceType:$second
+  );
+
+  let assemblyFormat = "$slice `,` $columnNum attr-dict `:` qualified(type($slice)) `,` type($columnNum) `->` qualified(type($first)) `,` qualified(type($second))";
+  let hasVerifier = 1;
+}
+
+def MergeSliceVerticallyOp : Bits_Op<"merge_vertically", [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let arguments = (ins
+    SliceType:$first,
+    SliceType:$second
+  );
+  let results = (outs SliceType:$slice);
+
+  let assemblyFormat = "$first `,` $second attr-dict `:` qualified(type($first)) `,` qualified(type($second)) `->` qualified(type($slice))";
+  let hasVerifier = 1;
+}
+
 def AddOp : Bits_Op<"add", [Pure, Commutative]> {
   let summary = "Bit-serial addition of two slice operands";
   let description = [{}];

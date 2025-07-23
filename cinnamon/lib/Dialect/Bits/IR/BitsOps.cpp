@@ -8,6 +8,7 @@
 #include <llvm/Support/LogicalResult.h>
 #include <mlir/IR/BuiltinTypes.h>
 #include <mlir/IR/Builders.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/IR/Operation.h>
 #include <mlir/IR/OpImplementation.h>
 #include <mlir/Support/LogicalResult.h>
@@ -70,6 +71,55 @@ LogicalResult AssembleOp::verify() {
 
   if (inputType.getVectorLength() != outputType.getDimSize(0))
     return emitOpError("vector length mismatch between input and output");
+
+  return success();
+}
+
+LogicalResult SplitSliceVerticallyOp::verify() {
+  auto vecLen = getSlice().getType().getVectorLength();
+  if (auto constantOp = dyn_cast<arith::ConstantOp>(getColumnNum().getDefiningOp())) {
+    if (auto intAttr = dyn_cast<IntegerAttr>(constantOp.getValue())) {
+      auto rowNum = intAttr.getInt();
+      if (vecLen <= rowNum)
+        return emitOpError(
+            "columnNum of the first slice must be less than the original one");
+    } else {
+      return emitOpError("columnNum must have explicit value");
+    }
+  } else {
+    return emitOpError("columnNum must have explicit value");
+  }
+
+  auto firstColNum = getFirst().getType().getVectorLength();
+  auto secondColNum = getSecond().getType().getVectorLength();
+  if (firstColNum + secondColNum != vecLen)
+    return emitOpError(
+        "column's sum of two result slices must be equal to the original one");
+  
+  auto firstBitwidth = getFirst().getType().getBitWidth();
+  auto secondBitwidth = getSecond().getType().getBitWidth();
+  auto bitwidth = getSlice().getType().getBitWidth();
+  if (firstBitwidth != bitwidth || secondBitwidth != bitwidth)
+    return emitOpError(
+        "bitwith of two result slices must be equal to the original one");
+
+  return success();
+}
+
+LogicalResult MergeSliceVerticallyOp::verify() {
+  auto firstBitwidth = getFirst().getType().getBitWidth();
+  auto secondBitwidth = getSecond().getType().getBitWidth();
+  auto resultBitwidth = getSlice().getType().getBitWidth();
+  if (firstBitwidth != resultBitwidth || secondBitwidth != resultBitwidth)
+    return emitOpError(
+        "bitwith of two input slices must be equal to the result");
+
+  auto firstColNum = getFirst().getType().getVectorLength();
+  auto secondColNum = getSecond().getType().getVectorLength();
+  auto resultColNum = getSlice().getType().getVectorLength();
+  if (firstColNum + secondColNum != resultColNum)
+    return emitOpError(
+        "column's sum of two input slices must be equal to the result");
 
   return success();
 }
