@@ -50,7 +50,9 @@ def SplitSliceVerticallyOp : Bits_Op<"split_vertically", [Pure]> {
     SliceType:$second
   );
 
-  let assemblyFormat = "$slice `,` $columnNum attr-dict `:` qualified(type($slice)) `,` type($columnNum) `->` qualified(type($first)) `,` qualified(type($second))";
+  let assemblyFormat = "$slice `,` $columnNum attr-dict `:`"
+      "qualified(type($slice)) `,` type($columnNum) `->`"
+      "qualified(type($first)) `,` qualified(type($second))";
   let hasVerifier = 1;
 }
 
@@ -64,19 +66,40 @@ def MergeSliceVerticallyOp : Bits_Op<"merge_vertically", [Pure]> {
   );
   let results = (outs SliceType:$slice);
 
-  let assemblyFormat = "$first `,` $second attr-dict `:` qualified(type($first)) `,` qualified(type($second)) `->` qualified(type($slice))";
+  let assemblyFormat = "$first `,` $second attr-dict `:`"
+      "qualified(type($first)) `,` qualified(type($second)) `->` qualified(type($slice))";
   let hasVerifier = 1;
 }
 
-def AddOp : Bits_Op<"add", [Pure, Commutative]> {
+def AddOp : Bits_Op<"add", [Pure]> {
   let summary = "Bit-serial addition of two slice operands";
   let description = [{}];
 
-  let arguments = (ins SliceType:$lhs, SliceType:$rhs);
-  let results = (outs SliceType:$result);
+  let arguments = (ins
+    SliceType:$lhs,
+    SliceType:$rhs
+    // SliceType:$cin
+  );
+  let results = (outs
+    SliceType:$result
+    // SliceType:$cout
+  );
 
-  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` qualified(type($lhs)) `,` qualified(type($rhs)) `->` qualified(type($result))";
+  // let assemblyFormat = "$lhs `,` $rhs `,` $cin attr-dict `:`"
+  //     "qualified(type($lhs)) `,` qualified(type($rhs)) `,` qualified(type($cin))"
+  //     "`->` qualified(type($result)) `,` qualified(type($cout))";
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:`"
+      "qualified(type($lhs)) `,` qualified(type($rhs))"
+      "`->` qualified(type($result))";
   let hasVerifier = 1;
+}
+
+def CreateEmptyCinOp : Bits_Op<"create_empty_cin", [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let results = (outs SliceType:$slice);
+  let assemblyFormat = "attr-dict `:` qualified(type($slice))";
 }
 
 def SubOp : Bits_Op<"sub", [Pure]> {

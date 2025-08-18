@@ -6,6 +6,8 @@
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 
 #include <cstdint>
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <memory>
 #include <mlir/IR/Builders.h>
@@ -18,6 +20,7 @@
 #include <mlir/IR/Value.h>
 #include <mlir/Transforms/DialectConversion.h>
 #include <tuple>
+
 
 using namespace mlir;
 using namespace mlir::bits;
@@ -41,6 +44,13 @@ struct SliceCache {
   }
 };
 
+// struct AddResultCache {
+//   static llvm::DenseMap<AddOp, llvm::SmallVector<SliceType, 2>> &get() {
+//     static llvm::DenseMap<AddOp, llvm::SmallVector<SliceType, 2>> cache;
+//     return cache;
+//   }
+// };
+
 template<typename SourceOp, typename TargetOp>
 struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
   using OpConversionPattern<SourceOp>::OpConversionPattern;
@@ -57,16 +67,7 @@ struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
     auto lhsType = cast<RankedTensorType>(lhs.getType());
     auto rhsType = cast<RankedTensorType>(rhs.getType());
 
-    if (!lhsType || !rhsType)
-      return rewriter.notifyMatchFailure(op, "Operands must be RankedTensorType");
-
-    if (lhsType.getRank() != 1 || rhsType.getRank() != 1)
-      return rewriter.notifyMatchFailure(op, "Only 1-D tensors are supported");
-
     auto elemType = lhsType.getElementType();
-    if (!elemType.isSignlessInteger())
-      return rewriter.notifyMatchFailure(op, "Tensor elements must be signless integer");
-
     auto ctx = rewriter.getContext();
     int64_t bitWidth = elemType.getIntOrFloatBitWidth();
     int64_t vectorLen = lhsType.getShape()[0];
@@ -74,8 +75,11 @@ struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
     auto &inputCache = InputCache::get();
     auto &sliceCache = SliceCache::get();
 
+    auto sliceType = SliceType::get(ctx, bitWidth, vectorLen);
+    // auto carryType = SliceType::get(ctx, 1, vectorLen);
+
     auto getOrCreateSlice = [&](Value operand) -> Value {
-      Operation* defOp = operand.getDefiningOp();
+      Operation *defOp = operand.getDefiningOp();
       if (defOp) {
         auto it = sliceCache.find(defOp);
         if (it != sliceCache.end())
@@ -86,7 +90,6 @@ struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
       if (it != inputCache.end())
         return it->second;
 
-      auto sliceType = SliceType::get(ctx, bitWidth, vectorLen);
       Value slice = rewriter.create<TransposeOp>(loc, sliceType, operand);
 
       inputCache[operand] = slice;
@@ -97,12 +100,14 @@ struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
     Value lhsSlice = getOrCreateSlice(lhs);
     Value rhsSlice = getOrCreateSlice(rhs);
 
-    auto sliceType = SliceType::get(ctx, bitWidth, vectorLen);
-    Value resultSlice = rewriter.create<TargetOp>(loc, sliceType, lhsSlice, rhsSlice);
+    // if (emptyCin == NULL)
+    //   emptyCin = rewriter.create<CreateEmptyCinOp>(loc, carryType);
 
-    sliceCache[op] = resultSlice;
+    auto addOp = rewriter.create<TargetOp>(loc, sliceType, lhsSlice, rhsSlice);
 
-    Value result = rewriter.create<AssembleOp>(loc, lhsType, resultSlice);
+    sliceCache[op] = addOp.getResult();
+
+    Value result = rewriter.create<AssembleOp>(loc, lhsType, addOp.getResult());
 
     rewriter.replaceOp(op, result);
 

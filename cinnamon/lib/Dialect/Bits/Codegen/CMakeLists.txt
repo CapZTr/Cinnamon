@@ -1,6 +1,5 @@
 add_mlir_dialect_library(BitsCodegen
   NetworkBuilder.cpp
-  ProgramParser.cpp
 
   DEPENDS
     BitsIncGen

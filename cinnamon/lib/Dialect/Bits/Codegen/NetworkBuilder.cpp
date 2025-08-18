@@ -1,7 +1,6 @@
 #include "cinm-mlir/Dialect/Bits/Codegen/NetworkBuilder.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 
-#include <cassert>
 #include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/LogicalResult.h>
@@ -9,8 +8,9 @@
 #include <mlir/IR/Diagnostics.h>
 #include <mlir/IR/Value.h>
 
+#include <cassert>
 #include <mockturtle/algorithms/cleanup.hpp>
-#include <optional>
+
 
 using namespace mlir;
 using namespace mlir::bits;
@@ -33,11 +33,13 @@ LogicalResult NetworkBuilder::build() {
       inputSlices.push_back(slice);
     } else if (auto add = dyn_cast<AddOp>(op)) {
       pendingBinaryOps.push_back(op);
+      // migSignalMap[add.getCin()] = mig.get_constant(false);
     } else if (auto assembleOp = dyn_cast<AssembleOp>(op)) {
       assemble = assembleOp;
     }
   });
 
+  // const auto cin = mig.get_constant(false);
   bool progress = true;
   while (progress && !pendingBinaryOps.empty()) {
     progress = false;
@@ -47,24 +49,28 @@ LogicalResult NetworkBuilder::build() {
         if (auto add = dyn_cast<AddOp>(*it)) {
           auto lhs = migSignalMap.lookup(add.getLhs());
           auto rhs = migSignalMap.lookup(add.getRhs());
-          MIG::signal carryIn;
+          // MIG::signal carryIn = migSignalMap.lookup(add.getCin());
           
-          auto found = findCarryIn(add);
-          if (found) {
-            carryIn = *found;
-          } else {
-            // if (!cinUsed) {
-            //   carryIn = cin;
-            //   cinUsed = true;
-            // } else {
-            //   carryIn = mig.get_constant(false);
-            // }
-            carryIn = mig.get_constant(false);
-          }
+          // auto found = findCarryIn(add);
+          // if (found) {
+          //   carryIn = *found;
+          // } else {
+          // if (!cinUsed) {
+          //   carryIn = cin;
+          //   cinUsed = true;
+          // } else {
+          //   carryIn = mig.get_constant(false);
+          // }
+          //   carryIn = mig.get_constant(false);
+          // }
 
-          auto [sum, cout] = buildAdd(lhs, rhs, carryIn);
+          auto cin = mig.create_pi();
+          auto [sum, cout] = buildAdd(lhs, rhs, cin);
           migSignalMap[add.getResult()] = sum;
-          coutMap[add] = cout;
+          const int cinIdex = mig.num_pis() - 1;
+          assert(!carryMap.contains(cinIdex));
+          carryMap[cinIdex] = mig.num_pos() - 1;
+          // coutMap[add] = cout;
 
           it = pendingBinaryOps.erase(it);
           progress = true;
@@ -80,59 +86,62 @@ LogicalResult NetworkBuilder::build() {
   }
 
   if (!pendingBinaryOps.empty()) {
-    llvm::errs() << "NetworkBuilder: Some binary ops could not be parsed due to missing operands\n";
+    llvm::errs() << "NetworkBuilder: Some binary ops could not be parsed "
+        "due to missing operands\n";
     return failure();
   }
 
   auto result = assemble.getInput();
   mig.create_po(migSignalMap.lookup(result));
-  // outputSlices.push_back(result);
+  outputSlices.push_back(result);
 
   // auto finalAdd = dyn_cast<AddOp>(result.getDefiningOp());
   // assert(coutMap.count(finalAdd) == 1);
   // mig.create_po(coutMap.lookup(finalAdd));
+  // outputSlices.push_back(finalAdd.getCout());
 
   mig = mockturtle::cleanup_dangling(mig);
 
   return success();
 }
 
-std::optional<MIG::signal> NetworkBuilder::findCarryIn(AddOp add) {
-  auto lhs = add.getLhs();
-  auto rhs = add.getRhs();
+// std::optional<MIG::signal> NetworkBuilder::findCarryIn(AddOp add) {
+//   auto lhs = add.getLhs();
+//   auto rhs = add.getRhs();
 
-  auto lhsDef = lhs.getDefiningOp();
-  if (auto lhsDefAdd = dyn_cast<AddOp>(lhsDef)) {
-    if (coutMap.count(lhsDefAdd)) {
-      auto cin = coutMap.lookup(lhsDefAdd);
-      coutMap.erase(lhsDefAdd);
-      return cin;
-    }
-  }
+//   auto lhsDef = lhs.getDefiningOp();
+//   if (auto lhsDefAdd = dyn_cast<AddOp>(lhsDef)) {
+//     if (coutMap.count(lhsDefAdd)) {
+//       auto cin = coutMap.lookup(lhsDefAdd);
+//       coutMap.erase(lhsDefAdd);
+//       return cin;
+//     }
+//   }
 
-  auto rhsDef = rhs.getDefiningOp();
-  if (auto rhsDefAdd = dyn_cast<AddOp>(rhsDef)) {
-    if (coutMap.count(rhsDefAdd)) {
-      auto cin = coutMap.lookup(rhsDefAdd);
-      coutMap.erase(rhsDefAdd);
-      return cin;
-    }
-  }
+//   auto rhsDef = rhs.getDefiningOp();
+//   if (auto rhsDefAdd = dyn_cast<AddOp>(rhsDef)) {
+//     if (coutMap.count(rhsDefAdd)) {
+//       auto cin = coutMap.lookup(rhsDefAdd);
+//       coutMap.erase(rhsDefAdd);
+//       return cin;
+//     }
+//   }
 
-  return std::nullopt;
-}
+//   return std::nullopt;
+// }
 
-std::pair<MIG::signal, MIG::signal> NetworkBuilder::buildAdd(MIG::signal const& lhs,
-                                                             MIG::signal const& rhs,
-                                                             MIG::signal const& cin) {
+std::pair<MIG::signal, MIG::signal> NetworkBuilder::buildAdd(
+    MIG::signal const& lhs,
+    MIG::signal const& rhs,
+    MIG::signal const& cin) {
   auto cout = mig.create_maj(lhs, rhs, cin);
+  mig.create_po(cout);
   auto maj = mig.create_maj(lhs, rhs, mig.create_not(cin));
   auto sum = mig.create_maj(maj, cin, mig.create_not(cout));
-
   return {sum, cout};
 }
 
-bool NetworkBuilder::operandsBuilt(Operation* op) const {
+bool NetworkBuilder::operandsBuilt(Operation *op) const {
   for (auto operand : op->getOperands()) {
     if (!migSignalMap.count(operand))
       return false;

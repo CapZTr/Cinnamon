@@ -129,14 +129,26 @@ LogicalResult AddOp::verify() {
   auto rhsType = cast<SliceType>(getRhs().getType());
   auto resType = cast<SliceType>(getResult().getType());
 
+  // auto cinType = cast<SliceType>(getCin().getType());
+  // auto coutType = cast<SliceType>(getCout().getType());
+
+  // if (!lhsType || !rhsType || !resType || !cinType || !coutType)
+  //   return emitOpError("operands, result and carries must all be of SliceType");
   if (!lhsType || !rhsType || !resType)
     return emitOpError("operands and result must all be of SliceType");
 
   if (lhsType.getBitWidth() != rhsType.getBitWidth() || lhsType.getBitWidth() != resType.getBitWidth())
     return emitOpError("bit widths of operands and result must match");
 
-  if (lhsType.getVectorLength() != rhsType.getVectorLength() || lhsType.getVectorLength() != resType.getVectorLength())
+  if (lhsType.getVectorLength() != resType.getVectorLength()
+      || rhsType.getVectorLength() != resType.getVectorLength())
+      // || cinType.getVectorLength() != resType.getVectorLength()
+      // || coutType.getVectorLength() != resType.getVectorLength())
+    // return emitOpError("vector lengths of operands, result and carries must match");
     return emitOpError("vector lengths of operands and result must match");
+  
+  // if (cinType.getBitWidth() != 1 || coutType.getBitWidth() != 1)
+  //   return emitOpError("Bitwidth of carry-in and carry-out must be 1");
 
   return success();
 }

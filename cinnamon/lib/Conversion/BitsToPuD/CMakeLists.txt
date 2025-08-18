@@ -1,7 +1,9 @@
 add_mlir_conversion_library(MLIRBitsToPuD
   BitsToPuD.cpp
   ${CMAKE_SOURCE_DIR}/lib/Dialect/Bits/Codegen/NetworkBuilder.cpp
-  ${CMAKE_SOURCE_DIR}/lib/Dialect/Bits/Codegen/ProgramParser.cpp
+  ${CMAKE_SOURCE_DIR}/lib/Dialect/PuD/Codegen/AddressAllocator.cpp
+  ${CMAKE_SOURCE_DIR}/lib/Dialect/PuD/Codegen/OperandTracker.cpp
+  ${CMAKE_SOURCE_DIR}/lib/Dialect/PuD/Codegen/ProgramParser.cpp
 
   ADDITIONAL_HEADER_DIRS
     ${MLIR_MAIN_INCLUDE_DIR}/bits/Conversion/BitsToPuD

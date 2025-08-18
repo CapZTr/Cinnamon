@@ -1,5 +1,4 @@
 #include "cinm-mlir/Conversion/BitsToPuD/BitsToPuD.h"
-#include "cinm-mlir/Conversion/BitsPasses.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 #include "cinm-mlir/Dialect/PuD/IR/PuDDialect.h"
@@ -7,10 +6,10 @@
 #include "cinm-mlir/Dialect/PuD/IR/PuDTypes.h"
 
 #include "cinm-mlir/Dialect/Bits/Codegen/NetworkBuilder.h"
-#include "cinm-mlir/Dialect/Bits/Codegen/ProgramParser.h"
+#include "cinm-mlir/Dialect/PuD/Codegen/AddressAllocator.h"
+#include "cinm-mlir/Dialect/PuD/Codegen/ProgramParser.h"
 
 #include <cassert>
-#include <cstddef>
 #include <cstdint>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
@@ -36,6 +35,8 @@
 #include <iostream>
 #include <mockturtle/generators/arithmetic.hpp>
 #include <mockturtle/io/write_dot.hpp>
+#include <optional>
+#include <ostream>
 #include <vector>
 
 #include "ambit.h"
@@ -51,146 +52,6 @@ using MIG = mockturtle::mig_network;
 
 namespace {
 
-struct RowAddress {
-  int64_t channel;
-  int64_t rank;
-  int64_t bank;
-  int64_t subarray;
-  int64_t row;
-
-  bool inSameSubArray(const RowAddress &other) {
-    return this->channel == other.channel
-        && this->rank == other.rank
-        && this->bank == other.bank
-        && this->subarray == other.subarray;
-  }
-
-  std::string str() {
-    return std::format("{} {} {} {} {}",
-        channel,
-        rank,
-        bank,
-        subarray,
-        row);
-  }
-};
-
-class AddressAllocator {
-public:
-  AddressAllocator() = default;
-
-  RowAddress allocate(int64_t numRows) {
-    assert(numRows <= MAX_ROW);
-
-    auto subArrayID = checkSpace(numRows);
-    auto saLocalID = subArrayID % 64;
-
-    int64_t channel = currentChannel;
-    int64_t rank = currentRank;
-    int64_t bank = currentBank;
-    int64_t sa = currentSubarray;
-    int64_t row = currentRow;
-    if (saLocalID == currentBank) {
-      currentRow += numRows;
-      row = currentRow;
-    } else if (subArrayID == -1) {
-      currentRow = 0;
-      ++currentSubarray;
-      if (currentSubarray > MAX_SUBARRAY) {
-        currentSubarray = 0;
-        ++currentBank;
-        if (currentBank > MAX_BANK) {
-          currentBank = 0;
-          ++currentRank;
-          if (currentRank > MAX_RANK) {
-            currentRank = 0;
-            ++currentChannel;
-            if (currentChannel > MAX_CHANNEL) {
-            }
-          }
-        }
-      }
-      channel = currentChannel;
-      rank = currentRank;
-      bank = currentRank;
-      sa = currentSubarray;
-      row = currentRow;
-    } else {
-      int64_t channelSANum = 2 * 8 * 64;
-      channel = subArrayID < channelSANum ? 0 : 1;
-
-      auto saChannelID = subArrayID % channelSANum;
-      int64_t rankSANum = 8 * 64;
-
-      rank = saChannelID < rankSANum ? 0 : 1;
-      auto saRankID = saChannelID % rankSANum;
-
-      bank = saRankID / 8;
-
-      sa = saLocalID;
-      auto space = restSpace.lookup(subArrayID);
-      row = MAX_ROW - space;
-    }
-
-    RowAddress addr = { 
-        channel, 
-        rank, 
-        bank, 
-        sa, 
-        row
-    };
-
-    int64_t saToUpdate = channel * 2 + rank * 2 + bank * 8 + sa;
-    int64_t rest = MAX_ROW - row - numRows;
-    restSpace[saToUpdate] = rest;
-
-    return addr;
-  }
-
-  RowAddress getRowFromOffset(const RowAddress &base, const int64_t offset) {
-    auto rowID = base.row + offset;
-    assert(rowID <= MAX_ROW);
-    return {base.channel, base.rank, base.bank, base.subarray, rowID};
-  }
-
-  void reset() {
-    currentChannel = 0;
-    currentRank = 0;
-    currentBank = 0;
-    currentSubarray = 0;
-    currentRow = 0;
-  }
-
-  int64_t getMaxColumnNum() const {
-    return MAX_COLUMN;
-  }
-
-private:
-  const int64_t MAX_CHANNEL = 1;
-  const int64_t MAX_RANK = 1;
-  const int64_t MAX_BANK = 7;
-  const int64_t MAX_SUBARRAY = 63;
-  const int64_t MAX_ROW = 1005;
-  const int64_t MAX_COLUMN = 8192;
-
-  int64_t currentChannel = 0;
-  int64_t currentRank = 0;
-  int64_t currentBank = 0;
-  int64_t currentSubarray = 0;
-  int64_t currentRow = 0;
-
-  DenseMap<int64_t, int64_t> restSpace;
-
-  int checkSpace(int64_t numRows) const {
-    int subArrayID = -1;
-    for (const auto &pair : restSpace) {
-      if (numRows <= pair.second)
-        subArrayID = pair.first;
-    }
-    return subArrayID;
-  }
-};
-
 struct GlobalAddressAllocator {
   static AddressAllocator &get() {
     static AddressAllocator allocator;
@@ -198,6 +59,10 @@ struct GlobalAddressAllocator {
   }
 };
 
+
+// =========================================================================
+// ========== Pass Structure ==========
+// =========================================================================
 
 struct ConvertBitsToPuD
     : public ConvertBitsToPuDBase<ConvertBitsToPuD> {
@@ -214,7 +79,11 @@ struct ConvertBitsToPuD
       signalPassFailure();
     }
     auto mig = builder.getNetwork();
-    auto inputSlices = builder.getInputSlices();
+    auto ntkInputs = builder.getInputSlices();
+    const int inputNum = ntkInputs.size();
+    auto carryMap = builder.getCarryMap();
+    const int carryNum = carryMap.size();
+    // auto ntkOutputs = builder.getOutputSlices();
 
     // NetworkBuilder::debugPrint(mig);
 
@@ -234,12 +103,12 @@ struct ConvertBitsToPuD
 
     ProgramString program_str;
     auto [optimized, result] = ambit_rewrite(settings, mig, program_str);
-    // std::cout << "Generated program:\n" << program_str.str() << "\n";
+    std::cout << "Generated program:\n" << program_str.str() << "\n";
 
     // NetworkBuilder::debugPrint(optimized);
 
-    // std::cout << " ===== Optimized Network ===== \n";
-    // mockturtle::write_dot(optimized, std::cout);
+    std::cout << "\n ===== Optimized Network ===== \n";
+    mockturtle::write_dot(optimized, std::cout);
 
 
     // =========================================================================
@@ -283,7 +152,7 @@ struct ConvertBitsToPuD
     OpBuilder opBuilder(newEntry, newEntry->begin());
     auto ctx = opBuilder.getContext();
 
-    auto resultSliceType = SliceType::get(ctx, bitWidth, vecLen);
+    // auto resultSliceType = SliceType::get(ctx, bitWidth, vecLen);
 
     Type i64Type = opBuilder.getIntegerType(64);
 
@@ -324,6 +193,7 @@ struct ConvertBitsToPuD
     llvm::StringMap<RowAddress> allocated;
     llvm::StringMap<TypedValue<RowType>> firstRows;
     llvm::StringMap<TypedValue<RowType>> rowMap;
+    llvm::StringMap<TypedValue<RowType>> carryRows;
 
     SmallVector<TypedValue<RowType>, 2> outputs;
     SmallVector<SmallVector<TypedValue<SliceType>>, 2> outputSlices;
@@ -398,7 +268,7 @@ struct ConvertBitsToPuD
     );
 
     // =========================================================================
-    // ========== Data rows Allocation ==========
+    // ========== Data Rows Allocation ==========
     // =========================================================================
 
     auto maxColNum = allocator.getMaxColumnNum();
@@ -410,7 +280,7 @@ struct ConvertBitsToPuD
     auto standardSliceType = SliceType::get(ctx, bitWidth, maxColNum);
     
     SmallVector<SmallVector<TypedValue<SliceType>>> slicesToStore;
-    for (auto &oldSlice : inputSlices) {
+    for (auto &oldSlice : ntkInputs) {
       assert(mapping.contains(oldSlice));
       auto newSlice = cast<TypedValue<SliceType>>(mapping.lookup(oldSlice));
       SmallVector<TypedValue<SliceType>> v;
@@ -434,7 +304,6 @@ struct ConvertBitsToPuD
       slicesToStore.push_back(v);
     }
 
-
     for (int roundIdx = 0; roundIdx < round; ++roundIdx) {
       allocator.reset();
       StringSet<> stored;
@@ -443,19 +312,31 @@ struct ConvertBitsToPuD
         if (inst.type == Instruction::Type::AAP) {
           auto operand0 = inst.operand0;
           if (operand0.type == AddressType::In) {
-            if (!allocated.contains(operand0.str_repr)) {
-              assert(roundIdx == 0);
-              auto addr = allocate(bitWidth);
-              allocated[operand0.str_repr] = addr;
-              auto firstRow = getOrCreateDRow(addr);
-              firstRows[operand0.str_repr] = firstRow;
-            }
-            if (!stored.contains(operand0.str_repr)) {
-              auto data = std::get<int>(operand0.data);
-              auto toStore = slicesToStore[data][roundIdx];
-              assert(firstRows.contains(operand0.str_repr));
-              auto store = opBuilder.create<StoreOp>(loc, toStore, firstRows.lookup(operand0.str_repr));
-              stored.insert(operand0.str_repr);
+            const auto inputIdx = std::get<int>(operand0.data);
+            if (inputIdx < inputNum) {
+              if (!allocated.contains(operand0.str_repr)) {
+                assert(roundIdx == 0);
+                auto addr = allocator.allocate(bitWidth);
+                allocated[operand0.str_repr] = addr;
+                auto firstRow = getOrCreateDRow(addr);
+                firstRows[operand0.str_repr] = firstRow;
+              }
+              if (!stored.contains(operand0.str_repr)) {
+                auto data = std::get<int>(operand0.data);
+                auto toStore = slicesToStore[data][roundIdx];
+                assert(firstRows.contains(operand0.str_repr));
+                opBuilder.create<StoreOp>(loc, toStore, firstRows.lookup(operand0.str_repr));
+                stored.insert(operand0.str_repr);
+              }
+            } else {
+              if (!allocated.contains(operand0.str_repr)) {
+                assert(roundIdx == 0);
+                auto addr = allocator.allocate(1);
+                allocated[operand0.str_repr] = addr;
+                auto cinRow = getOrCreateDRow(addr);
+                assert(!carryRows.contains(operand0.str_repr));
+                carryRows.try_emplace(operand0.str_repr, cinRow);
+              }
             }
           } else if (operand0.type == AddressType::Spill) {
             assert(allocated.contains(operand0.str_repr));
@@ -463,9 +344,21 @@ struct ConvertBitsToPuD
 
           auto operand1 = *inst.operand1;
           if (operand1.type == AddressType::Out || operand1.type == AddressType::Spill) {
+            const auto index = std::get<int>(operand1.data);
+            if (operand1.type == AddressType::Out && index < carryNum) {
+              if (!allocated.contains(operand1.str_repr)) {
+                assert(roundIdx == 0);
+                auto addr = allocator.allocate(1);
+                allocated[operand1.str_repr] = addr;
+                auto coutRow = getOrCreateDRow(addr);
+                assert(!carryRows.contains(operand1.str_repr));
+                carryRows.try_emplace(operand1.str_repr, coutRow);
+              }
+              continue;
+            }
             if (!allocated.contains(operand1.str_repr)) {
               assert(roundIdx == 0);
-              auto addr = allocate(bitWidth);
+              auto addr = allocator.allocate(bitWidth);
               allocated[operand1.str_repr] = addr;
               auto firstRow = getOrCreateDRow(addr);
               firstRows[operand1.str_repr] = firstRow;
@@ -482,14 +375,17 @@ struct ConvertBitsToPuD
       if (this->unroll) {
 
         int64_t iterIndex = 0;
+        int64_t addrOffset = bitWidth;
         while (iterIndex < bitWidth) {
+          addrOffset--;
 
           for (auto &inst : program) {
+            llvm::StringSet<> refreshedCin;
 
             if (inst.type == Instruction::Type::AP) {
               assert(inst.operand0.type == AddressType::Bitwise);
               auto index = std::get<int>(inst.operand0.data);
-              auto ap = opBuilder.create<APOp>(loc, bRows[index]);
+              opBuilder.create<APOp>(loc, bRows[index]);
             } else {
               assert(inst.type == Instruction::Type::AAP);
 
@@ -506,11 +402,26 @@ struct ConvertBitsToPuD
               } else {
                 assert(operand0.type == AddressType::In || operand0.type == AddressType::Spill);
                 auto firstRow = allocated[operand0.str_repr];
-                if (iterIndex == 0) {
-                  assert(firstRows.contains(operand0.str_repr));
-                  addr0 = firstRows.lookup(operand0.str_repr);
+                if (carryRows.contains(operand0.str_repr)) {
+                  if (iterIndex == 0) {
+                    addr0 = c0;
+                  } else {
+                    if (refreshedCin.contains(operand0.str_repr)) {
+                      addr0 = carryRows.lookup(operand0.str_repr);
+                    } else {
+                      const auto cinIdx = std::get<int>(operand0.data);
+                      const auto coutIdx = carryMap.lookup(cinIdx);
+                      addr0 = carryRows.lookup(std::format("O{}", coutIdx));
+                      refreshedCin.insert(operand0.str_repr);
+                    }
+                  }
                 } else {
-                  addr0 = getOrCreateDRow(allocator.getRowFromOffset(firstRow, iterIndex));
+                  if (addrOffset == 0) {
+                    assert(firstRows.contains(operand0.str_repr));
+                    addr0 = firstRows.lookup(operand0.str_repr);
+                  } else {
+                    addr0 = getOrCreateDRow(allocator.getRowFromOffset(firstRow, addrOffset));
+                  }
                 }
               }
 
@@ -519,17 +430,23 @@ struct ConvertBitsToPuD
                 addr1 = bRows[index];
               } else {
                 assert(operand1.type == AddressType::Out || operand1.type == AddressType::Spill);
-                auto firstRow = allocated[operand1.str_repr];
-                auto rowId = firstRow.row;
-                if (iterIndex == 0) {
-                  assert(firstRows.contains(operand1.str_repr));
-                  addr1 = firstRows.lookup(operand1.str_repr);
+                if (carryRows.contains(operand1.str_repr)) {
+                  assert(operand1.type == AddressType::Out);
+                  const auto outputIdx = std::get<int>(operand1.data);
+                  assert(outputIdx < carryNum);
+                  addr1 = carryRows.lookup(operand1.str_repr);
                 } else {
-                  addr1 = getOrCreateDRow(allocator.getRowFromOffset(firstRow, iterIndex));
+                  auto firstRow = allocated[operand1.str_repr];
+                  if (addrOffset == 0) {
+                    assert(firstRows.contains(operand1.str_repr));
+                    addr1 = firstRows.lookup(operand1.str_repr);
+                  } else {
+                    addr1 = getOrCreateDRow(allocator.getRowFromOffset(firstRow, addrOffset));
+                  }
                 }
               }
 
-              auto aap = opBuilder.create<AAPOp>(loc, addr0, addr1);
+              opBuilder.create<AAPOp>(loc, addr0, addr1);
 
             }
           }
@@ -553,7 +470,7 @@ struct ConvertBitsToPuD
             auto index = std::get<int>(operand0.data);
             addr0 = bRows[index];
             if (inst.type == Instruction::Type::AP) {
-              auto ap = opBuilder.create<APOp>(loc, addr0);
+              opBuilder.create<APOp>(loc, addr0);
               continue;
             }
           } else if (operand0.type == AddressType::Const) {
@@ -596,7 +513,7 @@ struct ConvertBitsToPuD
             );
           }
 
-          auto aap = opBuilder.create<AAPOp>(loc, addr0, addr1);
+          opBuilder.create<AAPOp>(loc, addr0, addr1);
         }
 
         opBuilder.setInsertionPointAfter(loop);
@@ -608,7 +525,7 @@ struct ConvertBitsToPuD
       if (roundIdx + 1 == round) {
         sType = SliceType::get(ctx, bitWidth, lastSliceVecLen);
       }
-      TypedValue<SliceType> slice = opBuilder.create<LoadOp>(loc, sType, firstRow, getOrCreateI64Val(bitWidth));
+      TypedValue<SliceType> slice = opBuilder.create<LoadOp>(loc, sType, firstRow,getOrCreateI64Val(bitWidth));
       outputSlices[0].push_back(slice);
 
     }
@@ -632,11 +549,6 @@ struct ConvertBitsToPuD
 
     opBuilder.create<func::ReturnOp>(loc, resultTensor);
 
-  }
-
-  RowAddress allocate(int64_t numRows) {
-    auto &allocator = GlobalAddressAllocator::get();
-    return allocator.allocate(numRows);
   }
 
   void setUnroll(bool doUnroll) {

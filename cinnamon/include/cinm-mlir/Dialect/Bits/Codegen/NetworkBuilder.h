@@ -1,16 +1,16 @@
 #pragma once
 
-#include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 
+#include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/LogicalResult.h>
 #include <mlir/IR/BuiltinOps.h>
 
 #include <mlir/IR/Value.h>
+#include <mlir/Support/LLVM.h>
 #include <mockturtle/networks/mig.hpp>
-
 
 using MIG = mockturtle::mig_network;
 
@@ -24,9 +24,11 @@ public:
 
   const MIG &getNetwork() const { return mig; }
 
-  const SmallVector<TypedValue<SliceType>> &getInputSlices() const { return inputSlices; }
+  const DenseMap<int, int> &getCarryMap() const { return carryMap; }
 
-  // const SmallVector<TypedValue<SliceType>> &getOutputSlices() const { return outputSlices; }
+  ArrayRef<TypedValue<SliceType>> getInputSlices() const { return inputSlices; }
+
+  ArrayRef<TypedValue<SliceType>> getOutputSlices() const { return outputSlices; }
 
   static void debugPrint(MIG const &mig, llvm::raw_ostream &os = llvm::errs()) {
     os << "\n=== MIG Network Debug Info ===\n";
@@ -72,11 +74,12 @@ private:
   ModuleOp module;
   MIG mig;
   DenseMap<Value, MIG::signal> migSignalMap;
-  DenseMap<AddOp, MIG::signal> coutMap;
+  DenseMap<int, int> carryMap;
+  // DenseMap<AddOp, MIG::signal> coutMap;
   SmallVector<TypedValue<SliceType>> inputSlices;
-  // SmallVector<TypedValue<SliceType>> outputSlices;
+  SmallVector<TypedValue<SliceType>, 1> outputSlices;
 
-  std::optional<MIG::signal> findCarryIn(AddOp add);
+  // std::optional<MIG::signal> findCarryIn(AddOp add);
   std::pair<MIG::signal, MIG::signal> buildAdd(MIG::signal const& lhs,
                                                MIG::signal const& rhs,
                                                MIG::signal const& cin);
