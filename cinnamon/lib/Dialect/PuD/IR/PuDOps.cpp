@@ -52,7 +52,7 @@ LogicalResult AAPOp::verify() {
     if (dstGroup == 0)
       return success();
   } else if (srcGroup == 2) {
-    if (dstGroup == 0)
+    if (dstGroup == 0 || dstGroup == 2)
       return success();
   }
 

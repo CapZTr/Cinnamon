@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstdint>
 #include <format>
+#include <iostream>
 #include <string>
 
 
@@ -46,6 +47,16 @@ public:
     currentBank = 0;
     currentSubarray = 0;
     currentRow = 0;
+  }
+
+  void printStatus() const {
+    auto status = std::format("Allocator status: {} {} {} {} {}",
+        currentChannel,
+        currentRank,
+        currentBank,
+        currentSubarray,
+        currentRow);
+    std::cout << status << "\n";
   }
 
   int64_t getMaxColumnNum() const {

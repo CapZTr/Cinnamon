@@ -1,17 +1,18 @@
 #include "cinm-mlir/Conversion/ArithToBits/ArithToBits.h"
-#include "cinm-mlir/Conversion/BitsFrontendPasses.h"
-#include "cinm-mlir/Conversion/BitsPasses.h"
 #include "cinm-mlir/Conversion/BitsToPuD/BitsToPuD.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsBase.h"
-#include "cinm-mlir/Dialect/Bits/IR/BitsDialect.h"
 #include "cinm-mlir/Dialect/PuD/IR/PuDBase.h"
 #include "cinm-mlir/Dialect/PuD/IR/PuDDialect.h"
 #include "cinm-mlir/Dialect/PuD/IR/PuDOps.h"
 #include "cinm-mlir/Dialect/PuD/IR/PuDTypes.h"
 
+#include "cinm-mlir/Dialect/PuD/Codegen/OperandTracker.h"
+
 #include <algorithm>
+#include <llvm/ADT/StringMap.h>
 #include <llvm/Support/LogicalResult.h>
 #include <llvm/Support/SourceMgr.h>
+#include <memory>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/IR/BuiltinOps.h>
@@ -27,6 +28,8 @@
 #include <mlir/Support/FileUtilities.h>
 #include <mlir/Support/LLVM.h>
 
+#include <array>
+#include <bitset>
 #include <cassert>
 #include <cstdint>
 #include <format>
@@ -53,6 +56,43 @@ std::string intToHex(const int64_t v) {
   ss << "0x" << std::hex << v;
   return ss.str();
 }
+
+// For simple test
+std::array<uint32_t, 4> inputs = {12345, 45678, 56789, 67890};
+std::array<std::bitset<32>, 4> inputBits;
+void initTest() {
+  for (int i = 0; i < 4; ++i) {
+    std::bitset<32> bs(inputs[i]);
+    inputBits[i] = bs;
+  }
+}
+llvm::StringMap<std::unique_ptr<OperandExpr>> exprMap;
+void storeAndInitInput(std::string baseAddr, int inputIdx) {
+  unsigned long long base = std::stoull(baseAddr, nullptr, 0);
+  const auto bs = inputBits[inputIdx];
+  for (int i = 0; i < 32; ++i) {
+    auto addr = intToHex(base + i);
+    auto name = std::format("I{}_{}", inputIdx, i);
+    auto expr = std::make_unique<DataExpr>(name, bs[31 - i]);
+    assert(!exprMap.contains(addr));
+    exprMap[addr] = std::move(expr);
+  }
+}
+void loadAndEvaluateResult(std::string baseAddr) {
+  unsigned long long base = std::stoull(baseAddr, nullptr, 0);
+  std::bitset<32> bs;
+  for (int i = 0; i < 32; ++i) {
+    auto addr = intToHex(base + i);
+    assert(exprMap.contains(addr));
+    auto expr = exprMap[addr].get();
+    if (expr->evaluate()) {
+      bs.set(31 - i);
+    }
+  }
+  std::cout << "DRAM result: " << bs.to_ullong() << "\n\n";
+}
+const auto cExpr0 = std::make_unique<ConstantExpr>(false);
+const auto cExpr1 = std::make_unique<ConstantExpr>(true);
 
 std::string getTraceLine(const int cycle, const std::string &opName,
     const std::string &addr0, const std::optional<std::string> addr1) {
@@ -130,23 +170,46 @@ int main(int argc, char **argv) {
     return addrs.lookup(rowAddr);
   };
 
-  auto getRowNum = [&](mlir::TypedValue<pud::RowType> rowAddr) -> int {
+  auto getRowIndex = [&](mlir::TypedValue<pud::RowType> rowAddr) -> int {
     auto op = rowAddr.getDefiningOp();
     assert(isa<pud::GetRowOp>(*op));
     auto getRow = cast<pud::GetRowOp>(*op);
-    auto row = indices.lookup(getRow.getRowID());
+    return indices.lookup(getRow.getRowID());
+  };
+
+  auto getRowNum = [&](mlir::TypedValue<pud::RowType> rowAddr) -> int {
+    auto row = getRowIndex(rowAddr);
     assert(row >= 0 && row <= 15);
     return row < 8 ? 1 
         : row < 12 ? 2
         : 3;
   };
 
+  uint64_t sum = 0;
+  for (const auto i : inputs) {
+    sum += i;
+  }
+  std::cout << "CPU  result: " << sum << "\n\n";
+
+  initTest();
+  OperandTracker tracker;
+
   module->walk([&](func::FuncOp func) {
+    int inputIdx = 0;
     func->walk([&](Operation *op) {
       if (auto cnst = dyn_cast<arith::ConstantOp>(*op)) {
         assert(cnst.getType().isInteger(64));
         indices[cast<mlir::TypedValue<IntegerType>>(cnst.getResult())] = cast<IntegerAttr>
             (cnst.getValue()).getValue().getZExtValue();
+      } else if (auto store = dyn_cast<pud::StoreOp>(*op)) {
+        auto firstRow = store.getFirstRow();
+        auto addr = getAddressAsStr(firstRow);
+        storeAndInitInput(addr, inputIdx);
+        inputIdx++;
+      } else if (auto load = dyn_cast<pud::LoadOp>(*op)) {
+        auto firstRow = load.getFirstRow();
+        auto addr = getAddressAsStr(firstRow);
+        loadAndEvaluateResult(addr);
       } else if (auto ap = dyn_cast<pud::APOp>(*op)) {
         auto row = ap.getAddr();
         assert(row.getType().getGroup() == 0);
@@ -157,7 +220,13 @@ int main(int argc, char **argv) {
             : "T";
         trace.push_back(getTraceLine(cycle, opName, addr, std::nullopt));
         cycle++;
+        // Tracking
+        tracker.executeAP(getRowIndex(row));
+        // std::cout << "===== AP =====\n";
+        // std::cout << "AP " << addr << ": " << tracker.getBGroupExprs()[getRowIndex(row)]->evaluate() << "\n";
+        // std::cout << "==============\n";
       } else if (auto aap = dyn_cast<pud::AAPOp>(*op)) {
+        // std::cout << "=====AAP =====\n";
         auto row0 = aap.getSrcAddr();
         auto addr0 = getAddressAsStr(row0);
         int rowNum0 = 1;
@@ -181,6 +250,46 @@ int main(int argc, char **argv) {
           trace.push_back(getTraceLine(cycle, "W", addr1, std::nullopt));
           cycle++;
         }
+        // Tracking
+        if (row0.getType().getGroup() == 0) {
+          auto index0 = getRowIndex(row0);
+          if (row1.getType().getGroup() == 0) {
+            auto index1 = getRowIndex(row1);
+            tracker.executeAAP(index0, index1);
+            // std::cout << "Source: " << addr0 << " = " << tracker.getBGroupExprs()[index0]->evaluate() << "\n";
+            // std::cout << "Destination: " << addr1 << " = " << tracker.getBGroupExprs()[index1]->evaluate() << "\n";
+          } else {
+            assert(row1.getType().getGroup() == 2);
+            auto expr = tracker.executeAAP(index0, std::nullopt);
+            // std::cout << "Source: " << addr0 << " = " << tracker.getBGroupExprs()[index0]->evaluate() << "\n";
+            // std::cout << "Destination: " << addr1 << " = " << expr->evaluate() << "\n";
+            exprMap[addr1] = std::move(expr);
+          }
+        } else if (row0.getType().getGroup() == 1) {
+          assert(row1.getType().getGroup() == 0);
+          auto cExpr = getRowIndex(row0) == 0 ? cExpr0.get() : cExpr1.get();
+          // std::cout << "Source: " << addr0 << " = " << cExpr->evaluate() << "\n";
+          auto index1 = getRowIndex(row1);
+          tracker.executeAAP(cExpr, index1);
+          // std::cout << "Destination: " << addr1 << " = " << tracker.getBGroupExprs()[index1]->evaluate() << "\n";
+        } else {
+          assert(row0.getType().getGroup() == 2);
+          assert(exprMap.contains(addr0));
+          auto src = exprMap[addr0]->clone();
+          // std::cout << "Source: " << addr0 << " = " << src->evaluate() << "\n";
+          if (row1.getType().getGroup() == 0) {
+            auto index1 = getRowIndex(row1);
+            tracker.executeAAP(src.get(), index1);
+            // std::cout << "Destination: " << addr1 << " = " << tracker.getBGroupExprs()[index1]->evaluate() << "\n";
+          } else {
+            assert(row1.getType().getGroup() == 2);
+            auto expr = tracker.executeAAP(exprMap[addr0].get(), std::nullopt);
+            // std::cout << "Destination: " << addr1 << " = " << expr->evaluate() << "\n";
+            // std::cout << "Tracking " << addr1 << ": " << expr->evaluate() << "\n";
+            exprMap[addr1] = std::move(expr);
+          }
+        }
+        // std::cout << "==============\n";
       }
     });
   });

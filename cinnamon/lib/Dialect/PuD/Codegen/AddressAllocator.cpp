@@ -59,7 +59,7 @@ RowAddress AddressAllocator::allocate(int64_t numRows) {
       rank, 
       bank, 
       sa, 
-      row
+      row-numRows
   };
 
   int64_t saToUpdate = channel * 2 + rank * 2 + bank * 8 + sa;
@@ -76,6 +76,9 @@ RowAddress AddressAllocator::getRowFromOffset(const RowAddress &base, const int6
 }
 
 int AddressAllocator::checkSpace(int64_t numRows) const {
+  if (restSpace.empty()) {
+    return 0;
+  }
   int subArrayID = -1;
   for (const auto &pair : restSpace) {
     if (numRows <= pair.second)

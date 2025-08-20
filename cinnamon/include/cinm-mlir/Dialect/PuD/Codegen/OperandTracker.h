@@ -1,5 +1,6 @@
 #pragma once
 
+#include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/SmallVector.h>
 #include <memory>
 #include <optional>
@@ -17,46 +18,42 @@ public:
 
 class ConstantExpr : public OperandExpr {
 private:
-  bool value;
+  bool bitVal;
   
 public:
-  ConstantExpr(bool value) : value(value) {}
+  ConstantExpr(bool bitVal) : bitVal(bitVal) {}
   
   std::unique_ptr<OperandExpr> clone() const override {
-    return std::make_unique<ConstantExpr>(value);
+    return std::make_unique<ConstantExpr>(bitVal);
   }
   
   std::string toString() const override {
-    return value ? "C1" : "C0";
+    return bitVal ? "C1" : "C0";
   }
 
   bool evaluate() const override {
-    return value;
+    return bitVal;
   }
 };
 
 class DataExpr : public OperandExpr {
 private:
   std::string name;
-  bool value;
+  bool bitVal;
   
 public:
-  DataExpr(const std::string &name) : name(name) {}
+  DataExpr(const std::string &name, bool bitVal) : name(name), bitVal(bitVal) {}
   
   std::unique_ptr<OperandExpr> clone() const override {
-    return std::make_unique<DataExpr>(name);
+    return std::make_unique<DataExpr>(name, bitVal);
   }
   
   std::string toString() const override {
     return name;
   }
 
-  void configure(bool val) {
-    value = val;
-  }
-
   bool evaluate() const override {
-    return value;
+    return bitVal;
   }
 };
 
@@ -121,12 +118,16 @@ class OperandTracker {
 private:
   llvm::SmallVector<std::unique_ptr<OperandExpr>, 16> bGroupExpressions;
 
+  std::unique_ptr<OperandExpr> doMaj(int index1, int index2, int index3);
+  void doNot(int index);
+
 public:
   explicit OperandTracker();
   std::unique_ptr<OperandExpr> executeAP(int index);
   std::unique_ptr<OperandExpr> executeAAP(
       std::variant<OperandExpr *, int> source,
       std::optional<int> destination);
-  std::unique_ptr<OperandExpr> doMaj(int index1, int index2, int index3);
-  void doNot(int index);
+  llvm::ArrayRef<std::unique_ptr<OperandExpr>> getBGroupExprs() const {
+    return bGroupExpressions;
+  }
 };

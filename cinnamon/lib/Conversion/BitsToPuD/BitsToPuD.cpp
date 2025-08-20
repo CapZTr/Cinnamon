@@ -103,12 +103,12 @@ struct ConvertBitsToPuD
 
     ProgramString program_str;
     auto [optimized, result] = ambit_rewrite(settings, mig, program_str);
-    std::cout << "Generated program:\n" << program_str.str() << "\n";
+    std::cout << "\nGenerated program:\n" << program_str.str() << "\n";
 
     // NetworkBuilder::debugPrint(optimized);
 
-    std::cout << "\n ===== Optimized Network ===== \n";
-    mockturtle::write_dot(optimized, std::cout);
+    // std::cout << "\n ===== Optimized Network ===== \n";
+    // mockturtle::write_dot(optimized, std::cout);
 
 
     // =========================================================================
@@ -316,7 +316,10 @@ struct ConvertBitsToPuD
             if (inputIdx < inputNum) {
               if (!allocated.contains(operand0.str_repr)) {
                 assert(roundIdx == 0);
+                // allocator.printStatus();
                 auto addr = allocator.allocate(bitWidth);
+                // std::cout << operand0.str_repr << ": " << addr.str() << "\n";
+                // allocator.printStatus();
                 allocated[operand0.str_repr] = addr;
                 auto firstRow = getOrCreateDRow(addr);
                 firstRows[operand0.str_repr] = firstRow;
@@ -331,7 +334,10 @@ struct ConvertBitsToPuD
             } else {
               if (!allocated.contains(operand0.str_repr)) {
                 assert(roundIdx == 0);
+                // allocator.printStatus();
                 auto addr = allocator.allocate(1);
+                // std::cout << operand0.str_repr << ": " << addr.str() << "\n";
+                // allocator.printStatus();
                 allocated[operand0.str_repr] = addr;
                 auto cinRow = getOrCreateDRow(addr);
                 assert(!carryRows.contains(operand0.str_repr));
@@ -348,7 +354,10 @@ struct ConvertBitsToPuD
             if (operand1.type == AddressType::Out && index < carryNum) {
               if (!allocated.contains(operand1.str_repr)) {
                 assert(roundIdx == 0);
+                // allocator.printStatus();
                 auto addr = allocator.allocate(1);
+                // std::cout << operand1.str_repr << ": " << addr.str() << "\n";
+                // allocator.printStatus();
                 allocated[operand1.str_repr] = addr;
                 auto coutRow = getOrCreateDRow(addr);
                 assert(!carryRows.contains(operand1.str_repr));
@@ -358,7 +367,10 @@ struct ConvertBitsToPuD
             }
             if (!allocated.contains(operand1.str_repr)) {
               assert(roundIdx == 0);
+              // allocator.printStatus();
               auto addr = allocator.allocate(bitWidth);
+              // std::cout << operand1.str_repr << ": " << addr.str() << "\n";
+              // allocator.printStatus();
               allocated[operand1.str_repr] = addr;
               auto firstRow = getOrCreateDRow(addr);
               firstRows[operand1.str_repr] = firstRow;
@@ -378,9 +390,8 @@ struct ConvertBitsToPuD
         int64_t addrOffset = bitWidth;
         while (iterIndex < bitWidth) {
           addrOffset--;
-
+          llvm::StringSet<> refreshedCin;
           for (auto &inst : program) {
-            llvm::StringSet<> refreshedCin;
 
             if (inst.type == Instruction::Type::AP) {
               assert(inst.operand0.type == AddressType::Bitwise);
@@ -406,12 +417,12 @@ struct ConvertBitsToPuD
                   if (iterIndex == 0) {
                     addr0 = c0;
                   } else {
-                    if (refreshedCin.contains(operand0.str_repr)) {
-                      addr0 = carryRows.lookup(operand0.str_repr);
-                    } else {
+                    addr0 = carryRows.lookup(operand0.str_repr);
+                    if (!refreshedCin.contains(operand0.str_repr)) {
                       const auto cinIdx = std::get<int>(operand0.data);
                       const auto coutIdx = carryMap.lookup(cinIdx);
-                      addr0 = carryRows.lookup(std::format("O{}", coutIdx));
+                      auto carry = carryRows.lookup(std::format("O{}", coutIdx));
+                      opBuilder.create<AAPOp>(loc, carry, addr0);
                       refreshedCin.insert(operand0.str_repr);
                     }
                   }

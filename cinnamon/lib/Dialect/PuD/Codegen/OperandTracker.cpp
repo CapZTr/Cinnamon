@@ -49,11 +49,13 @@ std::unique_ptr<OperandExpr> OperandTracker::executeAAP(
     std::variant<OperandExpr *, int> source,
     std::optional<int> destination) {
   OperandExpr *toClone;
+  std::unique_ptr<OperandExpr> temp;
   if (auto addr1 = std::get_if<int>(&source)) {
     if (*addr1 >= 12 && *addr1 <= 15) {
-      toClone = executeAP(*addr1).get();
+      temp = executeAP(*addr1);
+      toClone = temp.get();
     } else {
-      assert(*addr1 <= 6 && *addr1 != 5);
+      assert(*addr1 <= 7);
       toClone = bGroupExpressions[*addr1].get();
     }
   } else {
@@ -65,8 +67,8 @@ std::unique_ptr<OperandExpr> OperandTracker::executeAAP(
   } else {
     auto addr2 = *destination;
     assert(addr2 <= 11);
+    bGroupExpressions[addr2] = toClone->clone();
     if (addr2 <= 7) {
-      bGroupExpressions[addr2] = toClone->clone();
       if (addr2 >= 4) {
         doNot(addr2);
       }
