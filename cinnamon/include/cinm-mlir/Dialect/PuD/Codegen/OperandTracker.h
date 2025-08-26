@@ -123,6 +123,10 @@ private:
 
 public:
   explicit OperandTracker();
+  OperandTracker(const OperandTracker&) = delete;
+  OperandTracker& operator=(const OperandTracker&) = delete;
+  OperandTracker(OperandTracker&&) = default;
+  OperandTracker& operator=(OperandTracker&&) = default;
   std::unique_ptr<OperandExpr> executeAP(int index);
   std::unique_ptr<OperandExpr> executeAAP(
       std::variant<OperandExpr *, int> source,

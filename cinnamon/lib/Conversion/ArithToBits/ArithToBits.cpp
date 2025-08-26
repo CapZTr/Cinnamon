@@ -1,7 +1,5 @@
 #include "cinm-mlir/Conversion/ArithToBits/ArithToBits.h"
-#include "cinm-mlir/Conversion/BitsFrontendPasses.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsBase.h"
-#include "cinm-mlir/Dialect/Bits/IR/BitsDialect.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 

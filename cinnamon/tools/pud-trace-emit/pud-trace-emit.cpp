@@ -8,13 +8,18 @@
 
 #include "cinm-mlir/Dialect/PuD/Codegen/OperandTracker.h"
 
-#include <algorithm>
+#include <cstddef>
+#include <llvm/ADT/APInt.h>
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/SetVector.h>
+#include <llvm/ADT/SmallString.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringMap.h>
 #include <llvm/Support/LogicalResult.h>
 #include <llvm/Support/SourceMgr.h>
-#include <memory>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Dialect/Tensor/IR/Tensor.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/BuiltinTypes.h>
 #include <mlir/IR/DialectRegistry.h>
@@ -28,14 +33,16 @@
 #include <mlir/Support/FileUtilities.h>
 #include <mlir/Support/LLVM.h>
 
-#include <array>
-#include <bitset>
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -50,6 +57,9 @@ const int64_t NUM_ROW_PER_BANK = NUM_ROW_PER_SUBARRAY * NUM_SUBARRAY_PER_BANK;
 const int64_t NUM_ROW_PER_RANK = NUM_ROW_PER_BANK * NUM_BANK_PER_RANK;
 const int64_t NUM_ROW_PER_CHANEL = NUM_ROW_PER_RANK * NUM_RANK_PER_CHANNEL;
 const std::string DUMMY_DATA = "b186649dd2c40617e1df8669b90acd6389c0e5f8e5c059c5a4ea4f9eb6409eaacf4380666a43bcc792e0d3f2a7b88eca6067d625801408a3df929bb8b4136b68";
+// For simplification, we set lenth of each vector to 8 when evaluating
+// functional correctness.
+const size_t VEC_LEN = 8;
 
 std::string intToHex(const int64_t v) {
   std::stringstream ss;
@@ -57,42 +67,136 @@ std::string intToHex(const int64_t v) {
   return ss.str();
 }
 
-// For simple test
-std::array<uint32_t, 4> inputs = {12345, 45678, 56789, 67890};
-std::array<std::bitset<32>, 4> inputBits;
-void initTest() {
-  for (int i = 0; i < 4; ++i) {
-    std::bitset<32> bs(inputs[i]);
-    inputBits[i] = bs;
-  }
-}
-llvm::StringMap<std::unique_ptr<OperandExpr>> exprMap;
-void storeAndInitInput(std::string baseAddr, int inputIdx) {
-  unsigned long long base = std::stoull(baseAddr, nullptr, 0);
-  const auto bs = inputBits[inputIdx];
-  for (int i = 0; i < 32; ++i) {
-    auto addr = intToHex(base + i);
-    auto name = std::format("I{}_{}", inputIdx, i);
-    auto expr = std::make_unique<DataExpr>(name, bs[31 - i]);
-    assert(!exprMap.contains(addr));
-    exprMap[addr] = std::move(expr);
-  }
-}
-void loadAndEvaluateResult(std::string baseAddr) {
-  unsigned long long base = std::stoull(baseAddr, nullptr, 0);
-  std::bitset<32> bs;
-  for (int i = 0; i < 32; ++i) {
-    auto addr = intToHex(base + i);
-    assert(exprMap.contains(addr));
-    auto expr = exprMap[addr].get();
-    if (expr->evaluate()) {
-      bs.set(31 - i);
-    }
-  }
-  std::cout << "DRAM result: " << bs.to_ullong() << "\n\n";
-}
+// Evaluate Functional Correctness
 const auto cExpr0 = std::make_unique<ConstantExpr>(false);
 const auto cExpr1 = std::make_unique<ConstantExpr>(true);
+
+llvm::DenseMap<Value, llvm::SmallVector<llvm::APInt>> testValMap;
+llvm::SetVector<Value> inputs;
+
+unsigned bitWidth = 0;
+
+std::mt19937_64 &rng() {
+  thread_local std::mt19937_64 eng{std::random_device{}()};
+  return eng;
+}
+
+llvm::APInt createRandomTestVal(unsigned N) {
+  assert(N > 0);
+
+  const unsigned words = (N + 63) / 64;
+  llvm::SmallVector<uint64_t, 4> data(words);
+
+  std::uniform_int_distribution<uint64_t> dist(
+      0, std::numeric_limits<uint16_t>::max());
+  for (unsigned i = 0; i < words; ++i)
+    data[i] = dist(rng());
+
+  const unsigned extra = words * 64 - N;
+  if (extra) {
+    data.back() &= (extra == 64 ? 0ull : (~0ull >> extra));
+    // data.back() &= (~0ull) >> extra;
+  }
+
+  // auto v = llvm::APInt(N, words, data.data());
+  // v.print(llvm::outs(), /*isSigned=*/false);
+  // llvm::outs() << "\n";
+  // return v;
+  return llvm::APInt(N, words, data.data());
+}
+
+llvm::APInt getOrCreateTestVal(Value v, size_t i) {
+  if (v.getDefiningOp() == nullptr) {
+    inputs.insert(v);
+  }
+  assert(i < VEC_LEN);
+  assert(llvm::isa<RankedTensorType>(v.getType()));
+  auto t = cast<RankedTensorType>(v.getType());
+  assert(t.getRank() == 1);
+  assert(llvm::isa<IntegerType>(t.getElementType()));
+  auto elemBitWidth = t.getElementTypeBitWidth();
+  if (bitWidth == 0) {
+    bitWidth = elemBitWidth;
+  } else {
+    assert(bitWidth == elemBitWidth);
+  }
+  if (!testValMap.contains(v)) {
+    llvm::SmallVector<llvm::APInt> vec;
+    vec.push_back(createRandomTestVal(elemBitWidth));
+    testValMap[v] = vec;
+  } else if (testValMap[v].size() == i) {
+    llvm::APInt input = createRandomTestVal(elemBitWidth);
+    testValMap[v].push_back(input);
+  }
+  return testValMap.lookup(v)[i];
+}
+
+void doAddition(Value lhs, Value rhs, Value sum) {
+  assert(!testValMap.contains(sum));
+  llvm::SmallVector<llvm::APInt> resVec;
+  for (size_t i = 0; i < VEC_LEN; ++i) {
+    llvm::APInt res = getOrCreateTestVal(lhs, i) + getOrCreateTestVal(rhs, i);
+    resVec.push_back(res);
+  }
+  testValMap[sum] = resVec;
+}
+
+llvm::StringMap<llvm::SmallVector<std::unique_ptr<OperandExpr>>> exprMap;
+
+std::string resultString(const llvm::SmallVector<llvm::APInt> &resVec) {
+  assert(resVec.size() == VEC_LEN);
+  std::string resLine = "[";
+  for (size_t i = 0; i < VEC_LEN; ++i) {
+    llvm::SmallString<64> resStr;
+    resVec[i].toString(resStr, 10, true);
+    std::string s(resStr.begin(), resStr.end());
+    resLine += s;
+    resLine += ", ";
+  }
+  resLine.resize(resLine.size() - 2);
+  resLine += "]";
+  return resLine;
+}
+
+void storeAndInitInput(std::string baseAddr, size_t inputIdx) {
+  assert(inputIdx < inputs.size());
+  unsigned long long base = std::stoull(baseAddr, nullptr, 0);
+  const auto &v = inputs[inputIdx];
+  assert(testValMap.contains(v));
+  const auto &inputVec = testValMap[v];
+  for (size_t i = 0; i < bitWidth; ++i) {
+    auto bitIdx = bitWidth - i - 1;
+    llvm::SmallVector<std::unique_ptr<OperandExpr>> exprVec;
+    auto addr = intToHex(base + i);
+    assert(!exprMap.contains(addr));
+    auto name = std::format("I{}_{}", inputIdx, i);
+    for (size_t j = 0; j < VEC_LEN; ++j) {
+      auto expr = std::make_unique<DataExpr>(name, inputVec[j][bitIdx]);
+      exprVec.push_back(std::move(expr));
+    }
+    exprMap[addr] = std::move(exprVec);
+  }
+}
+
+void loadAndEvaluateResult(std::string baseAddr) {
+  unsigned long long base = std::stoull(baseAddr, nullptr, 0);
+  llvm::SmallVector<llvm::APInt> outputVec;
+  for (size_t i = 0; i < VEC_LEN; ++i) {
+    outputVec.push_back(llvm::APInt::getZero(bitWidth));
+  }
+  for (size_t i = 0; i < bitWidth; ++i) {
+    auto bitIdx = bitWidth - i - 1;
+    auto addr = intToHex(base + i);
+    assert(exprMap.contains(addr));
+    const auto &exprVec = exprMap[addr];
+    for (size_t j = 0; j < VEC_LEN; ++j) {
+      if (exprVec[j]->evaluate()) {
+        outputVec[j].setBit(bitIdx);
+      }
+    }
+  }
+  std::cout << "DRAM result:\n" << resultString(outputVec) << "\n\n";
+}
 
 std::string getTraceLine(const int cycle, const std::string &opName,
     const std::string &addr0, const std::optional<std::string> addr1) {
@@ -122,6 +226,19 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  std::string cpuRes;
+
+  func::FuncOp fp = *module->getOps<func::FuncOp>().begin();
+  fp.walk([&](Operation *op) {
+    if (auto add = dyn_cast<arith::AddIOp>(*op)) {
+      doAddition(add.getLhs(), add.getRhs(), add.getResult());
+    } else if (auto ret = dyn_cast<func::ReturnOp>(*op)) {
+      assert(testValMap.contains(ret.getOperand(0)));
+      const auto &resVec = testValMap.lookup(ret.getOperand(0));
+      cpuRes = resultString(resVec);
+    }
+  });
+
   PassManager pm(&context);
   pm.addNestedPass<func::FuncOp>(bits_frontend::createConvertArithToBitsPass());
   pm.addNestedPass<func::FuncOp>(mlir::bits::createConvertBitsToPuDPass(true));
@@ -130,6 +247,8 @@ int main(int argc, char **argv) {
     std::cerr << "Failed to run passes\n";
     return 1;
   }
+
+  std::cout << "CPU result:\n" << cpuRes << "\n\n";
 
   std::vector<std::string> trace;
   trace.push_back(">");
@@ -185,17 +304,11 @@ int main(int argc, char **argv) {
         : 3;
   };
 
-  uint64_t sum = 0;
-  for (const auto i : inputs) {
-    sum += i;
-  }
-  std::cout << "CPU  result: " << sum << "\n\n";
-
-  initTest();
-  OperandTracker tracker;
+  llvm::SmallVector<OperandTracker, 16> trackers;
+  trackers.resize(VEC_LEN);
 
   module->walk([&](func::FuncOp func) {
-    int inputIdx = 0;
+    size_t inputIdx = 0;
     func->walk([&](Operation *op) {
       if (auto cnst = dyn_cast<arith::ConstantOp>(*op)) {
         assert(cnst.getType().isInteger(64));
@@ -221,12 +334,10 @@ int main(int argc, char **argv) {
         trace.push_back(getTraceLine(cycle, opName, addr, std::nullopt));
         cycle++;
         // Tracking
-        tracker.executeAP(getRowIndex(row));
-        // std::cout << "===== AP =====\n";
-        // std::cout << "AP " << addr << ": " << tracker.getBGroupExprs()[getRowIndex(row)]->evaluate() << "\n";
-        // std::cout << "==============\n";
+        for (auto &t : trackers) {
+          t.executeAP(getRowIndex(row));
+        }
       } else if (auto aap = dyn_cast<pud::AAPOp>(*op)) {
-        // std::cout << "=====AAP =====\n";
         auto row0 = aap.getSrcAddr();
         auto addr0 = getAddressAsStr(row0);
         int rowNum0 = 1;
@@ -255,41 +366,52 @@ int main(int argc, char **argv) {
           auto index0 = getRowIndex(row0);
           if (row1.getType().getGroup() == 0) {
             auto index1 = getRowIndex(row1);
-            tracker.executeAAP(index0, index1);
-            // std::cout << "Source: " << addr0 << " = " << tracker.getBGroupExprs()[index0]->evaluate() << "\n";
-            // std::cout << "Destination: " << addr1 << " = " << tracker.getBGroupExprs()[index1]->evaluate() << "\n";
+            for (auto &t : trackers) {
+              t.executeAAP(index0, index1);
+            }
           } else {
             assert(row1.getType().getGroup() == 2);
-            auto expr = tracker.executeAAP(index0, std::nullopt);
-            // std::cout << "Source: " << addr0 << " = " << tracker.getBGroupExprs()[index0]->evaluate() << "\n";
-            // std::cout << "Destination: " << addr1 << " = " << expr->evaluate() << "\n";
-            exprMap[addr1] = std::move(expr);
+            if (!exprMap.contains(addr1)) {
+              exprMap[addr1] = llvm::SmallVector<std::unique_ptr<OperandExpr>>();
+            }
+            for (size_t i = 0; i < VEC_LEN; ++i) {
+              auto expr = trackers[i].executeAAP(index0, std::nullopt);
+              if (exprMap[addr1].size() <= i) {
+                exprMap[addr1].push_back(std::move(expr));
+              } else {
+                exprMap[addr1][i] = std::move(expr);
+              }
+            }
           }
         } else if (row0.getType().getGroup() == 1) {
           assert(row1.getType().getGroup() == 0);
           auto cExpr = getRowIndex(row0) == 0 ? cExpr0.get() : cExpr1.get();
-          // std::cout << "Source: " << addr0 << " = " << cExpr->evaluate() << "\n";
           auto index1 = getRowIndex(row1);
-          tracker.executeAAP(cExpr, index1);
-          // std::cout << "Destination: " << addr1 << " = " << tracker.getBGroupExprs()[index1]->evaluate() << "\n";
+          for (auto &t : trackers) {
+            t.executeAAP(cExpr, index1);
+          }
         } else {
           assert(row0.getType().getGroup() == 2);
           assert(exprMap.contains(addr0));
-          auto src = exprMap[addr0]->clone();
-          // std::cout << "Source: " << addr0 << " = " << src->evaluate() << "\n";
-          if (row1.getType().getGroup() == 0) {
-            auto index1 = getRowIndex(row1);
-            tracker.executeAAP(src.get(), index1);
-            // std::cout << "Destination: " << addr1 << " = " << tracker.getBGroupExprs()[index1]->evaluate() << "\n";
-          } else {
-            assert(row1.getType().getGroup() == 2);
-            auto expr = tracker.executeAAP(exprMap[addr0].get(), std::nullopt);
-            // std::cout << "Destination: " << addr1 << " = " << expr->evaluate() << "\n";
-            // std::cout << "Tracking " << addr1 << ": " << expr->evaluate() << "\n";
-            exprMap[addr1] = std::move(expr);
+          if (!exprMap.contains(addr1)) {
+            exprMap[addr1] = llvm::SmallVector<std::unique_ptr<OperandExpr>>();
+          }
+          for (size_t i = 0; i < VEC_LEN; ++i) {
+            auto src = exprMap[addr0][i]->clone();
+            if (row1.getType().getGroup() == 0) {
+              auto index1 = getRowIndex(row1);
+              trackers[i].executeAAP(src.get(), index1);
+            } else {
+              assert(row1.getType().getGroup() == 2);
+              auto expr = trackers[i].executeAAP(src.get(), std::nullopt);
+              if (exprMap[addr1].size() <= i) {
+                exprMap[addr1].push_back(std::move(expr));
+              } else {
+                exprMap[addr1][i] = std::move(expr);
+              }
+            }
           }
         }
-        // std::cout << "==============\n";
       }
     });
   });

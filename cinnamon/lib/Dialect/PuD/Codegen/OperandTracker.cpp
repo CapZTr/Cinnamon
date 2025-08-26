@@ -7,9 +7,7 @@
 
 
 OperandTracker::OperandTracker() {
-  for (int i = 0; i < 16; ++i) {
-    bGroupExpressions.push_back(nullptr);
-  }
+  bGroupExpressions.resize(16);
 }
 
 std::unique_ptr<OperandExpr> OperandTracker::executeAP(int index) {
@@ -101,10 +99,13 @@ std::unique_ptr<OperandExpr> OperandTracker::executeAAP(
 }
 
 std::unique_ptr<OperandExpr> OperandTracker::doMaj(int index1, int index2, int index3) {
+  assert(bGroupExpressions[index1] && bGroupExpressions[index2]
+      && bGroupExpressions[index3]
+      && "doMaj operands must be initialized before use");
   auto m = std::make_unique<MajExpr>(
-      std::move(bGroupExpressions[index1]),
-      std::move(bGroupExpressions[index2]),
-      std::move(bGroupExpressions[index3]));
+      bGroupExpressions[index1]->clone(),
+      bGroupExpressions[index2]->clone(),
+      bGroupExpressions[index3]->clone());
   bGroupExpressions[index1] = m->clone();
   bGroupExpressions[index2] = m->clone();
   bGroupExpressions[index3] = m->clone();
