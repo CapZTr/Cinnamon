@@ -69,7 +69,8 @@ RowAddress AddressAllocator::allocate(int64_t numRows) {
   return addr;
 }
 
-RowAddress AddressAllocator::getRowFromOffset(const RowAddress &base, const int64_t offset) {
+RowAddress AddressAllocator::getRowFromOffset(
+    const RowAddress &base, const int64_t offset) {
   auto rowID = base.row + offset;
   assert(rowID <= MAX_ROW);
   return {base.channel, base.rank, base.bank, base.subarray, rowID};

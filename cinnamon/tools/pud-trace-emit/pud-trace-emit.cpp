@@ -8,7 +8,6 @@
 
 #include "cinm-mlir/Dialect/PuD/Codegen/OperandTracker.h"
 
-#include <cstddef>
 #include <llvm/ADT/APInt.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SetVector.h>
@@ -35,6 +34,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <fstream>
@@ -56,10 +56,12 @@ const int NUM_ROW_PER_SUBARRAY = 1024;
 const int64_t NUM_ROW_PER_BANK = NUM_ROW_PER_SUBARRAY * NUM_SUBARRAY_PER_BANK;
 const int64_t NUM_ROW_PER_RANK = NUM_ROW_PER_BANK * NUM_BANK_PER_RANK;
 const int64_t NUM_ROW_PER_CHANEL = NUM_ROW_PER_RANK * NUM_RANK_PER_CHANNEL;
-const std::string DUMMY_DATA = "b186649dd2c40617e1df8669b90acd6389c0e5f8e5c059c5a4ea4f9eb6409eaacf4380666a43bcc792e0d3f2a7b88eca6067d625801408a3df929bb8b4136b68";
-// For simplification, we set lenth of each vector to 8 when evaluating
+const std::string DUMMY_DATA = "b186649dd2c40617e1df8669b90acd6389c0e5f8e5c059c"
+    "5a4ea4f9eb6409eaacf4380666a43bcc792e0d3f2a7b88eca6067d625801408a3df929bb8b"
+    "4136b68";
+// For simplification, we set lenth of each vector to 4 when evaluating
 // functional correctness.
-const size_t VEC_LEN = 8;
+const size_t VEC_LEN = 4;
 
 std::string intToHex(const int64_t v) {
   std::stringstream ss;
@@ -98,10 +100,6 @@ llvm::APInt createRandomTestVal(unsigned N) {
     // data.back() &= (~0ull) >> extra;
   }
 
-  // auto v = llvm::APInt(N, words, data.data());
-  // v.print(llvm::outs(), /*isSigned=*/false);
-  // llvm::outs() << "\n";
-  // return v;
   return llvm::APInt(N, words, data.data());
 }
 
@@ -248,7 +246,12 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  std::cout << "CPU result:\n" << cpuRes << "\n\n";
+  std::cout << "Inputs: \n";
+  for (const auto &in : inputs) {
+    assert(testValMap.contains(in));
+    std::cout << resultString(testValMap[in]) << "\n";
+  }
+  std::cout << "\n";
 
   std::vector<std::string> trace;
   trace.push_back(">");
@@ -307,6 +310,7 @@ int main(int argc, char **argv) {
   llvm::SmallVector<OperandTracker, 16> trackers;
   trackers.resize(VEC_LEN);
 
+  std::string resultAddr;
   module->walk([&](func::FuncOp func) {
     size_t inputIdx = 0;
     func->walk([&](Operation *op) {
@@ -321,8 +325,7 @@ int main(int argc, char **argv) {
         inputIdx++;
       } else if (auto load = dyn_cast<pud::LoadOp>(*op)) {
         auto firstRow = load.getFirstRow();
-        auto addr = getAddressAsStr(firstRow);
-        loadAndEvaluateResult(addr);
+        resultAddr = getAddressAsStr(firstRow);
       } else if (auto ap = dyn_cast<pud::APOp>(*op)) {
         auto row = ap.getAddr();
         assert(row.getType().getGroup() == 0);
@@ -415,6 +418,9 @@ int main(int argc, char **argv) {
       }
     });
   });
+
+  std::cout << "CPU result:\n" << cpuRes << "\n\n";
+  loadAndEvaluateResult(resultAddr);
 
   std::ofstream trace_file(argv[2]);
   if (!trace_file.is_open()) {

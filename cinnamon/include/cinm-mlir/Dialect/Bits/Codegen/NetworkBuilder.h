@@ -75,11 +75,9 @@ private:
   MIG mig;
   DenseMap<Value, MIG::signal> migSignalMap;
   DenseMap<int, int> carryMap;
-  // DenseMap<AddOp, MIG::signal> coutMap;
   SmallVector<TypedValue<SliceType>> inputSlices;
   SmallVector<TypedValue<SliceType>, 1> outputSlices;
 
-  // std::optional<MIG::signal> findCarryIn(AddOp add);
   std::pair<MIG::signal, MIG::signal> buildAdd(MIG::signal const& lhs,
                                                MIG::signal const& rhs,
                                                MIG::signal const& cin);
