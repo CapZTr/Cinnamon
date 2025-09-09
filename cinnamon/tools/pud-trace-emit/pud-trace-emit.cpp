@@ -8,12 +8,14 @@
 
 #include "cinm-mlir/Dialect/PuD/Codegen/OperandTracker.h"
 
+#include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/APInt.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SetVector.h>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringMap.h>
+#include <llvm/Support/Casting.h>
 #include <llvm/Support/LogicalResult.h>
 #include <llvm/Support/SourceMgr.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
@@ -73,7 +75,8 @@ std::string intToHex(const int64_t v) {
 const auto cExpr0 = std::make_unique<ConstantExpr>(false);
 const auto cExpr1 = std::make_unique<ConstantExpr>(true);
 
-llvm::DenseMap<Value, llvm::SmallVector<llvm::APInt>> testValMap;
+llvm::DenseMap<Value, llvm::SmallVector<llvm::APInt>> testIntValMap;
+llvm::DenseMap<Value, llvm::SmallVector<llvm::APFloat>> testFloatValMap;
 llvm::SetVector<Value> inputs;
 
 unsigned bitWidth = 0;
@@ -83,27 +86,80 @@ std::mt19937_64 &rng() {
   return eng;
 }
 
-llvm::APInt createRandomTestVal(unsigned N) {
+llvm::APInt createRandomAPInt(unsigned N) {
   assert(N > 0);
 
   const unsigned words = (N + 63) / 64;
   llvm::SmallVector<uint64_t, 4> data(words);
 
   std::uniform_int_distribution<uint64_t> dist(
-      0, std::numeric_limits<uint16_t>::max());
+      0, std::numeric_limits<uint32_t>::max());
   for (unsigned i = 0; i < words; ++i)
     data[i] = dist(rng());
 
   const unsigned extra = words * 64 - N;
   if (extra) {
     data.back() &= (extra == 64 ? 0ull : (~0ull >> extra));
-    // data.back() &= (~0ull) >> extra;
   }
 
   return llvm::APInt(N, words, data.data());
 }
 
-llvm::APInt getOrCreateTestVal(Value v, size_t i) {
+llvm::APFloat createAPFloat(unsigned bitWidth, std::optional<APInt> literal) {
+  if (literal.has_value()) {
+    assert(bitWidth == (*literal).getBitWidth());
+  }
+  const llvm::fltSemantics *sem = nullptr;
+  switch (bitWidth) {
+    case 16:
+      sem = &llvm::APFloat::IEEEhalf();
+      break;
+    case 32:
+      sem = &llvm::APFloat::IEEEsingle();
+      break;
+    case 64:
+      sem = &llvm::APFloat::IEEEdouble();
+      break;
+    case 128:
+      sem = &llvm::APFloat::IEEEquad();
+      break;
+    default:
+      assert(false && "Only 16/32/64/128-bit APFloat are supported");
+  }
+
+  llvm::APInt bits = literal.has_value() ?
+      *literal : createRandomAPInt(bitWidth);
+
+  return llvm::APFloat(*sem, bits);
+}
+
+llvm::APFloat getOrCreateFloatTestVal(Value v, size_t i) {
+  if (v.getDefiningOp() == nullptr) {
+    inputs.insert(v);
+  }
+  assert(i < VEC_LEN);
+  assert(llvm::isa<RankedTensorType>(v.getType()));
+  auto t = cast<RankedTensorType>(v.getType());
+  assert(t.getRank() == 1);
+  assert(llvm::isa<FloatType>(t.getElementType()));
+  auto elemBitWidth = t.getElementTypeBitWidth();
+  if (bitWidth == 0) {
+    bitWidth = elemBitWidth;
+  } else {
+    assert(bitWidth == elemBitWidth);
+  }
+  if (!testFloatValMap.contains(v)) {
+    llvm::SmallVector<llvm::APFloat> vec;
+    vec.push_back(createAPFloat(elemBitWidth, std::nullopt));
+    testFloatValMap[v] = vec;
+  } else if (testFloatValMap[v].size() == i) {
+    llvm::APFloat input = createAPFloat(elemBitWidth, std::nullopt);
+    testFloatValMap[v].push_back(input);
+  }
+  return testFloatValMap.lookup(v)[i];
+}
+
+llvm::APInt getOrCreateIntTestVal(Value v, size_t i) {
   if (v.getDefiningOp() == nullptr) {
     inputs.insert(v);
   }
@@ -118,30 +174,50 @@ llvm::APInt getOrCreateTestVal(Value v, size_t i) {
   } else {
     assert(bitWidth == elemBitWidth);
   }
-  if (!testValMap.contains(v)) {
+  if (!testIntValMap.contains(v)) {
     llvm::SmallVector<llvm::APInt> vec;
-    vec.push_back(createRandomTestVal(elemBitWidth));
-    testValMap[v] = vec;
-  } else if (testValMap[v].size() == i) {
-    llvm::APInt input = createRandomTestVal(elemBitWidth);
-    testValMap[v].push_back(input);
+    vec.push_back(createRandomAPInt(elemBitWidth));
+    testIntValMap[v] = vec;
+  } else if (testIntValMap[v].size() == i) {
+    llvm::APInt input = createRandomAPInt(elemBitWidth);
+    testIntValMap[v].push_back(input);
   }
-  return testValMap.lookup(v)[i];
+  return testIntValMap.lookup(v)[i];
 }
 
 void doAddition(Value lhs, Value rhs, Value sum) {
-  assert(!testValMap.contains(sum));
+  assert(!testIntValMap.contains(sum));
   llvm::SmallVector<llvm::APInt> resVec;
   for (size_t i = 0; i < VEC_LEN; ++i) {
-    llvm::APInt res = getOrCreateTestVal(lhs, i) + getOrCreateTestVal(rhs, i);
+    llvm::APInt res = getOrCreateIntTestVal(lhs, i) +
+        getOrCreateIntTestVal(rhs, i);
     resVec.push_back(res);
   }
-  testValMap[sum] = resVec;
+  testIntValMap[sum] = resVec;
+}
+
+llvm::APFloat apfMul(const llvm::APFloat &a, const llvm::APFloat &b) {
+  assert(&a.getSemantics() == &b.getSemantics() &&
+      "APFloat semantics must match");
+  llvm::APFloat r = a;
+  r.multiply(b, llvm::APFloat::rmNearestTiesToEven);
+  return r;
+}
+
+void doMultiplication(Value lhs, Value rhs, Value product) {
+  assert(!testFloatValMap.contains(product));
+  llvm::SmallVector<llvm::APFloat> resVec;
+  for (size_t i = 0; i < VEC_LEN; ++i) {
+    llvm::APFloat res = apfMul(
+        getOrCreateFloatTestVal(lhs, i), getOrCreateFloatTestVal(rhs, i));
+    resVec.push_back(res);
+  }
+  testFloatValMap[product] = resVec;
 }
 
 llvm::StringMap<llvm::SmallVector<std::unique_ptr<OperandExpr>>> exprMap;
 
-std::string resultString(const llvm::SmallVector<llvm::APInt> &resVec) {
+std::string resultIntString(const llvm::SmallVector<llvm::APInt> &resVec) {
   assert(resVec.size() == VEC_LEN);
   std::string resLine = "[";
   for (size_t i = 0; i < VEC_LEN; ++i) {
@@ -156,12 +232,35 @@ std::string resultString(const llvm::SmallVector<llvm::APInt> &resVec) {
   return resLine;
 }
 
-void storeAndInitInput(std::string baseAddr, size_t inputIdx) {
+std::string resultFloatString(const llvm::SmallVector<llvm::APFloat> &resVec) {
+  assert(resVec.size() == VEC_LEN);
+  std::string resLine = "[";
+  for (size_t i = 0; i < VEC_LEN; ++i) {
+    llvm::SmallString<64> resStr;
+    resVec[i].toString(resStr, 4, false);
+    std::string s(resStr.begin(), resStr.end());
+    resLine += s;
+    resLine += ", ";
+  }
+  resLine.resize(resLine.size() - 2);
+  resLine += "]";
+  return resLine;
+}
+
+void storeAndInitInput(std::string baseAddr, size_t inputIdx, bool isMulF) {
   assert(inputIdx < inputs.size());
   unsigned long long base = std::stoull(baseAddr, nullptr, 0);
   const auto &v = inputs[inputIdx];
-  assert(testValMap.contains(v));
-  const auto &inputVec = testValMap[v];
+  llvm::SmallVector<llvm::APInt> inputLiteralVec;
+  if (isMulF) {
+    assert(testFloatValMap.contains(v));
+    for (const auto &inputFloat : testFloatValMap[v]) {
+      inputLiteralVec.push_back(inputFloat.bitcastToAPInt());
+    }
+  } else {
+    assert(testIntValMap.contains(v));
+    inputLiteralVec = testIntValMap.lookup(v);
+  }
   for (size_t i = 0; i < bitWidth; ++i) {
     auto bitIdx = bitWidth - i - 1;
     llvm::SmallVector<std::unique_ptr<OperandExpr>> exprVec;
@@ -169,14 +268,14 @@ void storeAndInitInput(std::string baseAddr, size_t inputIdx) {
     assert(!exprMap.contains(addr));
     auto name = std::format("I{}_{}", inputIdx, i);
     for (size_t j = 0; j < VEC_LEN; ++j) {
-      auto expr = std::make_unique<DataExpr>(name, inputVec[j][bitIdx]);
+      auto expr = std::make_unique<DataExpr>(name, inputLiteralVec[j][bitIdx]);
       exprVec.push_back(std::move(expr));
     }
     exprMap[addr] = std::move(exprVec);
   }
 }
 
-void loadAndEvaluateResult(std::string baseAddr) {
+void loadAndEvaluateResult(std::string baseAddr, bool isMulF) {
   unsigned long long base = std::stoull(baseAddr, nullptr, 0);
   llvm::SmallVector<llvm::APInt> outputVec;
   for (size_t i = 0; i < VEC_LEN; ++i) {
@@ -193,12 +292,21 @@ void loadAndEvaluateResult(std::string baseAddr) {
       }
     }
   }
-  std::cout << "DRAM result:\n" << resultString(outputVec) << "\n\n";
+  if (!isMulF) {
+    std::cout << "DRAM result:\n" << resultIntString(outputVec) << "\n\n";
+  } else {
+    llvm::SmallVector<APFloat> floatVec;
+    for (const auto &apInt : outputVec) {
+      floatVec.push_back(createAPFloat(bitWidth, apInt));
+    }
+    std::cout << "DRAM result:\n" << resultFloatString(floatVec) << "\n\n";
+  }
 }
 
 std::string getTraceLine(const int cycle, const std::string &opName,
     const std::string &addr0, const std::optional<std::string> addr1) {
-  std::string line = std::format("{} {} {} {} 0", cycle, opName, addr0, DUMMY_DATA);
+  std::string line = std::format(
+      "{} {} {} {} 0", cycle, opName, addr0, DUMMY_DATA);
   return addr1.has_value() ? std::format("{} {}", line, *addr1) : line;
 }
 
@@ -225,15 +333,34 @@ int main(int argc, char **argv) {
   }
 
   std::string cpuRes;
-
+  bool isAddI = false;
+  bool isMulF = false;
   func::FuncOp fp = *module->getOps<func::FuncOp>().begin();
   fp.walk([&](Operation *op) {
     if (auto add = dyn_cast<arith::AddIOp>(*op)) {
+      if (!isAddI) {
+        isAddI = true;
+      }
+      assert(!isMulF);
       doAddition(add.getLhs(), add.getRhs(), add.getResult());
-    } else if (auto ret = dyn_cast<func::ReturnOp>(*op)) {
-      assert(testValMap.contains(ret.getOperand(0)));
-      const auto &resVec = testValMap.lookup(ret.getOperand(0));
-      cpuRes = resultString(resVec);
+    } else if (auto mul = dyn_cast<arith::MulFOp>(*op)) {
+      if (!isMulF) {
+        isMulF = true;
+      }
+      assert(!isAddI);
+      doMultiplication(mul.getLhs(), mul.getRhs(), mul.getResult());
+    }
+    else if (auto ret = dyn_cast<func::ReturnOp>(*op)) {
+      const Value toRet = ret.getOperand(0);
+      if (testIntValMap.contains(toRet)) {
+        assert(!testFloatValMap.contains(toRet));
+        const auto &resVec = testIntValMap[toRet];
+        cpuRes = resultIntString(resVec);
+      } else {
+        assert(testFloatValMap.contains(toRet));
+        const auto &resVec = testFloatValMap[toRet];
+        cpuRes = resultFloatString(resVec);
+      }
     }
   });
 
@@ -248,8 +375,15 @@ int main(int argc, char **argv) {
 
   std::cout << "Inputs: \n";
   for (const auto &in : inputs) {
-    assert(testValMap.contains(in));
-    std::cout << resultString(testValMap[in]) << "\n";
+    if (isAddI) {
+      assert(!isMulF);
+      assert(testIntValMap.contains(in));
+      std::cout << resultIntString(testIntValMap[in]) << "\n";
+    } else {
+      assert(isMulF);
+      assert(testFloatValMap.contains(in));
+      std::cout << resultFloatString(testFloatValMap[in]) << "\n";
+    }
   }
   std::cout << "\n";
 
@@ -262,8 +396,8 @@ int main(int argc, char **argv) {
   
   int cycle = 1;
 
-  auto getAddressAsStr = [&indices, &addrs, &saMap](mlir::TypedValue<pud::RowType> rowAddr)
-      -> std::string {
+  auto getAddressAsStr = [&indices, &addrs, &saMap]
+      (mlir::TypedValue<pud::RowType> rowAddr) -> std::string {
     if (!addrs.contains(rowAddr)) {
       assert(!saMap.contains(rowAddr));
       auto op = rowAddr.getDefiningOp();
@@ -316,12 +450,12 @@ int main(int argc, char **argv) {
     func->walk([&](Operation *op) {
       if (auto cnst = dyn_cast<arith::ConstantOp>(*op)) {
         assert(cnst.getType().isInteger(64));
-        indices[cast<mlir::TypedValue<IntegerType>>(cnst.getResult())] = cast<IntegerAttr>
-            (cnst.getValue()).getValue().getZExtValue();
+        indices[cast<mlir::TypedValue<IntegerType>>(cnst.getResult())] =
+            cast<IntegerAttr>(cnst.getValue()).getValue().getZExtValue();
       } else if (auto store = dyn_cast<pud::StoreOp>(*op)) {
         auto firstRow = store.getFirstRow();
         auto addr = getAddressAsStr(firstRow);
-        storeAndInitInput(addr, inputIdx);
+        storeAndInitInput(addr, inputIdx, isMulF);
         inputIdx++;
       } else if (auto load = dyn_cast<pud::LoadOp>(*op)) {
         auto firstRow = load.getFirstRow();
@@ -356,7 +490,8 @@ int main(int argc, char **argv) {
           const std::string opName = maxNum == 1 ? "O"
               : maxNum == 2 ? "ODRA"
               : "OTRA";
-          trace.push_back(getTraceLine(cycle, opName, addr0, std::make_optional(addr1)));
+          trace.push_back(
+              getTraceLine(cycle, opName, addr0, std::make_optional(addr1)));
           cycle++;
         } else {
           trace.push_back(getTraceLine(cycle, "R", addr0, std::nullopt));
@@ -375,7 +510,8 @@ int main(int argc, char **argv) {
           } else {
             assert(row1.getType().getGroup() == 2);
             if (!exprMap.contains(addr1)) {
-              exprMap[addr1] = llvm::SmallVector<std::unique_ptr<OperandExpr>>();
+              exprMap[addr1] = llvm::SmallVector<
+                  std::unique_ptr<OperandExpr>>();
             }
             for (size_t i = 0; i < VEC_LEN; ++i) {
               auto expr = trackers[i].executeAAP(index0, std::nullopt);
@@ -420,7 +556,7 @@ int main(int argc, char **argv) {
   });
 
   std::cout << "CPU result:\n" << cpuRes << "\n\n";
-  loadAndEvaluateResult(resultAddr);
+  loadAndEvaluateResult(resultAddr, isMulF);
 
   std::ofstream trace_file(argv[2]);
   if (!trace_file.is_open()) {

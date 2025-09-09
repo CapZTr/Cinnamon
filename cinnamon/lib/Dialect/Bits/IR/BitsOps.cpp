@@ -39,16 +39,25 @@ LogicalResult TransposeOp::verify() {
   if (!inputType || inputType.getRank() != 1)
     return emitOpError("input must be a 1D ranked tensor");
 
-  auto elemType = cast<IntegerType>(inputType.getElementType());
-  if (!elemType)
-    return emitOpError("tensor elements must be integers");
-
   auto outputType = cast<SliceType>(getOutput().getType());
   if (!outputType)
     return emitOpError("output must be of SliceType");
 
-  if (outputType.getBitWidth() != elemType.getWidth())
-    return emitOpError("bit width mismatch between input tensor element and output slice");
+  Type elemType = inputType.getElementType();
+  unsigned bitWidth = 0;
+
+  if (auto intTy = dyn_cast<IntegerType>(elemType)) {
+    bitWidth = intTy.getWidth();
+  } else if (auto floatTy = dyn_cast<FloatType>(elemType)) {
+    bitWidth = floatTy.getWidth();
+  } else {
+    return emitOpError() << "tensor elements must be integer or float, but got "
+                         << elemType;
+  }
+
+  if (outputType.getBitWidth() != bitWidth)
+    return emitOpError(
+        "bit width mismatch between input tensor element and output slice");
 
   if (outputType.getVectorLength() != inputType.getDimSize(0))
     return emitOpError("vector length mismatch between input and output");
@@ -65,9 +74,21 @@ LogicalResult AssembleOp::verify() {
   if (!outputType || outputType.getRank() != 1)
     return emitOpError("output must be a 1D ranked tensor");
 
-  auto elemType = cast<IntegerType>(outputType.getElementType());
-  if (inputType.getBitWidth() != elemType.getWidth())
-    return emitOpError("bit width mismatch between input slice and output tensor element");
+  Type elemType = outputType.getElementType();
+  unsigned bitWidth = 0;
+
+  if (auto intTy = dyn_cast<IntegerType>(elemType)) {
+    bitWidth = intTy.getWidth();
+  } else if (auto floatTy = dyn_cast<FloatType>(elemType)) {
+    bitWidth = floatTy.getWidth();
+  } else {
+    return emitOpError() << "tensor elements must be integer or float, but got "
+                         << elemType;
+  }
+
+  if (inputType.getBitWidth() != bitWidth)
+    return emitOpError(
+        "bit width mismatch between input slice and output tensor element");
 
   if (inputType.getVectorLength() != outputType.getDimSize(0))
     return emitOpError("vector length mismatch between input and output");
@@ -77,7 +98,8 @@ LogicalResult AssembleOp::verify() {
 
 LogicalResult SplitSliceVerticallyOp::verify() {
   auto vecLen = getSlice().getType().getVectorLength();
-  if (auto constantOp = dyn_cast<arith::ConstantOp>(getColumnNum().getDefiningOp())) {
+  if (auto constantOp = dyn_cast<arith::ConstantOp>(
+      getColumnNum().getDefiningOp())) {
     if (auto intAttr = dyn_cast<IntegerAttr>(constantOp.getValue())) {
       auto rowNum = intAttr.getInt();
       if (vecLen <= rowNum)
@@ -124,32 +146,41 @@ LogicalResult MergeSliceVerticallyOp::verify() {
   return success();
 }
 
-LogicalResult AddOp::verify() {
+LogicalResult AddIOp::verify() {
   auto lhsType = cast<SliceType>(getLhs().getType());
   auto rhsType = cast<SliceType>(getRhs().getType());
   auto resType = cast<SliceType>(getResult().getType());
 
-  // auto cinType = cast<SliceType>(getCin().getType());
-  // auto coutType = cast<SliceType>(getCout().getType());
-
-  // if (!lhsType || !rhsType || !resType || !cinType || !coutType)
-  //   return emitOpError("operands, result and carries must all be of SliceType");
   if (!lhsType || !rhsType || !resType)
     return emitOpError("operands and result must all be of SliceType");
 
-  if (lhsType.getBitWidth() != rhsType.getBitWidth() || lhsType.getBitWidth() != resType.getBitWidth())
+  if (lhsType.getBitWidth() != rhsType.getBitWidth() ||
+      lhsType.getBitWidth() != resType.getBitWidth())
     return emitOpError("bit widths of operands and result must match");
 
   if (lhsType.getVectorLength() != resType.getVectorLength()
       || rhsType.getVectorLength() != resType.getVectorLength())
-      // || cinType.getVectorLength() != resType.getVectorLength()
-      // || coutType.getVectorLength() != resType.getVectorLength())
-    // return emitOpError("vector lengths of operands, result and carries must match");
     return emitOpError("vector lengths of operands and result must match");
   
-  // if (cinType.getBitWidth() != 1 || coutType.getBitWidth() != 1)
-  //   return emitOpError("Bitwidth of carry-in and carry-out must be 1");
+  return success();
+}
 
+LogicalResult MulFOp::verify() {
+  auto lhsType = cast<SliceType>(getLhs().getType());
+  auto rhsType = cast<SliceType>(getRhs().getType());
+  auto resType = cast<SliceType>(getResult().getType());
+
+  if (!lhsType || !rhsType || !resType)
+    return emitOpError("operands and result must all be of SliceType");
+
+  if (lhsType.getBitWidth() != rhsType.getBitWidth() ||
+      lhsType.getBitWidth() != resType.getBitWidth())
+    return emitOpError("bit widths of operands and result must match");
+
+  if (lhsType.getVectorLength() != resType.getVectorLength()
+      || rhsType.getVectorLength() != resType.getVectorLength())
+    return emitOpError("vector lengths of operands and result must match");
+  
   return success();
 }
 
@@ -161,10 +192,12 @@ LogicalResult SubOp::verify() {
   if (!lhsType || !rhsType || !resType)
     return emitOpError("operands and result must all be of SliceType");
 
-  if (lhsType.getBitWidth() != rhsType.getBitWidth() || lhsType.getBitWidth() != resType.getBitWidth())
+  if (lhsType.getBitWidth() != rhsType.getBitWidth() ||
+      lhsType.getBitWidth() != resType.getBitWidth())
     return emitOpError("bit widths of operands and result must match");
 
-  if (lhsType.getVectorLength() != rhsType.getVectorLength() || lhsType.getVectorLength() != resType.getVectorLength())
+  if (lhsType.getVectorLength() != rhsType.getVectorLength() ||
+      lhsType.getVectorLength() != resType.getVectorLength())
     return emitOpError("vector lengths of operands and result must match");
 
   return success();

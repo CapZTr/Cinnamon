@@ -9,14 +9,12 @@
 #include "cinm-mlir/Dialect/PuD/Codegen/AddressAllocator.h"
 #include "cinm-mlir/Dialect/PuD/Codegen/ProgramParser.h"
 
-#include <cassert>
-#include <cstdint>
+#include <cstddef>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringMap.h>
 #include <llvm/ADT/StringSet.h>
 #include <llvm/Support/ErrorHandling.h>
-#include <memory>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/BuiltinTypes.h>
@@ -31,12 +29,13 @@
 #include <mlir/Support/LLVM.h>
 #include <mlir/Transforms/DialectConversion.h>
 
+#include <cassert>
+#include <cstdint>
 #include <format>
-// #include <iostream>
+#include <memory>
 #include <mockturtle/generators/arithmetic.hpp>
 #include <mockturtle/io/write_dot.hpp>
 #include <optional>
-// #include <ostream>
 #include <vector>
 
 #include "ambit.h"
@@ -78,6 +77,8 @@ struct ConvertBitsToPuD
       signalPassFailure();
     }
     auto mig = builder.getNetwork();
+    auto mulFSignNtk = builder.getMulFSignNtk();
+    const auto isMulF = builder.isMulFNtk();
     auto ntkInputs = builder.getInputSlices();
     const int inputNum = ntkInputs.size();
     auto carryMap = builder.getCarryMap();
@@ -118,7 +119,25 @@ struct ConvertBitsToPuD
     }
     std::vector<Instruction> program = parser.getProgram();
     parser.printProgram();
-    // std::cout << " ===== Parsed " << program.size() << " instructions =====" << "\n";
+    // std::cout << " ===== Parsed " << program.size() 
+    //     << " instructions =====" << "\n";
+
+    // MulFSignNtk
+    std::vector<Instruction> program_mulf_sign;
+    if (isMulF) {
+      ProgramString mulf_sign_str;
+      auto [optimized_mulf_sign, result_mulf_sign] = ambit_rewrite(
+          settings, mulFSignNtk, mulf_sign_str);
+      // std::cout << "\n ===== Optimized Network of MulF Sign-bit ===== \n";
+      // mockturtle::write_dot(optimized_mulf_sign, std::cout);
+      ProgramParser parser_mulf_sign(mulf_sign_str.str());
+      if (failed(parser_mulf_sign.parse())) {
+        signalPassFailure();
+      }
+      program_mulf_sign = parser_mulf_sign.getProgram();
+      parser_mulf_sign.printProgram();
+    }
+
 
     // =========================================================================
     // ==================== IR (PuD Dialect) Building ==========================
@@ -135,8 +154,37 @@ struct ConvertBitsToPuD
 
     auto transpose = cast<TransposeOp>(toKeep[0]);
     const auto bitWidth = transpose.getOutput().getType().getBitWidth();
+    int exponentBitWidth, mantissaBitWidth, bias;
+    if (isMulF) {
+      switch (bitWidth) {
+        case 16:
+          exponentBitWidth = 5;
+          mantissaBitWidth = 10;
+          bias = 15;
+          break;
+        case 32:
+          exponentBitWidth = 8;
+          mantissaBitWidth = 23;
+          bias = 127;
+          break;
+        case 64:
+          exponentBitWidth = 11;
+          mantissaBitWidth = 52;
+          bias = 1023;
+          break;
+        case 128:
+          exponentBitWidth = 15;
+          mantissaBitWidth = 112;
+          bias = 16383;
+          break;
+        default:
+          assert(false && "Unsupported floating-point bitwidth");
+          break;
+      }
+    }
     const auto vecLen = transpose.getOutput().getType().getVectorLength();
-    const auto tensorType = cast<RankedTensorType>(transpose.getInput().getType());
+    const auto tensorType = cast<RankedTensorType>(
+        transpose.getInput().getType());
 
     Block *newEntry = new Block();
     func.getBody().push_back(newEntry);
@@ -317,7 +365,8 @@ struct ConvertBitsToPuD
                 auto data = std::get<int>(operand0.data);
                 auto toStore = slicesToStore[data][roundIdx];
                 assert(firstRows.contains(operand0.str_repr));
-                opBuilder.create<StoreOp>(loc, toStore, firstRows.lookup(operand0.str_repr));
+                opBuilder.create<StoreOp>(
+                    loc, toStore, firstRows.lookup(operand0.str_repr));
                 stored.insert(operand0.str_repr);
               }
             } else {
@@ -335,7 +384,8 @@ struct ConvertBitsToPuD
           }
 
           auto operand1 = *inst.operand1;
-          if (operand1.type == AddressType::Out || operand1.type == AddressType::Spill) {
+          if (operand1.type == AddressType::Out ||
+              operand1.type == AddressType::Spill) {
             const auto index = std::get<int>(operand1.data);
             if (operand1.type == AddressType::Out && index < carryNum) {
               if (!allocated.contains(operand1.str_repr)) {
@@ -367,13 +417,9 @@ struct ConvertBitsToPuD
 
       if (this->unroll) {
 
-        int64_t iterIndex = 0;
-        int64_t addrOffset = bitWidth;
-        while (iterIndex < bitWidth) {
-          addrOffset--;
-          llvm::StringSet<> refreshedCin;
-          for (auto &inst : program) {
-
+        // Sign-bit Computation
+        if (isMulF) {
+          for (const auto &inst : program_mulf_sign) {
             if (inst.type == Instruction::Type::AP) {
               assert(inst.operand0.type == AddressType::Bitwise);
               auto index = std::get<int>(inst.operand0.data);
@@ -392,66 +438,212 @@ struct ConvertBitsToPuD
               } else if (operand0.type == AddressType::Const) {
                 addr0 = std::get<bool>(operand0.data) ? c1 : c0;
               } else {
-                assert(operand0.type == AddressType::In || operand0.type == AddressType::Spill);
-                auto firstRow = allocated[operand0.str_repr];
-                if (carryRows.contains(operand0.str_repr)) {
-                  if (iterIndex == 0) {
-                    addr0 = c0;
-                  } else {
-                    addr0 = carryRows.lookup(operand0.str_repr);
-                    if (!refreshedCin.contains(operand0.str_repr)) {
-                      const auto cinIdx = std::get<int>(operand0.data);
-                      const auto coutIdx = carryMap.lookup(cinIdx);
-                      auto carry = carryRows.lookup(std::format("O{}", coutIdx));
-                      opBuilder.create<AAPOp>(loc, carry, addr0);
-                      refreshedCin.insert(operand0.str_repr);
-                    }
-                  }
-                } else {
-                  if (addrOffset == 0) {
-                    assert(firstRows.contains(operand0.str_repr));
-                    addr0 = firstRows.lookup(operand0.str_repr);
-                  } else {
-                    addr0 = getOrCreateDRow(allocator.getRowFromOffset(firstRow, addrOffset));
-                  }
-                }
+                assert(operand0.type == AddressType::In ||
+                    operand0.type == AddressType::Spill);
+                addr0 = firstRows.lookup(operand0.str_repr);
               }
 
               if (operand1.type == AddressType::Bitwise) {
                 auto index = std::get<int>(operand1.data);
                 addr1 = bRows[index];
+              } else if (operand1.type == AddressType::Spill) {
+                addr1 = firstRows.lookup(operand1.str_repr);
               } else {
-                assert(operand1.type == AddressType::Out || operand1.type == AddressType::Spill);
-                if (carryRows.contains(operand1.str_repr)) {
-                  assert(operand1.type == AddressType::Out);
-                  const auto outputIdx = std::get<int>(operand1.data);
-                  assert(outputIdx < carryNum);
-                  addr1 = carryRows.lookup(operand1.str_repr);
-                } else {
-                  auto firstRow = allocated[operand1.str_repr];
-                  if (addrOffset == 0) {
-                    assert(firstRows.contains(operand1.str_repr));
-                    addr1 = firstRows.lookup(operand1.str_repr);
-                  } else {
-                    addr1 = getOrCreateDRow(allocator.getRowFromOffset(firstRow, addrOffset));
-                  }
-                }
+                assert(operand1.type == AddressType::Out);
+                addr1 = outputFirstRow;
               }
 
               opBuilder.create<AAPOp>(loc, addr0, addr1);
 
             }
           }
-
-          iterIndex++;
-
         }
+
+        for (size_t i = 0; i < 2; ++i) {
+          if (!isMulF && i == 1) {
+            break;
+          }
+          int interCount = !isMulF ? bitWidth :
+              i == 0 ? exponentBitWidth : mantissaBitWidth;
+
+          int64_t iterIndex = 0;
+          int64_t addrOffset = !isMulF ? interCount :
+              i == 0 ? exponentBitWidth + 1 : bitWidth;
+          while (iterIndex < interCount) {
+            addrOffset--;
+            llvm::StringSet<> refreshedCin;
+            for (auto &inst : program) {
+
+              if (inst.type == Instruction::Type::AP) {
+                assert(inst.operand0.type == AddressType::Bitwise);
+                auto index = std::get<int>(inst.operand0.data);
+                opBuilder.create<APOp>(loc, bRows[index]);
+              } else {
+                assert(inst.type == Instruction::Type::AAP);
+
+                TypedValue<RowType> addr0, addr1;
+
+                auto operand0 = inst.operand0;
+                auto operand1 = *inst.operand1;
+
+                if (operand0.type == AddressType::Bitwise) {
+                  auto index = std::get<int>(operand0.data);
+                  addr0 = bRows[index];
+                } else if (operand0.type == AddressType::Const) {
+                  addr0 = std::get<bool>(operand0.data) ? c1 : c0;
+                } else {
+                  assert(operand0.type == AddressType::In ||
+                      operand0.type == AddressType::Spill);
+                  auto firstRow = allocated[operand0.str_repr];
+                  if (carryRows.contains(operand0.str_repr)) {
+                    if (iterIndex == 0) {
+                      addr0 = c0;
+                    } else {
+                      addr0 = carryRows.lookup(operand0.str_repr);
+                      if (!refreshedCin.contains(operand0.str_repr)) {
+                        const auto cinIdx = std::get<int>(operand0.data);
+                        const auto coutIdx = carryMap.lookup(cinIdx);
+                        auto carry = carryRows.lookup(
+                            std::format("O{}", coutIdx));
+                        opBuilder.create<AAPOp>(loc, carry, addr0);
+                        refreshedCin.insert(operand0.str_repr);
+                      }
+                    }
+                  } else {
+                    if (addrOffset == 0) {
+                      assert(firstRows.contains(operand0.str_repr));
+                      addr0 = firstRows.lookup(operand0.str_repr);
+                    } else {
+                      addr0 = getOrCreateDRow(
+                          allocator.getRowFromOffset(firstRow, addrOffset));
+                    }
+                  }
+                }
+
+                if (operand1.type == AddressType::Bitwise) {
+                  auto index = std::get<int>(operand1.data);
+                  addr1 = bRows[index];
+                } else {
+                  assert(operand1.type == AddressType::Out ||
+                      operand1.type == AddressType::Spill);
+                  if (carryRows.contains(operand1.str_repr)) {
+                    assert(operand1.type == AddressType::Out);
+                    const auto outputIdx = std::get<int>(operand1.data);
+                    assert(outputIdx < carryNum);
+                    addr1 = carryRows.lookup(operand1.str_repr);
+                  } else {
+                    auto firstRow = allocated[operand1.str_repr];
+                    if (addrOffset == 0) {
+                      assert(firstRows.contains(operand1.str_repr));
+                      addr1 = firstRows.lookup(operand1.str_repr);
+                    } else {
+                      addr1 = getOrCreateDRow(
+                          allocator.getRowFromOffset(firstRow, addrOffset));
+                    }
+                  }
+                }
+
+                opBuilder.create<AAPOp>(loc, addr0, addr1);
+
+              }
+            }
+
+            iterIndex++;
+
+          }
+        }
+
+        // int64_t iterIndex = 0;
+        // int64_t addrOffset = bitWidth;
+        // while (iterIndex < bitWidth) {
+        //   addrOffset--;
+        //   llvm::StringSet<> refreshedCin;
+        //   for (auto &inst : program) {
+
+        //     if (inst.type == Instruction::Type::AP) {
+        //       assert(inst.operand0.type == AddressType::Bitwise);
+        //       auto index = std::get<int>(inst.operand0.data);
+        //       opBuilder.create<APOp>(loc, bRows[index]);
+        //     } else {
+        //       assert(inst.type == Instruction::Type::AAP);
+
+        //       TypedValue<RowType> addr0, addr1;
+
+        //       auto operand0 = inst.operand0;
+        //       auto operand1 = *inst.operand1;
+
+        //       if (operand0.type == AddressType::Bitwise) {
+        //         auto index = std::get<int>(operand0.data);
+        //         addr0 = bRows[index];
+        //       } else if (operand0.type == AddressType::Const) {
+        //         addr0 = std::get<bool>(operand0.data) ? c1 : c0;
+        //       } else {
+        //         assert(operand0.type == AddressType::In ||
+        //             operand0.type == AddressType::Spill);
+        //         auto firstRow = allocated[operand0.str_repr];
+        //         if (carryRows.contains(operand0.str_repr)) {
+        //           if (iterIndex == 0) {
+        //             addr0 = c0;
+        //           } else {
+        //             addr0 = carryRows.lookup(operand0.str_repr);
+        //             if (!refreshedCin.contains(operand0.str_repr)) {
+        //               const auto cinIdx = std::get<int>(operand0.data);
+        //               const auto coutIdx = carryMap.lookup(cinIdx);
+        //               auto carry = carryRows.lookup(
+        //                   std::format("O{}", coutIdx));
+        //               opBuilder.create<AAPOp>(loc, carry, addr0);
+        //               refreshedCin.insert(operand0.str_repr);
+        //             }
+        //           }
+        //         } else {
+        //           if (addrOffset == 0) {
+        //             assert(firstRows.contains(operand0.str_repr));
+        //             addr0 = firstRows.lookup(operand0.str_repr);
+        //           } else {
+        //             addr0 = getOrCreateDRow(
+        //                 allocator.getRowFromOffset(firstRow, addrOffset));
+        //           }
+        //         }
+        //       }
+
+        //       if (operand1.type == AddressType::Bitwise) {
+        //         auto index = std::get<int>(operand1.data);
+        //         addr1 = bRows[index];
+        //       } else {
+        //         assert(operand1.type == AddressType::Out ||
+        //             operand1.type == AddressType::Spill);
+        //         if (carryRows.contains(operand1.str_repr)) {
+        //           assert(operand1.type == AddressType::Out);
+        //           const auto outputIdx = std::get<int>(operand1.data);
+        //           assert(outputIdx < carryNum);
+        //           addr1 = carryRows.lookup(operand1.str_repr);
+        //         } else {
+        //           auto firstRow = allocated[operand1.str_repr];
+        //           if (addrOffset == 0) {
+        //             assert(firstRows.contains(operand1.str_repr));
+        //             addr1 = firstRows.lookup(operand1.str_repr);
+        //           } else {
+        //             addr1 = getOrCreateDRow(
+        //                 allocator.getRowFromOffset(firstRow, addrOffset));
+        //           }
+        //         }
+        //       }
+
+        //       opBuilder.create<AAPOp>(loc, addr0, addr1);
+
+        //     }
+        //   }
+
+        //   iterIndex++;
+
+        // }
 
       } else {
 
         auto loop = opBuilder.create<affine::AffineForOp>(loc, 0, bitWidth, 1);
         opBuilder.setInsertionPointToStart(loop.getBody());
-        Value iterIndex = opBuilder.create<arith::IndexCastOp>(loc, i64Type, loop.getInductionVar());
+        Value iterIndex = opBuilder.create<arith::IndexCastOp>(
+            loc, i64Type, loop.getInductionVar());
         const auto maxOffset = getOrCreateI64Val(bitWidth - 1);
         const Value offset = opBuilder.create<arith::SubIOp>(
             loc, i64Type, maxOffset, iterIndex);
@@ -469,7 +661,8 @@ struct ConvertBitsToPuD
           } else if (operand0.type == AddressType::Const) {
             addr0 = std::get<bool>(operand0.data) ? c1 : c0;
           } else {
-            assert(operand0.type == AddressType::In || operand0.type == AddressType::Spill);
+            assert(operand0.type == AddressType::In ||
+                operand0.type == AddressType::Spill);
             auto row = allocated.lookup(operand0.str_repr);
             Value rowID = opBuilder.create<arith::AddIOp>(
                 loc, i64Type, getOrCreateI64Val(row.row), offset);
@@ -530,7 +723,8 @@ struct ConvertBitsToPuD
     if (round > 1) {
       for (int i = 1; i < round; ++i) {
         auto second = outputSlices[i];
-        auto vecLen = resultSlice.getType().getVectorLength() + second.getType().getVectorLength();
+        auto vecLen = resultSlice.getType().getVectorLength() +
+            second.getType().getVectorLength();
         auto sType = SliceType::get(ctx, bitWidth, vecLen);
         resultSlice = opBuilder.create<MergeSliceVerticallyOp>(
             loc,
@@ -541,7 +735,8 @@ struct ConvertBitsToPuD
       }
     }
 
-    Value resultTensor = opBuilder.create<AssembleOp>(loc, tensorType, resultSlice);
+    Value resultTensor = opBuilder.create<AssembleOp>(
+        loc, tensorType, resultSlice);
 
     opBuilder.create<func::ReturnOp>(loc, resultTensor);
 

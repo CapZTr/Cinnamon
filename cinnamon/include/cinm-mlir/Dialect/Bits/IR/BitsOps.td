@@ -19,10 +19,11 @@ def TransposeOp : Bits_Op<"transpose", [Pure]> {
   let summary = "Transpose 1-D tensor of integers to Slice type";
   let description = [{}];
 
-  let arguments = (ins TensorOf<[AnySignlessInteger]>:$input);
+  let arguments = (ins TensorOf<[AnyInteger, AnyFloat]>:$input);
   let results = (outs SliceType:$output);
 
-  let assemblyFormat = "$input attr-dict `:` type($input) `->` qualified(type($output))";
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` "
+      "qualified(type($output))";
   let hasVerifier = 1;
 }
 
@@ -31,9 +32,10 @@ def AssembleOp : Bits_Op<"assemble", [Pure]> {
   let description = [{}];
 
   let arguments = (ins SliceType:$input);
-  let results = (outs TensorOf<[AnySignlessInteger]>:$output);
+  let results = (outs TensorOf<[AnyInteger, AnyFloat]>:$output);
 
-  let assemblyFormat = "$input attr-dict `:` qualified(type($input)) `->` type($output)";
+  let assemblyFormat = "$input attr-dict `:` qualified(type($input)) `->` "
+      "type($output)";
   let hasVerifier = 1;
 }
 
@@ -67,27 +69,42 @@ def MergeSliceVerticallyOp : Bits_Op<"merge_vertically", [Pure]> {
   let results = (outs SliceType:$slice);
 
   let assemblyFormat = "$first `,` $second attr-dict `:`"
-      "qualified(type($first)) `,` qualified(type($second)) `->` qualified(type($slice))";
+      "qualified(type($first)) `,` qualified(type($second)) `->`"
+      " qualified(type($slice))";
   let hasVerifier = 1;
 }
 
-def AddOp : Bits_Op<"add", [Pure]> {
-  let summary = "Bit-serial addition of two slice operands";
+def AddIOp : Bits_Op<"add_i", [Pure]> {
+  let summary = "Bit-serial addition of two slice operands in integer";
   let description = [{}];
 
   let arguments = (ins
     SliceType:$lhs,
     SliceType:$rhs
-    // SliceType:$cin
   );
   let results = (outs
     SliceType:$result
-    // SliceType:$cout
   );
 
-  // let assemblyFormat = "$lhs `,` $rhs `,` $cin attr-dict `:`"
-  //     "qualified(type($lhs)) `,` qualified(type($rhs)) `,` qualified(type($cin))"
-  //     "`->` qualified(type($result)) `,` qualified(type($cout))";
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:`"
+      "qualified(type($lhs)) `,` qualified(type($rhs))"
+      "`->` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
+def MulFOp : Bits_Op<"mul_f", [Pure]> {
+  let summary = "Bit-serial multiplication of two slice operands "
+      "in floating point";
+  let description = [{}];
+
+  let arguments = (ins
+    SliceType:$lhs,
+    SliceType:$rhs
+  );
+  let results = (outs
+    SliceType:$result
+  );
+
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:`"
       "qualified(type($lhs)) `,` qualified(type($rhs))"
       "`->` qualified(type($result))";
@@ -109,7 +126,8 @@ def SubOp : Bits_Op<"sub", [Pure]> {
   let arguments = (ins SliceType:$lhs, SliceType:$rhs);
   let results = (outs SliceType:$result);
 
-  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` qualified(type($lhs)) `,` qualified(type($rhs)) `->` qualified(type($result))";
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` qualified(type($lhs)) `,` "
+      "qualified(type($rhs)) `->` qualified(type($result))";
   let hasVerifier = 1;
 }
 

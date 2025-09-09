@@ -43,8 +43,8 @@ struct SliceCache {
 };
 
 // struct AddResultCache {
-//   static llvm::DenseMap<AddOp, llvm::SmallVector<SliceType, 2>> &get() {
-//     static llvm::DenseMap<AddOp, llvm::SmallVector<SliceType, 2>> cache;
+//   static llvm::DenseMap<AddIOp, llvm::SmallVector<SliceType, 2>> &get() {
+//     static llvm::DenseMap<AddIOp, llvm::SmallVector<SliceType, 2>> cache;
 //     return cache;
 //   }
 // };
@@ -74,7 +74,6 @@ struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
     auto &sliceCache = SliceCache::get();
 
     auto sliceType = SliceType::get(ctx, bitWidth, vectorLen);
-    // auto carryType = SliceType::get(ctx, 1, vectorLen);
 
     auto getOrCreateSlice = [&](Value operand) -> Value {
       Operation *defOp = operand.getDefiningOp();
@@ -98,14 +97,11 @@ struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
     Value lhsSlice = getOrCreateSlice(lhs);
     Value rhsSlice = getOrCreateSlice(rhs);
 
-    // if (emptyCin == NULL)
-    //   emptyCin = rewriter.create<CreateEmptyCinOp>(loc, carryType);
+    auto newOp = rewriter.create<TargetOp>(loc, sliceType, lhsSlice, rhsSlice);
 
-    auto addOp = rewriter.create<TargetOp>(loc, sliceType, lhsSlice, rhsSlice);
+    sliceCache[op] = newOp.getResult();
 
-    sliceCache[op] = addOp.getResult();
-
-    Value result = rewriter.create<AssembleOp>(loc, lhsType, addOp.getResult());
+    Value result = rewriter.create<AssembleOp>(loc, lhsType, newOp.getResult());
 
     rewriter.replaceOp(op, result);
 
@@ -122,18 +118,20 @@ struct ConvertArithToBits
 
     RewritePatternSet patterns(&ctx);
     patterns.add<
-        ConvertArithTensorOpToBits<arith::AddIOp, AddOp>>(&ctx);
+        ConvertArithTensorOpToBits<arith::AddIOp, AddIOp>>(&ctx);
+    patterns.add<
+        ConvertArithTensorOpToBits<arith::MulFOp, MulFOp>>(&ctx);
     
     ConversionTarget target(ctx);
     target.markUnknownOpDynamicallyLegal([](...) { return true; });
     target.addLegalDialect<BitsDialect>();
     target.addIllegalOp<arith::AddIOp>();
+    target.addIllegalOp<arith::MulFOp>();
 
     if (applyPartialConversion(func, target, std::move(patterns)).failed()) {
       signalPassFailure();
     }
 
-    // simplify(func);
     removeUnnecessaryAssembles(func);
   }
 
@@ -182,7 +180,7 @@ struct ConvertArithToBits
         // if (!transpose || transpose->hasOneUse())
         //   continue;
 
-        auto add = dyn_cast<AddOp>(*transpose->user_begin());
+        auto add = dyn_cast<AddIOp>(*transpose->user_begin());
         // if (!add)
         //   continue;
 

@@ -24,11 +24,17 @@ public:
 
   const MIG &getNetwork() const { return mig; }
 
+  const MIG &getMulFSignNtk() const { return mulFSignNtk; }
+
+  bool isMulFNtk() { return isMulF; }
+
   const DenseMap<int, int> &getCarryMap() const { return carryMap; }
 
   ArrayRef<TypedValue<SliceType>> getInputSlices() const { return inputSlices; }
 
-  ArrayRef<TypedValue<SliceType>> getOutputSlices() const { return outputSlices; }
+  ArrayRef<TypedValue<SliceType>> getOutputSlices() const {
+    return outputSlices;
+  }
 
   static void debugPrint(MIG const &mig, llvm::raw_ostream &os = llvm::errs()) {
     os << "\n=== MIG Network Debug Info ===\n";
@@ -73,16 +79,19 @@ public:
 private:
   ModuleOp module;
   MIG mig;
+  MIG mulFSignNtk;
+  bool isMulF = false;
   DenseMap<Value, MIG::signal> migSignalMap;
+  DenseMap<Value, MIG::signal> mulFSignSignalMap;
   DenseMap<int, int> carryMap;
   SmallVector<TypedValue<SliceType>> inputSlices;
   SmallVector<TypedValue<SliceType>, 1> outputSlices;
 
-  std::pair<MIG::signal, MIG::signal> buildAdd(MIG::signal const& lhs,
-                                               MIG::signal const& rhs,
-                                               MIG::signal const& cin);
+  std::pair<MIG::signal, MIG::signal> buildAdd(MIG::signal const &lhs,
+                                               MIG::signal const &rhs,
+                                               MIG::signal const &cin);
 
-  bool operandsBuilt(Operation* op) const;
+  bool operandsBuilt(Operation *op) const;
 };
 
 }
