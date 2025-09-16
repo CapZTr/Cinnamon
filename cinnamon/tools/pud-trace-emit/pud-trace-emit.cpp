@@ -64,6 +64,9 @@ const std::string DUMMY_DATA = "b186649dd2c40617e1df8669b90acd6389c0e5f8e5c059c"
 // For simplification, we set lenth of each vector to 4 when evaluating
 // functional correctness.
 const size_t VEC_LEN = 4;
+const llvm::SmallVector<double, 8> fixedFPVec{-0.125f, 8.0f, 0.25f, -16.0f,
+    16.0f, 2.0f, -2.0f, 0.0625f};
+size_t idx = 0;
 
 std::string intToHex(const int64_t v) {
   std::stringstream ss;
@@ -93,7 +96,7 @@ llvm::APInt createRandomAPInt(unsigned N) {
   llvm::SmallVector<uint64_t, 4> data(words);
 
   std::uniform_int_distribution<uint64_t> dist(
-      0, std::numeric_limits<uint32_t>::max());
+      0, std::numeric_limits<uint16_t>::max());
   for (unsigned i = 0; i < words; ++i)
     data[i] = dist(rng());
 
@@ -105,7 +108,25 @@ llvm::APInt createRandomAPInt(unsigned N) {
   return llvm::APInt(N, words, data.data());
 }
 
-llvm::APFloat createAPFloat(unsigned bitWidth, std::optional<APInt> literal) {
+// bool checkILLegalAPFloat(const llvm::APFloat &x) {
+//   if (!x.isFinite()) {
+//     return true;
+//   }
+
+//   llvm::APFloat floorX = x;
+//   (void)floorX.roundToIntegral(APFloat::rmTowardNegative);
+
+//   const llvm::fltSemantics &Sem = x.getSemantics();
+//   llvm::APFloat half(Sem, "0.5");
+//   llvm::APFloat threshold = floorX;
+//   (void)threshold.add(half, llvm::APFloat::rmNearestTiesToEven);
+
+//   auto cmp = x.compare(threshold);
+//   return cmp == llvm::APFloat::cmpGreaterThan;
+// }
+
+llvm::APFloat createAPFloat(
+    unsigned bitWidth, std::optional<APInt> literal, bool isRandom) {
   if (literal.has_value()) {
     assert(bitWidth == (*literal).getBitWidth());
   }
@@ -127,13 +148,45 @@ llvm::APFloat createAPFloat(unsigned bitWidth, std::optional<APInt> literal) {
       assert(false && "Only 16/32/64/128-bit APFloat are supported");
   }
 
-  llvm::APInt bits = literal.has_value() ?
-      *literal : createRandomAPInt(bitWidth);
+  if (!isRandom) {
+    if (idx == fixedFPVec.size()) {
+      idx = 0;
+    }
+    llvm::APFloat x(fixedFPVec[idx]);
+    bool loses = false;
+    x.convert(llvm::APFloat::IEEEhalf(),
+        llvm::APFloat::rmNearestTiesToEven,
+        &loses);
+    idx++;
+    return x;
+  }
 
-  return llvm::APFloat(*sem, bits);
+  if (literal.has_value()) {
+    return llvm::APFloat(*sem, *literal);
+  }
+
+  llvm::APFloat toRet(*sem, createRandomAPInt(bitWidth));
+  while (toRet.isNaN() || toRet.isInfinity() || !toRet.isFinite()) {
+    toRet = llvm::APFloat(*sem, createRandomAPInt(bitWidth));
+  }
+  return toRet;
 }
 
-llvm::APFloat getOrCreateFloatTestVal(Value v, size_t i) {
+// Debugging
+void dumpHalf(const llvm::APFloat &f) {
+  auto bits = f.bitcastToAPInt().getZExtValue();
+  unsigned sign = (bits >> 15) & 0x1;
+  unsigned exp  = (bits >> 10) & 0x1F;
+  unsigned mant = bits & 0x3FF;
+
+  llvm::outs() << "sign=" << sign
+               << " exp=" << exp
+               << " mant=" << mant
+               << " raw=0x" << llvm::Twine::utohexstr(bits)
+               << "\n";
+}
+
+llvm::APFloat getOrCreateFloatTestVal(Value v, size_t i, bool isRandom) {
   if (v.getDefiningOp() == nullptr) {
     inputs.insert(v);
   }
@@ -150,10 +203,10 @@ llvm::APFloat getOrCreateFloatTestVal(Value v, size_t i) {
   }
   if (!testFloatValMap.contains(v)) {
     llvm::SmallVector<llvm::APFloat> vec;
-    vec.push_back(createAPFloat(elemBitWidth, std::nullopt));
+    vec.push_back(createAPFloat(elemBitWidth, std::nullopt, isRandom));
     testFloatValMap[v] = vec;
   } else if (testFloatValMap[v].size() == i) {
-    llvm::APFloat input = createAPFloat(elemBitWidth, std::nullopt);
+    llvm::APFloat input = createAPFloat(elemBitWidth, std::nullopt, isRandom);
     testFloatValMap[v].push_back(input);
   }
   return testFloatValMap.lookup(v)[i];
@@ -209,7 +262,10 @@ void doMultiplication(Value lhs, Value rhs, Value product) {
   llvm::SmallVector<llvm::APFloat> resVec;
   for (size_t i = 0; i < VEC_LEN; ++i) {
     llvm::APFloat res = apfMul(
-        getOrCreateFloatTestVal(lhs, i), getOrCreateFloatTestVal(rhs, i));
+        getOrCreateFloatTestVal(lhs, i, true),
+        getOrCreateFloatTestVal(rhs, i, true));
+        // getOrCreateFloatTestVal(lhs, i, false),
+        // getOrCreateFloatTestVal(rhs, i, false));
     resVec.push_back(res);
   }
   testFloatValMap[product] = resVec;
@@ -297,9 +353,12 @@ void loadAndEvaluateResult(std::string baseAddr, bool isMulF) {
   } else {
     llvm::SmallVector<APFloat> floatVec;
     for (const auto &apInt : outputVec) {
-      floatVec.push_back(createAPFloat(bitWidth, apInt));
+      floatVec.push_back(createAPFloat(bitWidth, apInt, true));
     }
     std::cout << "DRAM result:\n" << resultFloatString(floatVec) << "\n\n";
+    // for (const auto &fp : floatVec) {
+    //   dumpHalf(fp);
+    // }
   }
 }
 
@@ -360,6 +419,9 @@ int main(int argc, char **argv) {
         assert(testFloatValMap.contains(toRet));
         const auto &resVec = testFloatValMap[toRet];
         cpuRes = resultFloatString(resVec);
+        // for (const auto &fp : resVec) {
+        //   dumpHalf(fp);
+        // }
       }
     }
   });
@@ -383,6 +445,9 @@ int main(int argc, char **argv) {
       assert(isMulF);
       assert(testFloatValMap.contains(in));
       std::cout << resultFloatString(testFloatValMap[in]) << "\n";
+      // for (const auto &fp : testFloatValMap[in]) {
+      //   dumpHalf(fp);
+      // }
     }
   }
   std::cout << "\n";
@@ -444,6 +509,32 @@ int main(int argc, char **argv) {
   llvm::SmallVector<OperandTracker, 16> trackers;
   trackers.resize(VEC_LEN);
 
+  int exponentBitWidth;
+  int bias;
+  if (isMulF) {
+    switch (bitWidth) {
+      case 16:
+        exponentBitWidth = 5;
+        bias = -15;
+        break;
+      case 32:
+        exponentBitWidth = 8;
+        bias = -127;
+        break;
+      case 64:
+        exponentBitWidth = 11;
+        bias = -1023;
+        break;
+      case 128:
+        exponentBitWidth = 15;
+        bias = -16383;
+        break;
+      default:
+        assert(false && "Unsupported floating-point bitwidth");
+        break;
+    }
+  }
+
   std::string resultAddr;
   module->walk([&](func::FuncOp func) {
     size_t inputIdx = 0;
@@ -455,8 +546,34 @@ int main(int argc, char **argv) {
       } else if (auto store = dyn_cast<pud::StoreOp>(*op)) {
         auto firstRow = store.getFirstRow();
         auto addr = getAddressAsStr(firstRow);
-        storeAndInitInput(addr, inputIdx, isMulF);
-        inputIdx++;
+        if (isMulF &&
+            store.getSlice().getType().getBitWidth() == exponentBitWidth) {
+          llvm::APInt biasAPInt(exponentBitWidth, bias, true);
+          // llvm::SmallString<64> biasStr;
+          // biasAPInt.toString(biasStr, 10, true);
+          // std::string s(biasStr.begin(), biasStr.end());
+          // llvm::SmallString<64> biasBinStr;
+          // biasAPInt.toString(biasBinStr, 2, false);
+          // std::string sBin(biasBinStr.begin(), biasBinStr.end());
+          // std::cout << "Bias to ADD: "
+          //     << s << " Bin: " << sBin << "\n\n";
+          unsigned long long base = std::stoull(addr, nullptr, 0);
+          for (int i = 0; i < exponentBitWidth; ++i) {
+            auto bitIdx = exponentBitWidth - i - 1;
+            llvm::SmallVector<std::unique_ptr<OperandExpr>> exprVec;
+            auto withOffset = intToHex(base + i);
+            assert(!exprMap.contains(withOffset));
+            auto name = std::format("I_bias_{}", i);
+            for (size_t j = 0; j < VEC_LEN; ++j) {
+              auto expr = std::make_unique<DataExpr>(name, biasAPInt[bitIdx]);
+              exprVec.push_back(std::move(expr));
+            }
+            exprMap[withOffset] = std::move(exprVec);
+          }
+        } else {
+          storeAndInitInput(addr, inputIdx, isMulF);
+          inputIdx++;
+        }
       } else if (auto load = dyn_cast<pud::LoadOp>(*op)) {
         auto firstRow = load.getFirstRow();
         resultAddr = getAddressAsStr(firstRow);

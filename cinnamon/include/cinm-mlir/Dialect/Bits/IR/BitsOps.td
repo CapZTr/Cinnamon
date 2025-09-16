@@ -111,7 +111,7 @@ def MulFOp : Bits_Op<"mul_f", [Pure]> {
   let hasVerifier = 1;
 }
 
-def CreateEmptyCinOp : Bits_Op<"create_empty_cin", [Pure]> {
+def CreateSliceOp : Bits_Op<"create_slice", [Pure]> {
   let summary = "";
   let description = [{}];
 

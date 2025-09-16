@@ -67,7 +67,7 @@ LogicalResult NetworkBuilder::build() {
           auto lhs = migSignalMap.lookup(add.getLhs());
           auto rhs = migSignalMap.lookup(add.getRhs());
           auto cin = mig.create_pi();
-          auto [sum, cout] = buildAdd(lhs, rhs, cin);
+          auto [sum, cout] = buildAdd(mig, lhs, rhs, cin);
           migSignalMap[add.getResult()] = sum;
           const int cinIdex = mig.num_pis() - 1;
           assert(!carryMap.contains(cinIdex));
@@ -86,7 +86,7 @@ LogicalResult NetworkBuilder::build() {
           auto lhs = migSignalMap.lookup(mul.getLhs());
           auto rhs = migSignalMap.lookup(mul.getRhs());
           auto cin = mig.create_pi();
-          auto [sum, cout] = buildAdd(lhs, rhs, cin);
+          auto [sum, cout] = buildAdd(mig, lhs, rhs, cin);
           migSignalMap[mul.getResult()] = sum;
           const int cinIdex = mig.num_pis() - 1;
           assert(!carryMap.contains(cinIdex));
@@ -116,22 +116,34 @@ LogicalResult NetworkBuilder::build() {
   if (isMulF) {
     assert(mulFSignSignalMap.contains(result));
     mulFSignNtk.create_po(mulFSignSignalMap[result]);
+
+    // Exponent Network
+    auto i0 = mulFExponentNtk.create_pi();
+    auto i1 = mulFExponentNtk.create_pi();
+    auto i2 = mulFExponentNtk.create_pi();
+    auto [sum, cout] = buildAdd(mulFExponentNtk, i0, i1, i2);
+    mulFExponentNtk.create_po(sum);
   }
   outputSlices.push_back(result);
 
   mig = mockturtle::cleanup_dangling(mig);
+  if (isMulF) {
+    mulFSignNtk = mockturtle::cleanup_dangling(mulFSignNtk);
+    mulFExponentNtk = mockturtle::cleanup_dangling(mulFExponentNtk);
+  }
 
   return success();
 }
 
 std::pair<MIG::signal, MIG::signal> NetworkBuilder::buildAdd(
+    MIG &ntk,
     MIG::signal const &lhs,
     MIG::signal const &rhs,
     MIG::signal const &cin) {
-  auto cout = mig.create_maj(lhs, rhs, cin);
-  mig.create_po(cout);
-  auto maj = mig.create_maj(lhs, rhs, mig.create_not(cin));
-  auto sum = mig.create_maj(maj, cin, mig.create_not(cout));
+  auto cout = ntk.create_maj(lhs, rhs, cin);
+  ntk.create_po(cout);
+  auto maj = ntk.create_maj(lhs, rhs, ntk.create_not(cin));
+  auto sum = ntk.create_maj(maj, cin, ntk.create_not(cout));
   return {sum, cout};
 }
 
