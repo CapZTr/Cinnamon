@@ -23,7 +23,8 @@ def AAPOp : PuD_Op<"AAP", [Pure]> {
 
   let arguments = (ins RowType:$srcAddr, RowType:$dstAddr);
 
-  let assemblyFormat = "$srcAddr `,` $dstAddr attr-dict `:` qualified(type($srcAddr)) `,` qualified(type($dstAddr))";
+  let assemblyFormat = "$srcAddr `,` $dstAddr attr-dict `:` "
+      "qualified(type($srcAddr)) `,` qualified(type($dstAddr))";
   let hasVerifier = 1;
 }
 
@@ -43,7 +44,8 @@ def StoreOp : PuD_Op<"store", [Pure]> {
 
   let arguments = (ins SliceType:$slice, RowType:$firstRow);
 
-  let assemblyFormat = "$slice `,` $firstRow attr-dict `:` qualified(type($slice)) `,` qualified(type($firstRow))";
+  let assemblyFormat = "$slice `,` $firstRow attr-dict `:` "
+      "qualified(type($slice)) `,` qualified(type($firstRow))";
   let hasVerifier = 1;
 }
 
@@ -54,7 +56,9 @@ def LoadOp : PuD_Op<"load", [Pure]> {
   let arguments = (ins RowType:$firstRow, I64:$rowNum);
   let results = (outs SliceType:$slice);
 
-  let assemblyFormat = "$firstRow `,` $rowNum attr-dict `:` qualified(type($firstRow)) `,` type($rowNum) `->` qualified(type($slice))";
+  let assemblyFormat = "$firstRow `,` $rowNum attr-dict `:` "
+      "qualified(type($firstRow)) `,` type($rowNum) `->` "
+      "qualified(type($slice))";
   let hasVerifier = 1;
 }
 
@@ -71,7 +75,10 @@ def GetRowOp : PuD_Op<"get_row", [Pure]> {
   );
   let results = (outs RowType:$addr);
 
-  let assemblyFormat = "$channelID `,` $rankID `,` $bankID `,` $subarrayID `,` $rowID attr-dict `:` type($channelID) `,` type($rankID) `,` type($bankID) `,` type($subarrayID) `,` type($rowID) `->` qualified(type($addr))";
+  let assemblyFormat = "$channelID `,` $rankID `,` $bankID `,` $subarrayID `,` "
+      "$rowID attr-dict `:` type($channelID) `,` type($rankID) `,` "
+      "type($bankID) `,` type($subarrayID) `,` type($rowID) `->` "
+      "qualified(type($addr))";
 }
 
 #endif

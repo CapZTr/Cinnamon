@@ -121,12 +121,21 @@ struct ConvertArithToBits
         ConvertArithTensorOpToBits<arith::AddIOp, AddIOp>>(&ctx);
     patterns.add<
         ConvertArithTensorOpToBits<arith::MulFOp, MulFOp>>(&ctx);
+    patterns.add<
+        ConvertArithTensorOpToBits<arith::AndIOp, AndOp>>(&ctx);
+    patterns.add<
+        ConvertArithTensorOpToBits<arith::OrIOp, OrOp>>(&ctx);
+    patterns.add<
+        ConvertArithTensorOpToBits<arith::XOrIOp, XOrOp>>(&ctx);
     
     ConversionTarget target(ctx);
     target.markUnknownOpDynamicallyLegal([](...) { return true; });
     target.addLegalDialect<BitsDialect>();
     target.addIllegalOp<arith::AddIOp>();
     target.addIllegalOp<arith::MulFOp>();
+    target.addIllegalOp<arith::AndIOp>();
+    target.addIllegalOp<arith::OrIOp>();
+    target.addIllegalOp<arith::XOrIOp>();
 
     if (applyPartialConversion(func, target, std::move(patterns)).failed()) {
       signalPassFailure();

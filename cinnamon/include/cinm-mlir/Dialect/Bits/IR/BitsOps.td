@@ -52,8 +52,8 @@ def SplitSliceVerticallyOp : Bits_Op<"split_vertically", [Pure]> {
     SliceType:$second
   );
 
-  let assemblyFormat = "$slice `,` $columnNum attr-dict `:`"
-      "qualified(type($slice)) `,` type($columnNum) `->`"
+  let assemblyFormat = "$slice `,` $columnNum attr-dict `:` "
+      "qualified(type($slice)) `,` type($columnNum) `->` "
       "qualified(type($first)) `,` qualified(type($second))";
   let hasVerifier = 1;
 }
@@ -68,9 +68,9 @@ def MergeSliceVerticallyOp : Bits_Op<"merge_vertically", [Pure]> {
   );
   let results = (outs SliceType:$slice);
 
-  let assemblyFormat = "$first `,` $second attr-dict `:`"
-      "qualified(type($first)) `,` qualified(type($second)) `->`"
-      " qualified(type($slice))";
+  let assemblyFormat = "$first `,` $second attr-dict `:` "
+      "qualified(type($first)) `,` qualified(type($second)) `->` "
+      "qualified(type($slice))";
   let hasVerifier = 1;
 }
 
@@ -105,8 +105,62 @@ def MulFOp : Bits_Op<"mul_f", [Pure]> {
     SliceType:$result
   );
 
-  let assemblyFormat = "$lhs `,` $rhs attr-dict `:`"
-      "qualified(type($lhs)) `,` qualified(type($rhs))"
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) "
+      "`->` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
+def AndOp : Bits_Op<"and", [Pure]> {
+  let summary = "Bit-serial AND of two slice operands";
+  let description = [{}];
+
+  let arguments = (ins
+    SliceType:$lhs,
+    SliceType:$rhs
+  );
+  let results = (outs
+    SliceType:$result
+  );
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) "
+      "`->` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
+def OrOp : Bits_Op<"or", [Pure]> {
+  let summary = "Bit-serial OR of two slice operands";
+  let description = [{}];
+
+  let arguments = (ins
+    SliceType:$lhs,
+    SliceType:$rhs
+  );
+  let results = (outs
+    SliceType:$result
+  );
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) "
+      "`->` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
+def XOrOp : Bits_Op<"xor", [Pure]> {
+  let summary = "Bit-serial XOR of two slice operands";
+  let description = [{}];
+
+  let arguments = (ins
+    SliceType:$lhs,
+    SliceType:$rhs
+  );
+  let results = (outs
+    SliceType:$result
+  );
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) "
       "`->` qualified(type($result))";
   let hasVerifier = 1;
 }
@@ -117,18 +171,6 @@ def CreateSliceOp : Bits_Op<"create_slice", [Pure]> {
 
   let results = (outs SliceType:$slice);
   let assemblyFormat = "attr-dict `:` qualified(type($slice))";
-}
-
-def SubOp : Bits_Op<"sub", [Pure]> {
-  let summary = "Bit-serial subtraction of two slice operands";
-  let description = [{}];
-
-  let arguments = (ins SliceType:$lhs, SliceType:$rhs);
-  let results = (outs SliceType:$result);
-
-  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` qualified(type($lhs)) `,` "
-      "qualified(type($rhs)) `->` qualified(type($result))";
-  let hasVerifier = 1;
 }
 
 #endif

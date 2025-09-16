@@ -34,28 +34,27 @@ LogicalResult NetworkBuilder::build() {
         mulFSignSignalMap[slice] = mulFSignNtk.create_pi();
       }
       inputSlices.push_back(slice);
-    } else if (auto add = dyn_cast<AddIOp>(op)) {
+    } else if (isa<AddIOp>(op) || isa<MulFOp>(op) || isa<AndOp>(op)
+        || isa<OrOp>(op) || isa<XOrOp>(op)) {
       pendingBinaryOps.push_back(op);
-    } else if (auto mul = dyn_cast<MulFOp>(op)) {
-      pendingBinaryOps.push_back(op);
-    }
-    else if (auto assembleOp = dyn_cast<AssembleOp>(op)) {
+    } else if (auto assembleOp = dyn_cast<AssembleOp>(op)) {
       assemble = assembleOp;
     }
   });
 
-  bool allAddI = llvm::all_of(pendingBinaryOps, [](Operation *op) {
-    return isa<AddIOp>(op);
+  bool noneMulF = llvm::none_of(pendingBinaryOps, [](Operation *op) {
+    return isa<MulFOp>(op);
   });
   bool allMulF = llvm::all_of(pendingBinaryOps, [](Operation *op) {
     return isa<MulFOp>(op);
   });
+
+  assert((noneMulF || allMulF) &&
+      "pendingBinaryOps must contain either all MulFOp or none MulFOp");
+
   if (allMulF) {
     isMulF = true;
   }
-
-  assert((allAddI || allMulF) &&
-      "pendingBinaryOps must contain either all AddIOp or all MulFOp");
 
   bool progress = true;
   while (progress && !pendingBinaryOps.empty()) {
@@ -73,6 +72,24 @@ LogicalResult NetworkBuilder::build() {
           assert(!carryMap.contains(cinIdex));
           carryMap[cinIdex] = mig.num_pos() - 1;
 
+          it = pendingBinaryOps.erase(it);
+          progress = true;
+        } else if (auto andOp = dyn_cast<AndOp>(*it)) {
+          auto lhs = migSignalMap.lookup(andOp.getLhs());
+          auto rhs = migSignalMap.lookup(andOp.getRhs());
+          migSignalMap[andOp.getResult()] = mig.create_and(lhs, rhs);
+          it = pendingBinaryOps.erase(it);
+          progress = true;
+        } else if (auto orOp = dyn_cast<OrOp>(*it)) {
+          auto lhs = migSignalMap.lookup(orOp.getLhs());
+          auto rhs = migSignalMap.lookup(orOp.getRhs());
+          migSignalMap[orOp.getResult()] = mig.create_or(lhs, rhs);
+          it = pendingBinaryOps.erase(it);
+          progress = true;
+        } else if (auto xorOp = dyn_cast<XOrOp>(*it)) {
+          auto lhs = migSignalMap.lookup(xorOp.getLhs());
+          auto rhs = migSignalMap.lookup(xorOp.getRhs());
+          migSignalMap[xorOp.getResult()] = mig.create_xor(lhs, rhs);
           it = pendingBinaryOps.erase(it);
           progress = true;
         } else if (auto mul = dyn_cast<MulFOp>(*it)) {

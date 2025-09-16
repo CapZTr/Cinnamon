@@ -249,6 +249,39 @@ void doAddition(Value lhs, Value rhs, Value sum) {
   testIntValMap[sum] = resVec;
 }
 
+void doAND(Value lhs, Value rhs, Value result) {
+  assert(!testIntValMap.contains(result));
+  llvm::SmallVector<llvm::APInt> resVec;
+  for (size_t i = 0; i < VEC_LEN; ++i) {
+    llvm::APInt res = getOrCreateIntTestVal(lhs, i) &
+        getOrCreateIntTestVal(rhs, i);
+    resVec.push_back(res);
+  }
+  testIntValMap[result] = resVec;
+}
+
+void doOR(Value lhs, Value rhs, Value result) {
+  assert(!testIntValMap.contains(result));
+  llvm::SmallVector<llvm::APInt> resVec;
+  for (size_t i = 0; i < VEC_LEN; ++i) {
+    llvm::APInt res = getOrCreateIntTestVal(lhs, i) |
+        getOrCreateIntTestVal(rhs, i);
+    resVec.push_back(res);
+  }
+  testIntValMap[result] = resVec;
+}
+
+void doXOR(Value lhs, Value rhs, Value result) {
+  assert(!testIntValMap.contains(result));
+  llvm::SmallVector<llvm::APInt> resVec;
+  for (size_t i = 0; i < VEC_LEN; ++i) {
+    llvm::APInt res = getOrCreateIntTestVal(lhs, i) ^
+        getOrCreateIntTestVal(rhs, i);
+    resVec.push_back(res);
+  }
+  testIntValMap[result] = resVec;
+}
+
 llvm::APFloat apfMul(const llvm::APFloat &a, const llvm::APFloat &b) {
   assert(&a.getSemantics() == &b.getSemantics() &&
       "APFloat semantics must match");
@@ -392,24 +425,27 @@ int main(int argc, char **argv) {
   }
 
   std::string cpuRes;
-  bool isAddI = false;
   bool isMulF = false;
   func::FuncOp fp = *module->getOps<func::FuncOp>().begin();
   fp.walk([&](Operation *op) {
     if (auto add = dyn_cast<arith::AddIOp>(*op)) {
-      if (!isAddI) {
-        isAddI = true;
-      }
       assert(!isMulF);
       doAddition(add.getLhs(), add.getRhs(), add.getResult());
+    } else if (auto andOp = dyn_cast<arith::AndIOp>(*op)) {
+      assert(!isMulF);
+      doAND(andOp.getLhs(), andOp.getRhs(), andOp.getResult());
+    } else if (auto orOp = dyn_cast<arith::OrIOp>(*op)) {
+      assert(!isMulF);
+      doAND(orOp.getLhs(), orOp.getRhs(), orOp.getResult());
+    } else if (auto xorOp = dyn_cast<arith::XOrIOp>(*op)) {
+      assert(!isMulF);
+      doAND(xorOp.getLhs(), xorOp.getRhs(), xorOp.getResult());
     } else if (auto mul = dyn_cast<arith::MulFOp>(*op)) {
       if (!isMulF) {
         isMulF = true;
       }
-      assert(!isAddI);
       doMultiplication(mul.getLhs(), mul.getRhs(), mul.getResult());
-    }
-    else if (auto ret = dyn_cast<func::ReturnOp>(*op)) {
+    } else if (auto ret = dyn_cast<func::ReturnOp>(*op)) {
       const Value toRet = ret.getOperand(0);
       if (testIntValMap.contains(toRet)) {
         assert(!testFloatValMap.contains(toRet));
@@ -437,12 +473,10 @@ int main(int argc, char **argv) {
 
   std::cout << "Inputs: \n";
   for (const auto &in : inputs) {
-    if (isAddI) {
-      assert(!isMulF);
+    if (!isMulF) {
       assert(testIntValMap.contains(in));
       std::cout << resultIntString(testIntValMap[in]) << "\n";
     } else {
-      assert(isMulF);
       assert(testFloatValMap.contains(in));
       std::cout << resultFloatString(testFloatValMap[in]) << "\n";
       // for (const auto &fp : testFloatValMap[in]) {
