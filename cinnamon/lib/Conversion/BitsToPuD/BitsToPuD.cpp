@@ -119,7 +119,7 @@ struct ConvertBitsToPuD
       signalPassFailure();
     }
     std::vector<Instruction> program = parser.getProgram();
-    // parser.printProgram();
+    parser.printProgram();
     // std::cout << " ===== Parsed " << program.size() 
     //     << " instructions =====" << "\n";
 
@@ -400,8 +400,7 @@ struct ConvertBitsToPuD
           }
 
           auto operand1 = *inst.operand1;
-          if (operand1.type == AddressType::Out ||
-              operand1.type == AddressType::Spill) {
+          if (operand1.type == AddressType::Out) {
             const auto index = std::get<int>(operand1.data);
             if (operand1.type == AddressType::Out && index < carryNum) {
               if (!allocated.contains(operand1.str_repr)) {
@@ -425,8 +424,15 @@ struct ConvertBitsToPuD
                 outputFirstRow = firstRow;
               }
             }
-          } else if (operand1.type == AddressType::Bitwise) {
-          }
+          } else if (operand1.type == AddressType::Spill) {
+            if (!allocated.contains(operand1.str_repr)) {
+              assert(roundIdx == 0);
+              auto addr = allocator.allocate(1);
+              allocated[operand1.str_repr] = addr;
+              auto firstRow = getOrCreateDRow(addr);
+              firstRows[operand1.str_repr] = firstRow;
+            }
+          } else if (operand1.type == AddressType::Bitwise) {}
         } else {
           assert(inst.type == Instruction::Type::AP);
         }
@@ -447,7 +453,7 @@ struct ConvertBitsToPuD
             auto operand = *(inst.operand1);
             if (operand.type == AddressType::Spill) {
               if (!biasSFirstRowMap.contains(operand.str_repr)) {
-                auto sAddr = allocator.allocate(exponentBitWidth);
+                auto sAddr = allocator.allocate(1);
                 biasSFirstRowMap[operand.str_repr] = sAddr;
               }
             }
@@ -525,9 +531,11 @@ struct ConvertBitsToPuD
                 addr0 = bRows[index];
               } else if (operand0.type == AddressType::Const) {
                 addr0 = std::get<bool>(operand0.data) ? c1 : c0;
+              } else if (operand0.type == AddressType::Spill) {
+                assert(firstRows.contains(operand0.str_repr));
+                addr0 = firstRows.lookup(operand0.str_repr);
               } else {
-                assert(operand0.type == AddressType::In ||
-                    operand0.type == AddressType::Spill);
+                assert(operand0.type == AddressType::In);
                 auto firstRow = allocated[operand0.str_repr];
                 if (carryRows.contains(operand0.str_repr)) {
                   if (iterIndex == 0) {
@@ -557,9 +565,12 @@ struct ConvertBitsToPuD
               if (operand1.type == AddressType::Bitwise) {
                 auto index = std::get<int>(operand1.data);
                 addr1 = bRows[index];
-              } else {
-                assert(operand1.type == AddressType::Out ||
-                    operand1.type == AddressType::Spill);
+              } else if (operand1.type == AddressType::Spill) {
+                assert(firstRows.contains(operand1.str_repr));
+                addr1 = firstRows.lookup(operand1.str_repr);
+              }
+              else {
+                assert(operand1.type == AddressType::Out);
                 if (carryRows.contains(operand1.str_repr)) {
                   assert(operand1.type == AddressType::Out);
                   const auto outputIdx = std::get<int>(operand1.data);
@@ -610,8 +621,7 @@ struct ConvertBitsToPuD
                 addr0 = std::get<bool>(operand0.data) ? c1 : c0;
               } else if (operand0.type == AddressType::Spill) {
                 assert(biasSFirstRowMap.contains(operand0.str_repr));
-                addr0 = getOrCreateDRow(allocator.getRowFromOffset(
-                    biasSFirstRowMap[operand0.str_repr], biasOffset - 1));
+                addr0 = getOrCreateDRow(biasSFirstRowMap[operand0.str_repr]);
               } else {
                 assert(operand0.type == AddressType::In);
                 if (operand0.str_repr == "I0") {
@@ -639,8 +649,7 @@ struct ConvertBitsToPuD
                 addr1 = bRows[index];
               } else if (operand1.type == AddressType::Spill) {
                 assert(biasSFirstRowMap.contains(operand0.str_repr));
-                addr1 = getOrCreateDRow(allocator.getRowFromOffset(
-                    biasSFirstRowMap[operand0.str_repr], biasOffset - 1));
+                addr1 = getOrCreateDRow(biasSFirstRowMap[operand0.str_repr]);
               } else {
                 assert(operand1.type == AddressType::Out);
                 if (operand1.str_repr == "O0") {
