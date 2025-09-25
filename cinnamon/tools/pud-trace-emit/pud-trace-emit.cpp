@@ -63,7 +63,7 @@ const std::string DUMMY_DATA = "b186649dd2c40617e1df8669b90acd6389c0e5f8e5c059c"
     "4136b68";
 // For simplification, we set lenth of each vector to 4 when evaluating
 // functional correctness.
-const size_t VEC_LEN = 4;
+const size_t VEC_LEN = 512;
 const llvm::SmallVector<double, 8> fixedFPVec{-0.125f, 8.0f, 0.25f, -16.0f,
     16.0f, 2.0f, -2.0f, 0.0625f};
 size_t idx = 0;
@@ -72,6 +72,110 @@ std::string intToHex(const int64_t v) {
   std::stringstream ss;
   ss << "0x" << std::hex << v;
   return ss.str();
+}
+
+// For MulF Accuracy Analysis
+int total, within10pct, eSumSmallerBias, doubleMantissa, other = 0;
+llvm::SmallVector<llvm::APFloat> cpuResAPFVec;
+llvm::SmallVector<llvm::APFloat> dramResAPFVec;
+
+static llvm::APFloat cst(const llvm::APFloat &x, const char *lit) {
+  return llvm::APFloat(x.getSemantics(), lit);
+}
+
+static llvm::APFloat absf(const llvm::APFloat &x) {
+  llvm::APFloat t = x;
+  if (t.isNegative()) {
+    t.changeSign();
+  }
+  return t;
+}
+
+static llvm::APFloat floorf(const llvm::APFloat &x) {
+  llvm::APFloat t = x;
+  (void)t.roundToIntegral(llvm::APFloat::rmTowardNegative);
+  return t;
+}
+
+static llvm::APFloat frac(const llvm::APFloat &x) {
+  llvm::APFloat f = x;
+  llvm::APFloat fx = floorf(x);
+  (void)f.subtract(fx, llvm::APFloat::rmNearestTiesToEven);
+  return f;
+}
+
+static llvm::APFloat convertToSemantics(
+    const llvm::APFloat &Asem, const llvm::APFloat &B, bool *losesInfo) {
+  if (&Asem.getSemantics() == &B.getSemantics()) {
+    if (losesInfo) *losesInfo = false;
+    return B;
+  }
+  llvm::APFloat T = B;
+  (void)T.convert(Asem.getSemantics(), APFloat::rmNearestTiesToEven, losesInfo);
+  return T;
+}
+
+void classifyAB(const llvm::APFloat &Ain,
+                const llvm::APFloat &Bin,
+                bool *losesInfo = nullptr) {
+  llvm::APFloat A = Ain;
+  llvm::APFloat B = convertToSemantics(Ain, Bin, losesInfo);
+
+  if (!A.isFinite() || !B.isFinite()) {
+    return;
+  }
+  
+  total++;
+  if (A.isZero()) {
+    if (B.isZero()) {
+      within10pct++;
+      return;
+    }
+  } else {
+    llvm::APFloat diff = B;
+    (void)diff.subtract(A, llvm::APFloat::rmNearestTiesToEven);
+    diff = absf(diff);
+
+    llvm::APFloat tol = absf(A);
+    llvm::APFloat tenPct = cst(A, "0.1");
+    (void)tol.multiply(tenPct, llvm::APFloat::rmNearestTiesToEven);
+
+    auto cmp = diff.compare(tol);
+    if (cmp == llvm::APFloat::cmpLessThan || cmp == llvm::APFloat::cmpEqual) {
+      within10pct++;
+      return;
+    }
+  }
+
+  if (!B.isZero()) {
+    if (A.isZero()) {
+      eSumSmallerBias++;
+      return;
+    } else {
+      llvm::APFloat thr = absf(A);
+      llvm::APFloat k1024 = cst(A, "1024");
+      (void)thr.multiply(k1024, llvm::APFloat::rmNearestTiesToEven);
+      if (absf(B).compare(thr) != llvm::APFloat::cmpLessThan) {
+        eSumSmallerBias++;
+        return;
+      }
+    }
+  }
+
+  llvm::APFloat fA = frac(A);
+  llvm::APFloat fB = frac(B);
+
+  llvm::APFloat two = cst(A, "2");
+  llvm::APFloat twiceFA = fA;
+  (void)twiceFA.multiply(two, llvm::APFloat::rmNearestTiesToEven);
+
+  APFloat fTwice = frac(twiceFA);
+  if (fB.compare(fTwice) == llvm::APFloat::cmpEqual) {
+    doubleMantissa++;
+    return;
+  }
+
+  other++;
 }
 
 // Evaluate Functional Correctness
@@ -96,7 +200,7 @@ llvm::APInt createRandomAPInt(unsigned N) {
   llvm::SmallVector<uint64_t, 4> data(words);
 
   std::uniform_int_distribution<uint64_t> dist(
-      0, std::numeric_limits<uint16_t>::max());
+      0, std::numeric_limits<uint32_t>::max());
   for (unsigned i = 0; i < words; ++i)
     data[i] = dist(rng());
 
@@ -132,6 +236,9 @@ llvm::APFloat createAPFloat(
   }
   const llvm::fltSemantics *sem = nullptr;
   switch (bitWidth) {
+    case 8:
+      sem = &llvm::APFloat::Float8E4M3FNUZ();
+      break;
     case 16:
       sem = &llvm::APFloat::IEEEhalf();
       break;
@@ -145,7 +252,7 @@ llvm::APFloat createAPFloat(
       sem = &llvm::APFloat::IEEEquad();
       break;
     default:
-      assert(false && "Only 16/32/64/128-bit APFloat are supported");
+      assert(false && "Only 8/16/32/64/128-bit APFloat are supported");
   }
 
   if (!isRandom) {
@@ -154,7 +261,9 @@ llvm::APFloat createAPFloat(
     }
     llvm::APFloat x(fixedFPVec[idx]);
     bool loses = false;
-    x.convert(llvm::APFloat::IEEEhalf(),
+    x.convert(llvm::APFloat::IEEEsingle(),
+    // x.convert(llvm::APFloat::IEEEhalf(),
+    // x.convert(llvm::APFloat::Float8E4M3FNUZ(),
         llvm::APFloat::rmNearestTiesToEven,
         &loses);
     idx++;
@@ -389,6 +498,7 @@ void loadAndEvaluateResult(std::string baseAddr, bool isMulF) {
       floatVec.push_back(createAPFloat(bitWidth, apInt, true));
     }
     std::cout << "DRAM result:\n" << resultFloatString(floatVec) << "\n\n";
+    dramResAPFVec = floatVec;
     // for (const auto &fp : floatVec) {
     //   dumpHalf(fp);
     // }
@@ -455,6 +565,7 @@ int main(int argc, char **argv) {
         assert(testFloatValMap.contains(toRet));
         const auto &resVec = testFloatValMap[toRet];
         cpuRes = resultFloatString(resVec);
+        cpuResAPFVec = resVec;
         // for (const auto &fp : resVec) {
         //   dumpHalf(fp);
         // }
@@ -547,6 +658,10 @@ int main(int argc, char **argv) {
   int bias;
   if (isMulF) {
     switch (bitWidth) {
+      case 8:
+        exponentBitWidth = 4;
+        bias = -7;
+        break;
       case 16:
         exponentBitWidth = 5;
         bias = -15;
@@ -708,6 +823,16 @@ int main(int argc, char **argv) {
 
   std::cout << "CPU result:\n" << cpuRes << "\n\n";
   loadAndEvaluateResult(resultAddr, isMulF);
+
+  assert(cpuResAPFVec.size() == dramResAPFVec.size());
+  for (size_t i = 0; i < cpuResAPFVec.size(); ++i) {
+    classifyAB(cpuResAPFVec[i], dramResAPFVec[i]);
+  }
+  std::cout << total << "\n";
+  std::cout << within10pct << "\n";
+  std::cout << eSumSmallerBias << "\n";
+  std::cout << doubleMantissa << "\n";
+  std::cout << other << "\n";
 
   std::ofstream trace_file(argv[2]);
   if (!trace_file.is_open()) {

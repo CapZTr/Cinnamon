@@ -171,6 +171,9 @@ struct ConvertBitsToPuD
     int exponentBitWidth;
     if (isMulF) {
       switch (bitWidth) {
+        case 8:
+          exponentBitWidth = 4;
+          break;
         case 16:
           exponentBitWidth = 5;
           break;
