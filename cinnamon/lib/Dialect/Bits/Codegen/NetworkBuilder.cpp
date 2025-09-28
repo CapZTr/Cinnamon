@@ -3,6 +3,7 @@
 
 #include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/Support/Casting.h>
 #include <llvm/Support/LogicalResult.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/BuiltinTypes.h>
@@ -35,7 +36,8 @@ LogicalResult NetworkBuilder::build() {
       }
       inputSlices.push_back(slice);
     } else if (isa<AddIOp>(op) || isa<MulFOp>(op) || isa<AndOp>(op)
-        || isa<OrOp>(op) || isa<XOrOp>(op)) {
+        || isa<OrOp>(op) || isa<XOrOp>(op) || isa<MaxOp>(op) || isa<MinOp>(op))
+    {
       pendingBinaryOps.push_back(op);
     } else if (auto assembleOp = dyn_cast<AssembleOp>(op)) {
       assemble = assembleOp;
@@ -55,6 +57,21 @@ LogicalResult NetworkBuilder::build() {
   if (allMulF) {
     isMulF = true;
   }
+
+  if (pendingBinaryOps.size() == 1) {
+    auto op = pendingBinaryOps[0];
+    if (auto maxOp = dyn_cast<MaxOp>(op)) {
+      isMax = true;
+      gtSignalMap[maxOp.getLhs()] = gtNtk.create_pi();
+      gtSignalMap[maxOp.getRhs()] = gtNtk.create_pi();
+    } else if (auto minOp = dyn_cast<MinOp>(op)) {
+      isMin = true;
+      ltSignalMap[minOp.getLhs()] = ltNtk.create_pi();
+      ltSignalMap[minOp.getRhs()] = ltNtk.create_pi();
+    }
+  }
+
+  assert((int)isMulF + (int)isMax + (int)isMin <= 1);
 
   bool progress = true;
   while (progress && !pendingBinaryOps.empty()) {
@@ -111,6 +128,40 @@ LogicalResult NetworkBuilder::build() {
 
           it = pendingBinaryOps.erase(it);
           progress = true;
+        } else if (auto maxOp = dyn_cast<MaxOp>(*it)) {
+          const auto lhs = maxOp.getLhs();
+          const auto rhs = maxOp.getRhs();
+          // GT
+          const auto &lhsGTSignal = gtSignalMap[lhs];
+          const auto &rhsGTSignal = gtSignalMap[rhs];
+          gtNtk.create_po(
+              gtNtk.create_and(lhsGTSignal, gtNtk.create_not(rhsGTSignal)));
+          
+          // Mux
+          const auto &lhsSignal = migSignalMap[lhs];
+          const auto &rhsSignal = migSignalMap[rhs];
+          migSignalMap[maxOp.getResult()] = buildMux2(
+              mig, mig.create_pi(), lhsSignal, rhsSignal);
+
+          it = pendingBinaryOps.erase(it);
+          progress = true;
+        } else if (auto minOp = dyn_cast<MinOp>(*it)) {
+          const auto lhs = minOp.getLhs();
+          const auto rhs = minOp.getRhs();
+          // LT
+          const auto &lhsLTSignal = ltSignalMap[lhs];
+          const auto &rhsLTSignal = ltSignalMap[rhs];
+          ltNtk.create_po(
+              ltNtk.create_and(ltNtk.create_not(lhsLTSignal), rhsLTSignal));
+          
+          // Mux
+          const auto &lhsSignal = migSignalMap[lhs];
+          const auto &rhsSignal = migSignalMap[rhs];
+          migSignalMap[minOp.getResult()] = buildMux2(
+              mig, mig.create_pi(), lhsSignal, rhsSignal);
+
+          it = pendingBinaryOps.erase(it);
+          progress = true;
         } else {
           emitError((*it)->getLoc(),
                     "NetworkBuilder: Unsupported type of binary op");
@@ -148,6 +199,12 @@ LogicalResult NetworkBuilder::build() {
     mulFSignNtk = mockturtle::cleanup_dangling(mulFSignNtk);
     mulFExponentNtk = mockturtle::cleanup_dangling(mulFExponentNtk);
   }
+  if (isMax) {
+    gtNtk = mockturtle::cleanup_dangling(gtNtk);
+  }
+  if (isMin) {
+    ltNtk = mockturtle::cleanup_dangling(ltNtk);
+  }
 
   return success();
 }
@@ -162,6 +219,15 @@ std::pair<MIG::signal, MIG::signal> NetworkBuilder::buildAdd(
   auto maj = ntk.create_maj(lhs, rhs, ntk.create_not(cin));
   auto sum = ntk.create_maj(maj, cin, ntk.create_not(cout));
   return {sum, cout};
+}
+
+MIG::signal NetworkBuilder::buildMux2(MIG &ntk,
+                      MIG::signal const &s,
+                      MIG::signal const &lhs,
+                      MIG::signal const &rhs) {
+  auto and1 = ntk.create_and(s, lhs);
+  auto and2 = ntk.create_and(ntk.create_not(s), rhs);
+  return ntk.create_or(and1, and2);
 }
 
 bool NetworkBuilder::operandsBuilt(Operation *op) const {

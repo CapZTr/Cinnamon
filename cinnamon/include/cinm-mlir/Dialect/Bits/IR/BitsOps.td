@@ -165,6 +165,42 @@ def XOrOp : Bits_Op<"xor", [Pure]> {
   let hasVerifier = 1;
 }
 
+def MaxOp : Bits_Op<"max", [Pure]> {
+  let summary = "Bit-serial max of two slice operands";
+  let description = [{}];
+
+  let arguments = (ins
+    SliceType:$lhs,
+    SliceType:$rhs
+  );
+  let results = (outs
+    SliceType:$result
+  );
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) "
+      "`->` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
+def MinOp : Bits_Op<"min", [Pure]> {
+  let summary = "Bit-serial min of two slice operands";
+  let description = [{}];
+
+  let arguments = (ins
+    SliceType:$lhs,
+    SliceType:$rhs
+  );
+  let results = (outs
+    SliceType:$result
+  );
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) "
+      "`->` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
 def CreateSliceOp : Bits_Op<"create_slice", [Pure]> {
   let summary = "";
   let description = [{}];

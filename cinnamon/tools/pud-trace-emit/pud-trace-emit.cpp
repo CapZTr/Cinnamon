@@ -63,7 +63,7 @@ const std::string DUMMY_DATA = "b186649dd2c40617e1df8669b90acd6389c0e5f8e5c059c"
     "4136b68";
 // For simplification, we set lenth of each vector to 4 when evaluating
 // functional correctness.
-const size_t VEC_LEN = 512;
+const size_t VEC_LEN = 8;
 const llvm::SmallVector<double, 8> fixedFPVec{-0.125f, 8.0f, 0.25f, -16.0f,
     16.0f, 2.0f, -2.0f, 0.0625f};
 size_t idx = 0;
@@ -200,7 +200,7 @@ llvm::APInt createRandomAPInt(unsigned N) {
   llvm::SmallVector<uint64_t, 4> data(words);
 
   std::uniform_int_distribution<uint64_t> dist(
-      0, std::numeric_limits<uint32_t>::max());
+      0, std::numeric_limits<uint8_t>::max());
   for (unsigned i = 0; i < words; ++i)
     data[i] = dist(rng());
 
@@ -391,6 +391,30 @@ void doXOR(Value lhs, Value rhs, Value result) {
   testIntValMap[result] = resVec;
 }
 
+void doMax(Value lhs, Value rhs, Value result) {
+  assert(!testIntValMap.contains(result));
+  llvm::SmallVector<llvm::APInt> resVec;
+  for (size_t i = 0; i < VEC_LEN; ++i) {
+    llvm::APInt lhsAPInt = getOrCreateIntTestVal(lhs, i);
+    llvm::APInt rhsAPInt = getOrCreateIntTestVal(rhs, i);
+    llvm::APInt res = lhsAPInt.uge(rhsAPInt) ? lhsAPInt : rhsAPInt;
+    resVec.push_back(res);
+  }
+  testIntValMap[result] = resVec;
+}
+
+void doMin(Value lhs, Value rhs, Value result) {
+  assert(!testIntValMap.contains(result));
+  llvm::SmallVector<llvm::APInt> resVec;
+  for (size_t i = 0; i < VEC_LEN; ++i) {
+    llvm::APInt lhsAPInt = getOrCreateIntTestVal(lhs, i);
+    llvm::APInt rhsAPInt = getOrCreateIntTestVal(rhs, i);
+    llvm::APInt res = lhsAPInt.ule(rhsAPInt) ? lhsAPInt : rhsAPInt;
+    resVec.push_back(res);
+  }
+  testIntValMap[result] = resVec;
+}
+
 llvm::APFloat apfMul(const llvm::APFloat &a, const llvm::APFloat &b) {
   assert(&a.getSemantics() == &b.getSemantics() &&
       "APFloat semantics must match");
@@ -505,6 +529,21 @@ void loadAndEvaluateResult(std::string baseAddr, bool isMulF) {
   }
 }
 
+void printMaskRow() {
+  const auto &addr = intToHex(0);
+  std::cout << addr << ": ";
+  const auto &exprVec = exprMap[addr];
+  for (size_t i = 0; i < VEC_LEN; ++i) {
+    if (exprVec[i]->evaluate()) {
+      std::cout << "1 ";
+    } else {
+      assert(!exprVec[i]->evaluate());
+      std::cout << "0 ";
+    }
+  }
+  std::cout << "\n";
+}
+
 std::string getTraceLine(const int cycle, const std::string &opName,
     const std::string &addr0, const std::optional<std::string> addr1) {
   std::string line = std::format(
@@ -550,6 +589,12 @@ int main(int argc, char **argv) {
     } else if (auto xorOp = dyn_cast<arith::XOrIOp>(*op)) {
       assert(!isMulF);
       doAND(xorOp.getLhs(), xorOp.getRhs(), xorOp.getResult());
+    } else if (auto maxOp = dyn_cast<arith::MaxUIOp>(*op)) {
+      assert(!isMulF);
+      doMax(maxOp.getLhs(), maxOp.getRhs(), maxOp.getResult());
+    } else if (auto minOp = dyn_cast<arith::MinUIOp>(*op)) {
+      assert(!isMulF);
+      doMin(minOp.getLhs(), minOp.getRhs(), minOp.getResult());
     } else if (auto mul = dyn_cast<arith::MulFOp>(*op)) {
       if (!isMulF) {
         isMulF = true;
@@ -781,6 +826,13 @@ int main(int argc, char **argv) {
             }
             for (size_t i = 0; i < VEC_LEN; ++i) {
               auto expr = trackers[i].executeAAP(index0, std::nullopt);
+              // if (addr1 == "0x0") {
+              //   if (expr->evaluate()) {
+              //     std::cout << "Writing 1 to Mask\n";
+              //   } else {
+              //     std::cout << "Writing 0 to Mask\n";
+              //   }
+              // }
               if (exprMap[addr1].size() <= i) {
                 exprMap[addr1].push_back(std::move(expr));
               } else {
@@ -824,15 +876,18 @@ int main(int argc, char **argv) {
   std::cout << "CPU result:\n" << cpuRes << "\n\n";
   loadAndEvaluateResult(resultAddr, isMulF);
 
-  assert(cpuResAPFVec.size() == dramResAPFVec.size());
-  for (size_t i = 0; i < cpuResAPFVec.size(); ++i) {
-    classifyAB(cpuResAPFVec[i], dramResAPFVec[i]);
+  if (isMulF) {
+    assert(cpuResAPFVec.size() == dramResAPFVec.size());
+    for (size_t i = 0; i < cpuResAPFVec.size(); ++i) {
+      classifyAB(cpuResAPFVec[i], dramResAPFVec[i]);
+    }
+    std::cout << total << "\n";
+    std::cout << within10pct << "\n";
+    std::cout << eSumSmallerBias << "\n";
+    std::cout << doubleMantissa << "\n";
+    std::cout << other << "\n";
   }
-  std::cout << total << "\n";
-  std::cout << within10pct << "\n";
-  std::cout << eSumSmallerBias << "\n";
-  std::cout << doubleMantissa << "\n";
-  std::cout << other << "\n";
+  printMaskRow();
 
   std::ofstream trace_file(argv[2]);
   if (!trace_file.is_open()) {

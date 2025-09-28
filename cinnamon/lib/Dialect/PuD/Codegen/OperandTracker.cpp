@@ -109,6 +109,9 @@ std::unique_ptr<OperandExpr> OperandTracker::doMaj(int index1, int index2, int i
   bGroupExpressions[index1] = m->clone();
   bGroupExpressions[index2] = m->clone();
   bGroupExpressions[index3] = m->clone();
+  if (index1 == 4 || index1 == 6) {
+    doNot(index1);
+  }
   return m;
 }
 

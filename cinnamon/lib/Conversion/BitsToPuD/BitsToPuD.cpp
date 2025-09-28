@@ -9,6 +9,7 @@
 #include "cinm-mlir/Dialect/PuD/Codegen/AddressAllocator.h"
 #include "cinm-mlir/Dialect/PuD/Codegen/ProgramParser.h"
 
+#include <iostream>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringMap.h>
@@ -80,10 +81,17 @@ struct ConvertBitsToPuD
     auto mulFSignNtk = builder.getMulFSignNtk();
     auto mulFExponentNtk = builder.getMulFExponentNtk();
     const auto isMulF = builder.isMulFNtk();
+    auto gtNtk = builder.getGTNtk();
+    const auto isMax = builder.isMaxNtk();
+    auto ltNtk = builder.getLTNtk();
+    const auto isMin = builder.isMinNtk();
+    assert((int)isMulF + (int)isMax + (int)isMin <= 1);
     auto ntkInputs = builder.getInputSlices();
     const int inputNum = ntkInputs.size();
+    std::cout << inputNum << " inputs\n";
     auto carryMap = builder.getCarryMap();
     const int carryNum = carryMap.size();
+    std::cout << carryNum << " carries\n";
 
     // NetworkBuilder::debugPrint(mig);
 
@@ -150,6 +158,31 @@ struct ConvertBitsToPuD
       // parser_minus_bias.printProgram();
     }
 
+    std::vector<Instruction> program_gt;
+    if (isMax) {
+      ProgramString gt_str;
+      auto [optimized_gt, result_gt] = ambit_rewrite(
+          settings, gtNtk, gt_str);
+      ProgramParser parser_gt(gt_str.str());
+      if (failed(parser_gt.parse())) {
+        signalPassFailure();
+      }
+      program_gt = parser_gt.getProgram();
+      parser_gt.printProgram();
+    }
+    std::vector<Instruction> program_lt;
+    if (isMin) {
+      ProgramString lt_str;
+      auto [optimized_lt, result_lt] = ambit_rewrite(
+          settings, ltNtk, lt_str);
+      ProgramParser parser_lt(lt_str.str());
+      if (failed(parser_lt.parse())) {
+        signalPassFailure();
+      }
+      program_lt = parser_lt.getProgram();
+      parser_lt.printProgram();
+    }
+
 
     // =========================================================================
     // ==================== IR (PuD Dialect) Building ==========================
@@ -191,6 +224,7 @@ struct ConvertBitsToPuD
           break;
       }
     }
+    TypedValue<RowType> maskRow;
     const auto vecLen = transpose.getOutput().getType().getVectorLength();
     const auto tensorType = cast<RankedTensorType>(
         transpose.getInput().getType());
@@ -367,6 +401,22 @@ struct ConvertBitsToPuD
       allocator.reset();
       StringSet<> stored;
 
+      std::vector<Instruction> program_gtLt;
+      if (isMax || isMin) {
+        program_gtLt = isMax ? program_gt : program_lt;
+        for (const auto &inst : program_gtLt) {
+          if (inst.type == Instruction::Type::AAP) {
+            auto operand = *inst.operand1;
+            if (operand.str_repr == "O0") {
+              auto maskRowAddr = allocator.allocate(1);
+              maskRow = getOrCreateDRow(maskRowAddr);
+              std::cout << "Mask Allocated in " << maskRowAddr.str() << "\n";
+              break;
+            }
+          }
+        }
+      }
+
       for (auto &inst : program) {
         if (inst.type == Instruction::Type::AAP) {
           auto operand0 = inst.operand0;
@@ -376,6 +426,7 @@ struct ConvertBitsToPuD
               if (!allocated.contains(operand0.str_repr)) {
                 assert(roundIdx == 0);
                 auto addr = allocator.allocate(bitWidth);
+                std::cout << operand0.str_repr << " allocated in " << addr.str() << "\n";
                 allocated[operand0.str_repr] = addr;
                 auto firstRow = getOrCreateDRow(addr);
                 firstRows[operand0.str_repr] = firstRow;
@@ -391,11 +442,16 @@ struct ConvertBitsToPuD
             } else {
               if (!allocated.contains(operand0.str_repr)) {
                 assert(roundIdx == 0);
-                auto addr = allocator.allocate(1);
-                allocated[operand0.str_repr] = addr;
-                auto cinRow = getOrCreateDRow(addr);
-                assert(!carryRows.contains(operand0.str_repr));
-                carryRows.try_emplace(operand0.str_repr, cinRow);
+                if (isMax || isMin) {
+                  std::cout << operand0.str_repr << " do nothing\n";
+                  // do nothing
+                } else {
+                  auto addr = allocator.allocate(1);
+                  allocated[operand0.str_repr] = addr;
+                  auto cinRow = getOrCreateDRow(addr);
+                  assert(!carryRows.contains(operand0.str_repr));
+                  carryRows.try_emplace(operand0.str_repr, cinRow);
+                }
               }
             }
           } else if (operand0.type == AddressType::Spill) {
@@ -419,6 +475,7 @@ struct ConvertBitsToPuD
             if (!allocated.contains(operand1.str_repr)) {
               assert(roundIdx == 0);
               auto addr = allocator.allocate(bitWidth);
+              std::cout << operand1.str_repr << " allocated in " << addr.str() << "\n";
               allocated[operand1.str_repr] = addr;
               auto firstRow = getOrCreateDRow(addr);
               firstRows[operand1.str_repr] = firstRow;
@@ -508,6 +565,72 @@ struct ConvertBitsToPuD
           }
         }
 
+        if (isMax || isMin) {
+          program_gtLt = isMax ? program_gt : program_lt;
+          int gtLtIdx = bitWidth;
+          opBuilder.create<AAPOp>(loc, c0, bRows[2]);
+          auto firstAddrIn0 = allocated["I0"];
+          auto firstAddrIn1 = allocated["I1"];
+          while (gtLtIdx > 0) {
+            gtLtIdx--;
+          //   for (const auto &inst : program_gtLt) {
+          //     if (inst.type == Instruction::Type::AAP) {
+          //       TypedValue<RowType> addr0, addr1;
+          //       auto operand0 = inst.operand0;
+          //       if (operand0.type == AddressType::Bitwise) {
+          //         addr0 = bRows[std::get<int>(operand0.data)];
+          //       } else if (operand0.type == AddressType::Const) {
+          //         assert(std::get<bool>(operand0.data) == false);
+          //         addr0 = c0;
+          //       } else {
+          //         assert(operand0.type == AddressType::In);
+          //         assert(allocated.contains(operand0.str_repr));
+          //         auto firstRow = allocated[operand0.str_repr];
+          //         if (gtLtIdx == 0) {
+          //           addr0 = getOrCreateDRow(firstRow);
+          //         } else {
+          //           addr0 = getOrCreateDRow(
+          //               allocator.getRowFromOffset(firstRow, gtLtIdx));
+          //         }
+          //       }
+
+          //       auto operand1 = *inst.operand1;
+          //       if (operand1.type == AddressType::Bitwise) {
+          //         addr1 = bRows[std::get<int>(operand1.data)];
+          //       } else {
+          //         assert(operand1.str_repr == "O0");
+          //         addr1 = maskRow;
+          //         std::cout << "Write to Mask\n";
+          //       }
+
+          //       opBuilder.create<AAPOp>(loc, addr0, addr1);
+          //     } else {
+          //       TypedValue<RowType> addr = bRows[std::get<int>(inst.operand0.data)];
+          //       opBuilder.create<APOp>(loc, addr);
+          //     }
+          //   }
+          // }
+            TypedValue<RowType> in0, in1;
+            if (gtLtIdx == 0) {
+              in0 = getOrCreateDRow(firstAddrIn0);
+              in1 = getOrCreateDRow(firstAddrIn1);
+            } else {
+              in0 = getOrCreateDRow(allocator.getRowFromOffset(firstAddrIn0, gtLtIdx));
+              in1 = getOrCreateDRow(allocator.getRowFromOffset(firstAddrIn1, gtLtIdx));
+            }
+            if (isMax) {
+              opBuilder.create<AAPOp>(loc, in0, bRows[1]);
+              opBuilder.create<AAPOp>(loc, in1, bRows[5]);
+            } else {
+              assert(isMin);
+              opBuilder.create<AAPOp>(loc, in0, bRows[5]);
+              opBuilder.create<AAPOp>(loc, in1, bRows[1]);
+            }
+            opBuilder.create<APOp>(loc, bRows[14]);
+          }
+          opBuilder.create<AAPOp>(loc, bRows[2], maskRow);
+        }
+
         int iterCount = !isMulF ? bitWidth : bitWidth - 1;
 
         int64_t iterIndex = 0;
@@ -539,28 +662,32 @@ struct ConvertBitsToPuD
                 addr0 = firstRows.lookup(operand0.str_repr);
               } else {
                 assert(operand0.type == AddressType::In);
-                auto firstRow = allocated[operand0.str_repr];
-                if (carryRows.contains(operand0.str_repr)) {
-                  if (iterIndex == 0) {
-                    addr0 = c0;
-                  } else {
-                    addr0 = carryRows.lookup(operand0.str_repr);
-                    if (!refreshedCin.contains(operand0.str_repr)) {
-                      const auto cinIdx = std::get<int>(operand0.data);
-                      const auto coutIdx = carryMap.lookup(cinIdx);
-                      auto carry = carryRows.lookup(
-                          std::format("O{}", coutIdx));
-                      opBuilder.create<AAPOp>(loc, carry, addr0);
-                      refreshedCin.insert(operand0.str_repr);
-                    }
-                  }
+                if ((isMax || isMin) && operand0.str_repr == "I2") {
+                  addr0 = maskRow;
                 } else {
-                  if (addrOffset == 0) {
-                    assert(firstRows.contains(operand0.str_repr));
-                    addr0 = firstRows.lookup(operand0.str_repr);
+                  auto firstRow = allocated[operand0.str_repr];
+                  if (carryRows.contains(operand0.str_repr)) {
+                    if (iterIndex == 0) {
+                      addr0 = c0;
+                    } else {
+                      addr0 = carryRows.lookup(operand0.str_repr);
+                      if (!refreshedCin.contains(operand0.str_repr)) {
+                        const auto cinIdx = std::get<int>(operand0.data);
+                        const auto coutIdx = carryMap.lookup(cinIdx);
+                        auto carry = carryRows.lookup(
+                            std::format("O{}", coutIdx));
+                        opBuilder.create<AAPOp>(loc, carry, addr0);
+                        refreshedCin.insert(operand0.str_repr);
+                      }
+                    }
                   } else {
-                    addr0 = getOrCreateDRow(
-                        allocator.getRowFromOffset(firstRow, addrOffset));
+                    if (addrOffset == 0) {
+                      assert(firstRows.contains(operand0.str_repr));
+                      addr0 = firstRows.lookup(operand0.str_repr);
+                    } else {
+                      addr0 = getOrCreateDRow(
+                          allocator.getRowFromOffset(firstRow, addrOffset));
+                    }
                   }
                 }
               }

@@ -127,6 +127,10 @@ struct ConvertArithToBits
         ConvertArithTensorOpToBits<arith::OrIOp, OrOp>>(&ctx);
     patterns.add<
         ConvertArithTensorOpToBits<arith::XOrIOp, XOrOp>>(&ctx);
+    patterns.add<
+        ConvertArithTensorOpToBits<arith::MaxUIOp, MaxOp>>(&ctx);
+    patterns.add<
+        ConvertArithTensorOpToBits<arith::MinUIOp, MinOp>>(&ctx);
     
     ConversionTarget target(ctx);
     target.markUnknownOpDynamicallyLegal([](...) { return true; });
@@ -136,6 +140,8 @@ struct ConvertArithToBits
     target.addIllegalOp<arith::AndIOp>();
     target.addIllegalOp<arith::OrIOp>();
     target.addIllegalOp<arith::XOrIOp>();
+    target.addIllegalOp<arith::MaxUIOp>();
+    target.addIllegalOp<arith::MinUIOp>();
 
     if (applyPartialConversion(func, target, std::move(patterns)).failed()) {
       signalPassFailure();

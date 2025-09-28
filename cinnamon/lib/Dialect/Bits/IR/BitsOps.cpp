@@ -240,3 +240,41 @@ LogicalResult XOrOp::verify() {
   
   return success();
 }
+
+LogicalResult MaxOp::verify() {
+  auto lhsType = cast<SliceType>(getLhs().getType());
+  auto rhsType = cast<SliceType>(getRhs().getType());
+  auto resType = cast<SliceType>(getResult().getType());
+
+  if (!lhsType || !rhsType || !resType)
+    return emitOpError("operands and result must all be of SliceType");
+
+  if (lhsType.getBitWidth() != rhsType.getBitWidth() ||
+      lhsType.getBitWidth() != resType.getBitWidth())
+    return emitOpError("bit widths of operands and result must match");
+
+  if (lhsType.getVectorLength() != resType.getVectorLength()
+      || rhsType.getVectorLength() != resType.getVectorLength())
+    return emitOpError("vector lengths of operands and result must match");
+  
+  return success();
+}
+
+LogicalResult MinOp::verify() {
+  auto lhsType = cast<SliceType>(getLhs().getType());
+  auto rhsType = cast<SliceType>(getRhs().getType());
+  auto resType = cast<SliceType>(getResult().getType());
+
+  if (!lhsType || !rhsType || !resType)
+    return emitOpError("operands and result must all be of SliceType");
+
+  if (lhsType.getBitWidth() != rhsType.getBitWidth() ||
+      lhsType.getBitWidth() != resType.getBitWidth())
+    return emitOpError("bit widths of operands and result must match");
+
+  if (lhsType.getVectorLength() != resType.getVectorLength()
+      || rhsType.getVectorLength() != resType.getVectorLength())
+    return emitOpError("vector lengths of operands and result must match");
+  
+  return success();
+}

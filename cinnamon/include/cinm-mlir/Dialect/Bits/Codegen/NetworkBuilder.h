@@ -28,7 +28,15 @@ public:
 
   const MIG &getMulFExponentNtk() const { return mulFExponentNtk; }
 
+  const MIG &getGTNtk() const { return gtNtk; }
+
+  const MIG &getLTNtk() const { return ltNtk; }
+
   bool isMulFNtk() { return isMulF; }
+
+  bool isMaxNtk() { return isMax; }
+
+  bool isMinNtk() { return isMin; }
 
   const DenseMap<int, int> &getCarryMap() const { return carryMap; }
 
@@ -83,17 +91,27 @@ private:
   MIG mig;
   MIG mulFSignNtk;
   MIG mulFExponentNtk;
+  MIG gtNtk;
+  MIG ltNtk;
   bool isMulF = false;
+  bool isMax = false;
+  bool isMin = false;
   DenseMap<Value, MIG::signal> migSignalMap;
   DenseMap<Value, MIG::signal> mulFSignSignalMap;
+  DenseMap<Value, MIG::signal> gtSignalMap;
+  DenseMap<Value, MIG::signal> ltSignalMap;
   DenseMap<int, int> carryMap;
   SmallVector<TypedValue<SliceType>> inputSlices;
   SmallVector<TypedValue<SliceType>, 1> outputSlices;
 
-  std::pair<MIG::signal, MIG::signal> buildAdd(MIG &tnk,
+  std::pair<MIG::signal, MIG::signal> buildAdd(MIG &ntk,
                                                MIG::signal const &lhs,
                                                MIG::signal const &rhs,
                                                MIG::signal const &cin);
+  MIG::signal buildMux2(MIG &ntk,
+                        MIG::signal const &s,
+                        MIG::signal const &lhs,
+                        MIG::signal const &rhs);
 
   bool operandsBuilt(Operation *op) const;
 };
