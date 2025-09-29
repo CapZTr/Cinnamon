@@ -88,10 +88,8 @@ struct ConvertBitsToPuD
     assert((int)isMulF + (int)isMax + (int)isMin <= 1);
     auto ntkInputs = builder.getInputSlices();
     const int inputNum = ntkInputs.size();
-    std::cout << inputNum << " inputs\n";
     auto carryMap = builder.getCarryMap();
     const int carryNum = carryMap.size();
-    std::cout << carryNum << " carries\n";
 
     // NetworkBuilder::debugPrint(mig);
 
@@ -410,7 +408,6 @@ struct ConvertBitsToPuD
             if (operand.str_repr == "O0") {
               auto maskRowAddr = allocator.allocate(1);
               maskRow = getOrCreateDRow(maskRowAddr);
-              std::cout << "Mask Allocated in " << maskRowAddr.str() << "\n";
               break;
             }
           }
@@ -426,7 +423,6 @@ struct ConvertBitsToPuD
               if (!allocated.contains(operand0.str_repr)) {
                 assert(roundIdx == 0);
                 auto addr = allocator.allocate(bitWidth);
-                std::cout << operand0.str_repr << " allocated in " << addr.str() << "\n";
                 allocated[operand0.str_repr] = addr;
                 auto firstRow = getOrCreateDRow(addr);
                 firstRows[operand0.str_repr] = firstRow;
@@ -443,7 +439,6 @@ struct ConvertBitsToPuD
               if (!allocated.contains(operand0.str_repr)) {
                 assert(roundIdx == 0);
                 if (isMax || isMin) {
-                  std::cout << operand0.str_repr << " do nothing\n";
                   // do nothing
                 } else {
                   auto addr = allocator.allocate(1);
@@ -475,7 +470,6 @@ struct ConvertBitsToPuD
             if (!allocated.contains(operand1.str_repr)) {
               assert(roundIdx == 0);
               auto addr = allocator.allocate(bitWidth);
-              std::cout << operand1.str_repr << " allocated in " << addr.str() << "\n";
               allocated[operand1.str_repr] = addr;
               auto firstRow = getOrCreateDRow(addr);
               firstRows[operand1.str_repr] = firstRow;

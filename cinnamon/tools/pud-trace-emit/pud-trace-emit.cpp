@@ -585,10 +585,10 @@ int main(int argc, char **argv) {
       doAND(andOp.getLhs(), andOp.getRhs(), andOp.getResult());
     } else if (auto orOp = dyn_cast<arith::OrIOp>(*op)) {
       assert(!isMulF);
-      doAND(orOp.getLhs(), orOp.getRhs(), orOp.getResult());
+      doOR(orOp.getLhs(), orOp.getRhs(), orOp.getResult());
     } else if (auto xorOp = dyn_cast<arith::XOrIOp>(*op)) {
       assert(!isMulF);
-      doAND(xorOp.getLhs(), xorOp.getRhs(), xorOp.getResult());
+      doXOR(xorOp.getLhs(), xorOp.getRhs(), xorOp.getResult());
     } else if (auto maxOp = dyn_cast<arith::MaxUIOp>(*op)) {
       assert(!isMulF);
       doMax(maxOp.getLhs(), maxOp.getRhs(), maxOp.getResult());
@@ -729,6 +729,8 @@ int main(int argc, char **argv) {
     }
   }
 
+  int apNum = 0, aapNum = 0;
+
   std::string resultAddr;
   module->walk([&](func::FuncOp func) {
     size_t inputIdx = 0;
@@ -772,6 +774,7 @@ int main(int argc, char **argv) {
         auto firstRow = load.getFirstRow();
         resultAddr = getAddressAsStr(firstRow);
       } else if (auto ap = dyn_cast<pud::APOp>(*op)) {
+        apNum++;
         auto row = ap.getAddr();
         assert(row.getType().getGroup() == 0);
         auto addr = getAddressAsStr(row);
@@ -786,6 +789,7 @@ int main(int argc, char **argv) {
           t.executeAP(getRowIndex(row));
         }
       } else if (auto aap = dyn_cast<pud::AAPOp>(*op)) {
+        aapNum++;
         auto row0 = aap.getSrcAddr();
         auto addr0 = getAddressAsStr(row0);
         int rowNum0 = 1;
@@ -876,6 +880,11 @@ int main(int argc, char **argv) {
   std::cout << "CPU result:\n" << cpuRes << "\n\n";
   loadAndEvaluateResult(resultAddr, isMulF);
 
+  std::cout << "===== Number of Generated Operations =====\n";
+  std::cout << "AP  " << apNum << "\n";
+  std::cout << "AAP " << aapNum << "\n";
+  std::cout << "==========================================\n\n";
+
   if (isMulF) {
     assert(cpuResAPFVec.size() == dramResAPFVec.size());
     for (size_t i = 0; i < cpuResAPFVec.size(); ++i) {
@@ -887,7 +896,7 @@ int main(int argc, char **argv) {
     std::cout << doubleMantissa << "\n";
     std::cout << other << "\n";
   }
-  printMaskRow();
+  // printMaskRow();
 
   std::ofstream trace_file(argv[2]);
   if (!trace_file.is_open()) {

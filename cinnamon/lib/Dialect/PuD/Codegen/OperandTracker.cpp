@@ -64,7 +64,6 @@ std::unique_ptr<OperandExpr> OperandTracker::executeAAP(
     return toClone->clone();
   } else {
     auto addr2 = *destination;
-    assert(addr2 <= 11);
     bGroupExpressions[addr2] = toClone->clone();
     if (addr2 <= 7) {
       if (addr2 >= 4) {
@@ -89,6 +88,28 @@ std::unique_ptr<OperandExpr> OperandTracker::executeAAP(
         case 11:
           bGroupExpressions[0] = toClone->clone();
           bGroupExpressions[3] = toClone->clone();
+          break;
+        case 12:
+          bGroupExpressions[0] = toClone->clone();
+          bGroupExpressions[1] = toClone->clone();
+          bGroupExpressions[2] = toClone->clone();
+          break;
+        case 13:
+          bGroupExpressions[1] = toClone->clone();
+          bGroupExpressions[2] = toClone->clone();
+          bGroupExpressions[3] = toClone->clone();
+          break;
+        case 14:
+          bGroupExpressions[4] = toClone->clone();
+          bGroupExpressions[1] = toClone->clone();
+          bGroupExpressions[2] = toClone->clone();
+          doNot(4);
+          break;
+        case 15:
+          bGroupExpressions[6] = toClone->clone();
+          bGroupExpressions[0] = toClone->clone();
+          bGroupExpressions[3] = toClone->clone();
+          doNot(6);
           break;
         default:
           break;
