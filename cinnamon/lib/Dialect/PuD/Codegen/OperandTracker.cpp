@@ -119,7 +119,8 @@ std::unique_ptr<OperandExpr> OperandTracker::executeAAP(
   }
 }
 
-std::unique_ptr<OperandExpr> OperandTracker::doMaj(int index1, int index2, int index3) {
+std::unique_ptr<OperandExpr> OperandTracker::doMaj(
+    int index1, int index2, int index3) {
   assert(bGroupExpressions[index1] && bGroupExpressions[index2]
       && bGroupExpressions[index3]
       && "doMaj operands must be initialized before use");

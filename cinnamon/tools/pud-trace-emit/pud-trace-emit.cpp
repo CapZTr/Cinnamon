@@ -1,6 +1,8 @@
 #include "cinm-mlir/Conversion/ArithToBits/ArithToBits.h"
 #include "cinm-mlir/Conversion/BitsToPuD/BitsToPuD.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsBase.h"
+#include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
+#include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 #include "cinm-mlir/Dialect/PuD/IR/PuDBase.h"
 #include "cinm-mlir/Dialect/PuD/IR/PuDDialect.h"
 #include "cinm-mlir/Dialect/PuD/IR/PuDOps.h"
@@ -75,7 +77,7 @@ std::string intToHex(const int64_t v) {
 }
 
 // For MulF Accuracy Analysis
-int total, within10pct, eSumSmallerBias, doubleMantissa, other = 0;
+int total, within10pct, eSumSmallerBias, doubleMantissa, other;
 llvm::SmallVector<llvm::APFloat> cpuResAPFVec;
 llvm::SmallVector<llvm::APFloat> dramResAPFVec;
 
@@ -322,15 +324,22 @@ llvm::APFloat getOrCreateFloatTestVal(Value v, size_t i, bool isRandom) {
 }
 
 llvm::APInt getOrCreateIntTestVal(Value v, size_t i) {
-  if (v.getDefiningOp() == nullptr) {
+  if (v.getDefiningOp() == nullptr ||
+      llvm::isa<mlir::bits::TransposeOp>(v.getDefiningOp())) {
     inputs.insert(v);
   }
   assert(i < VEC_LEN);
-  assert(llvm::isa<RankedTensorType>(v.getType()));
-  auto t = cast<RankedTensorType>(v.getType());
-  assert(t.getRank() == 1);
-  assert(llvm::isa<IntegerType>(t.getElementType()));
-  auto elemBitWidth = t.getElementTypeBitWidth();
+  // assert(llvm::isa<RankedTensorType>(v.getType()));
+  int64_t elemBitWidth;
+  if (llvm::isa<RankedTensorType>(v.getType())) {
+    auto t = cast<RankedTensorType>(v.getType());
+    assert(t.getRank() == 1);
+    assert(llvm::isa<IntegerType>(t.getElementType()));
+    elemBitWidth = t.getElementTypeBitWidth();
+  } else {
+    assert(llvm::isa<mlir::bits::SliceType>(v.getType()));
+    elemBitWidth = cast<mlir::bits::SliceType>(v.getType()).getBitWidth();
+  }
   if (bitWidth == 0) {
     bitWidth = elemBitWidth;
   } else {
@@ -415,6 +424,38 @@ void doMin(Value lhs, Value rhs, Value result) {
   testIntValMap[result] = resVec;
 }
 
+void doANDReduction(Value input, Value result) {
+  assert(!testIntValMap.contains(result));
+  llvm::SmallVector<llvm::APInt> resVec;
+  for (size_t i = 0; i < VEC_LEN; ++i) {
+    llvm::APInt res(1, getOrCreateIntTestVal(input, i).isAllOnes());
+    resVec.push_back(res);
+  }
+  testIntValMap[result] = resVec;
+}
+
+void doORReduction(Value input, Value result) {
+  assert(!testIntValMap.contains(result));
+  llvm::SmallVector<llvm::APInt> resVec;
+  for (size_t i = 0; i < VEC_LEN; ++i) {
+    llvm::APInt res(1, getOrCreateIntTestVal(input, i).getBoolValue());
+    resVec.push_back(res);
+  }
+  testIntValMap[result] = resVec;
+}
+
+void doXORReduction(Value input, Value result) {
+  assert(!testIntValMap.contains(result));
+  llvm::SmallVector<llvm::APInt> resVec;
+  for (size_t i = 0; i < VEC_LEN; ++i) {
+    auto x = getOrCreateIntTestVal(input, i);
+    for (unsigned s = 1; s < bitWidth; s <<= 1)
+      x ^= x.lshr(s);
+    resVec.push_back(llvm::APInt(1, x[0]));
+  }
+  testIntValMap[result] = resVec;
+}
+
 llvm::APFloat apfMul(const llvm::APFloat &a, const llvm::APFloat &b) {
   assert(&a.getSemantics() == &b.getSemantics() &&
       "APFloat semantics must match");
@@ -439,12 +480,13 @@ void doMultiplication(Value lhs, Value rhs, Value product) {
 
 llvm::StringMap<llvm::SmallVector<std::unique_ptr<OperandExpr>>> exprMap;
 
-std::string resultIntString(const llvm::SmallVector<llvm::APInt> &resVec) {
+std::string resultIntString(
+    const llvm::SmallVector<llvm::APInt> &resVec, bool isRed) {
   assert(resVec.size() == VEC_LEN);
   std::string resLine = "[";
   for (size_t i = 0; i < VEC_LEN; ++i) {
     llvm::SmallString<64> resStr;
-    resVec[i].toString(resStr, 10, true);
+    resVec[i].toString(resStr, 10, !isRed);
     std::string s(resStr.begin(), resStr.end());
     resLine += s;
     resLine += ", ";
@@ -497,14 +539,15 @@ void storeAndInitInput(std::string baseAddr, size_t inputIdx, bool isMulF) {
   }
 }
 
-void loadAndEvaluateResult(std::string baseAddr, bool isMulF) {
+void loadAndEvaluateResult(std::string baseAddr, bool isMulF, bool isRed) {
   unsigned long long base = std::stoull(baseAddr, nullptr, 0);
   llvm::SmallVector<llvm::APInt> outputVec;
   for (size_t i = 0; i < VEC_LEN; ++i) {
     outputVec.push_back(llvm::APInt::getZero(bitWidth));
   }
-  for (size_t i = 0; i < bitWidth; ++i) {
-    auto bitIdx = bitWidth - i - 1;
+  int iterCount = isRed ? 1 : bitWidth;
+  for (int i = 0; i < iterCount; ++i) {
+    auto bitIdx = isRed ? 0 : bitWidth - i - 1;
     auto addr = intToHex(base + i);
     assert(exprMap.contains(addr));
     const auto &exprVec = exprMap[addr];
@@ -515,7 +558,7 @@ void loadAndEvaluateResult(std::string baseAddr, bool isMulF) {
     }
   }
   if (!isMulF) {
-    std::cout << "DRAM result:\n" << resultIntString(outputVec) << "\n\n";
+    std::cout << "DRAM result:\n" << resultIntString(outputVec, isRed) << "\n\n";
   } else {
     llvm::SmallVector<APFloat> floatVec;
     for (const auto &apInt : outputVec) {
@@ -552,12 +595,12 @@ std::string getTraceLine(const int cycle, const std::string &opName,
 }
 
 int main(int argc, char **argv) {
-  MLIRContext context;
   DialectRegistry registry;
   registerAllDialects(registry);
-  context.appendDialectRegistry(registry);
+  // context.appendDialectRegistry(registry);
 
   registry.insert<mlir::bits::BitsDialect, pud::PuDDialect>();
+  MLIRContext context(registry);
   
   llvm::SourceMgr srcMgr;
   auto buffer = openInputFile(argv[1]);
@@ -575,7 +618,9 @@ int main(int argc, char **argv) {
 
   std::string cpuRes;
   bool isMulF = false;
+  bool isRed = false;
   func::FuncOp fp = *module->getOps<func::FuncOp>().begin();
+  Value toRet;
   fp.walk([&](Operation *op) {
     if (auto add = dyn_cast<arith::AddIOp>(*op)) {
       assert(!isMulF);
@@ -595,17 +640,33 @@ int main(int argc, char **argv) {
     } else if (auto minOp = dyn_cast<arith::MinUIOp>(*op)) {
       assert(!isMulF);
       doMin(minOp.getLhs(), minOp.getRhs(), minOp.getResult());
+    } else if (auto andRed = dyn_cast<mlir::bits::ReduceAndOp>(*op)) {
+      isRed = true;
+      assert(!isMulF);
+      toRet = andRed.getResult();
+      doANDReduction(andRed.getInput(), andRed.getResult());
+    } else if (auto orRed = dyn_cast<mlir::bits::ReduceOrOp>(*op)) {
+      isRed = true;
+      assert(!isMulF);
+      toRet = orRed.getResult();
+      doORReduction(orRed.getInput(), orRed.getResult());
+    } else if (auto xorRed = dyn_cast<mlir::bits::ReduceXOrOp>(*op)) {
+      isRed = true;
+      assert(!isMulF);
+      toRet = xorRed.getResult();
+      doXORReduction(xorRed.getInput(), xorRed.getResult());
     } else if (auto mul = dyn_cast<arith::MulFOp>(*op)) {
       if (!isMulF) {
         isMulF = true;
       }
       doMultiplication(mul.getLhs(), mul.getRhs(), mul.getResult());
     } else if (auto ret = dyn_cast<func::ReturnOp>(*op)) {
-      const Value toRet = ret.getOperand(0);
+      if (!isRed)
+        toRet = ret.getOperand(0);
       if (testIntValMap.contains(toRet)) {
         assert(!testFloatValMap.contains(toRet));
         const auto &resVec = testIntValMap[toRet];
-        cpuRes = resultIntString(resVec);
+        cpuRes = resultIntString(resVec, isRed);
       } else {
         assert(testFloatValMap.contains(toRet));
         const auto &resVec = testFloatValMap[toRet];
@@ -631,7 +692,7 @@ int main(int argc, char **argv) {
   for (const auto &in : inputs) {
     if (!isMulF) {
       assert(testIntValMap.contains(in));
-      std::cout << resultIntString(testIntValMap[in]) << "\n";
+      std::cout << resultIntString(testIntValMap[in], isRed) << "\n";
     } else {
       assert(testFloatValMap.contains(in));
       std::cout << resultFloatString(testFloatValMap[in]) << "\n";
@@ -878,7 +939,7 @@ int main(int argc, char **argv) {
   });
 
   std::cout << "CPU result:\n" << cpuRes << "\n\n";
-  loadAndEvaluateResult(resultAddr, isMulF);
+  loadAndEvaluateResult(resultAddr, isMulF, isRed);
 
   std::cout << "===== Number of Generated Operations =====\n";
   std::cout << "AP  " << apNum << "\n";

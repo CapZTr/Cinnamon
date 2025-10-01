@@ -88,6 +88,7 @@ struct ConvertBitsToPuD
     assert((int)isMulF + (int)isMax + (int)isMin <= 1);
     auto ntkInputs = builder.getInputSlices();
     const int inputNum = ntkInputs.size();
+    const bool isRed = inputNum == 1 ? true : false;
     auto carryMap = builder.getCarryMap();
     const int carryNum = carryMap.size();
 
@@ -224,8 +225,13 @@ struct ConvertBitsToPuD
     }
     TypedValue<RowType> maskRow;
     const auto vecLen = transpose.getOutput().getType().getVectorLength();
-    const auto tensorType = cast<RankedTensorType>(
+    auto tensorType = cast<RankedTensorType>(
         transpose.getInput().getType());
+    if (isRed) {
+      auto i1Type = IntegerType::get(tensorType.getContext(), 1);
+      tensorType = RankedTensorType::get(
+          tensorType.getShape(), i1Type, tensorType.getEncoding());
+    }
 
     Block *newEntry = new Block();
     func.getBody().push_back(newEntry);
@@ -364,7 +370,8 @@ struct ConvertBitsToPuD
       lastSliceVecLen = maxColNum;
     int round = (vecLen - 1) / maxColNum + 1;
     const Value maxColVal = getOrCreateI64Val(maxColNum);
-    auto standardSliceType = SliceType::get(ctx, bitWidth, maxColNum);
+    auto standardSliceType = isRed ? SliceType::get(ctx, 1, maxColNum)
+        : SliceType::get(ctx, bitWidth, maxColNum);
     
     SmallVector<SmallVector<TypedValue<SliceType>>> slicesToStore;
     for (const auto &oldSlice : ntkInputs) {
@@ -438,7 +445,7 @@ struct ConvertBitsToPuD
             } else {
               if (!allocated.contains(operand0.str_repr)) {
                 assert(roundIdx == 0);
-                if (isMax || isMin) {
+                if (isMax || isMin || isRed) {
                   // do nothing
                 } else {
                   auto addr = allocator.allocate(1);
@@ -456,14 +463,18 @@ struct ConvertBitsToPuD
           auto operand1 = *inst.operand1;
           if (operand1.type == AddressType::Out) {
             const auto index = std::get<int>(operand1.data);
-            if (operand1.type == AddressType::Out && index < carryNum) {
+            if (index < carryNum || isRed) {
               if (!allocated.contains(operand1.str_repr)) {
                 assert(roundIdx == 0);
                 auto addr = allocator.allocate(1);
                 allocated[operand1.str_repr] = addr;
-                auto coutRow = getOrCreateDRow(addr);
-                assert(!carryRows.contains(operand1.str_repr));
-                carryRows.try_emplace(operand1.str_repr, coutRow);
+                auto outRow = getOrCreateDRow(addr);
+                if (isRed) {
+                  outputFirstRow = outRow;
+                } else {
+                  assert(!carryRows.contains(operand1.str_repr));
+                  carryRows.try_emplace(operand1.str_repr, outRow);
+                }
               }
               continue;
             }
@@ -625,13 +636,16 @@ struct ConvertBitsToPuD
           opBuilder.create<AAPOp>(loc, bRows[2], maskRow);
         }
 
-        int iterCount = !isMulF ? bitWidth : bitWidth - 1;
+        int iterCount = isMulF ? bitWidth - 1 : bitWidth;
 
         int64_t iterIndex = 0;
         int64_t addrOffset = bitWidth;
         while (iterIndex < iterCount) {
           addrOffset--;
+          if (iterIndex == 2 && isRed)
+            addrOffset--;
           llvm::StringSet<> refreshedCin;
+          TypedValue<RowType> i1RowForReduction;
           for (auto &inst : program) {
 
             if (inst.type == Instruction::Type::AP) {
@@ -658,6 +672,18 @@ struct ConvertBitsToPuD
                 assert(operand0.type == AddressType::In);
                 if ((isMax || isMin) && operand0.str_repr == "I2") {
                   addr0 = maskRow;
+                } else if (isRed && operand0.str_repr == "I1") {
+                  if (iterIndex == 0) {
+                    if (!i1RowForReduction) {
+                      auto firstRow = allocated["I0"];
+                      addr0 = getOrCreateDRow(
+                          allocator.getRowFromOffset(firstRow, addrOffset - 1));
+                    } else {
+                      addr0 = i1RowForReduction;
+                    }
+                  } else {
+                    continue;
+                  }
                 } else {
                   auto firstRow = allocated[operand0.str_repr];
                   if (carryRows.contains(operand0.str_repr)) {
@@ -695,7 +721,19 @@ struct ConvertBitsToPuD
               }
               else {
                 assert(operand1.type == AddressType::Out);
-                if (carryRows.contains(operand1.str_repr)) {
+                if (isRed) {
+                  if (iterIndex == iterCount - 1) {
+                    addr1 = outputFirstRow;
+                  } else {
+                    if (program.size() > 4) {
+                      addr1 = bRows[7];
+                      // continue;
+                    } else {
+                      opBuilder.create<APOp>(loc, addr0);
+                      continue;
+                    }
+                  }
+                } else if (carryRows.contains(operand1.str_repr)) {
                   assert(operand1.type == AddressType::Out);
                   const auto outputIdx = std::get<int>(operand1.data);
                   assert(outputIdx < carryNum);
@@ -718,6 +756,8 @@ struct ConvertBitsToPuD
           }
 
           iterIndex++;
+          if (iterIndex == 1 && isRed)
+            iterIndex++;
 
         }
 
@@ -864,7 +904,8 @@ struct ConvertBitsToPuD
 
       SliceType sType = standardSliceType;
       if (roundIdx + 1 == round) {
-        sType = SliceType::get(ctx, bitWidth, lastSliceVecLen);
+        sType = isRed ? SliceType::get(ctx, 1, lastSliceVecLen)
+            : SliceType::get(ctx, bitWidth, lastSliceVecLen);
       }
       TypedValue<SliceType> slice = opBuilder.create<LoadOp>(
           loc, sType, outputFirstRow, getOrCreateI64Val(bitWidth));
@@ -878,7 +919,8 @@ struct ConvertBitsToPuD
         auto second = outputSlices[i];
         auto vecLen = resultSlice.getType().getVectorLength() +
             second.getType().getVectorLength();
-        auto sType = SliceType::get(ctx, bitWidth, vecLen);
+        auto sType = isRed ? SliceType::get(ctx, 1, vecLen)
+            : SliceType::get(ctx, bitWidth, vecLen);
         resultSlice = opBuilder.create<MergeSliceVerticallyOp>(
             loc,
             sType,

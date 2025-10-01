@@ -36,7 +36,8 @@ LogicalResult NetworkBuilder::build() {
       }
       inputSlices.push_back(slice);
     } else if (isa<AddIOp>(op) || isa<MulFOp>(op) || isa<AndOp>(op)
-        || isa<OrOp>(op) || isa<XOrOp>(op) || isa<MaxOp>(op) || isa<MinOp>(op))
+        || isa<OrOp>(op) || isa<XOrOp>(op) || isa<MaxOp>(op) || isa<MinOp>(op)
+        || isa<ReduceAndOp>(op) || isa<ReduceOrOp>(op) || isa<ReduceXOrOp>(op))
     {
       pendingBinaryOps.push_back(op);
     } else if (auto assembleOp = dyn_cast<AssembleOp>(op)) {
@@ -107,6 +108,24 @@ LogicalResult NetworkBuilder::build() {
           auto lhs = migSignalMap.lookup(xorOp.getLhs());
           auto rhs = migSignalMap.lookup(xorOp.getRhs());
           migSignalMap[xorOp.getResult()] = mig.create_xor(lhs, rhs);
+          it = pendingBinaryOps.erase(it);
+          progress = true;
+        } else if (auto redAnd = dyn_cast<ReduceAndOp>(*it)) {
+          auto in0 = migSignalMap.lookup(redAnd.getInput());
+          migSignalMap[redAnd.getResult()] = mig.create_and(
+              in0, mig.create_pi());
+          it = pendingBinaryOps.erase(it);
+          progress = true;
+        } else if (auto redOr = dyn_cast<ReduceOrOp>(*it)) {
+          auto in0 = migSignalMap.lookup(redOr.getInput());
+          migSignalMap[redOr.getResult()] = mig.create_or(
+              in0, mig.create_pi());
+          it = pendingBinaryOps.erase(it);
+          progress = true;
+        } else if (auto redXor = dyn_cast<ReduceXOrOp>(*it)) {
+          auto in0 = migSignalMap.lookup(redXor.getInput());
+          migSignalMap[redXor.getResult()] = mig.create_xor(
+              in0, mig.create_pi());
           it = pendingBinaryOps.erase(it);
           progress = true;
         } else if (auto mul = dyn_cast<MulFOp>(*it)) {

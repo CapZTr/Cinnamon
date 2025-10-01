@@ -165,6 +165,51 @@ def XOrOp : Bits_Op<"xor", [Pure]> {
   let hasVerifier = 1;
 }
 
+def ReduceAndOp : Bits_Op<"and_red", [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let arguments = (ins
+    SliceType:$input
+  );
+  let results = (outs
+    SliceType:$result
+  );
+
+  let assemblyFormat = "$input attr-dict `:` "
+      "qualified(type($input)) `->` qualified(type($result))";
+}
+
+def ReduceOrOp : Bits_Op<"or_red", [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let arguments = (ins
+    SliceType:$input
+  );
+  let results = (outs
+    SliceType:$result
+  );
+
+  let assemblyFormat = "$input attr-dict `:` "
+      "qualified(type($input)) `->` qualified(type($result))";
+}
+
+def ReduceXOrOp : Bits_Op<"xor_red", [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let arguments = (ins
+    SliceType:$input
+  );
+  let results = (outs
+    SliceType:$result
+  );
+
+  let assemblyFormat = "$input attr-dict `:` "
+      "qualified(type($input)) `->` qualified(type($result))";
+}
+
 def MaxOp : Bits_Op<"max", [Pure]> {
   let summary = "Bit-serial max of two slice operands";
   let description = [{}];
