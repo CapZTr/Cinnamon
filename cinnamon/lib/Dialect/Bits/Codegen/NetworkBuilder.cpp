@@ -1,5 +1,6 @@
 #include "cinm-mlir/Dialect/Bits/Codegen/NetworkBuilder.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
+#include "mockturtle/generators/arithmetic.hpp"
 
 #include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/SmallVector.h>
@@ -84,7 +85,8 @@ LogicalResult NetworkBuilder::build() {
           auto lhs = migSignalMap.lookup(add.getLhs());
           auto rhs = migSignalMap.lookup(add.getRhs());
           auto cin = mig.create_pi();
-          auto [sum, cout] = buildAdd(mig, lhs, rhs, cin);
+          auto [sum, cout] = mockturtle::full_adder(mig, lhs, rhs, cin);
+          mig.create_po(cout);
           migSignalMap[add.getResult()] = sum;
           const int cinIdex = mig.num_pis() - 1;
           assert(!carryMap.contains(cinIdex));

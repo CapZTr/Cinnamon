@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <llvm/Support/LogicalResult.h>
 
 #include <iostream>
@@ -16,7 +17,7 @@ struct BitwiseOperand {
   bool inverted;
 };
 
-enum class AddressType { In, Out, Spill, Const, Bitwise };
+enum class AddressType { Data, Const, Bitwise };
 struct Address {
   AddressType type;
   std::variant<int, bool, std::vector<BitwiseOperand>> data;
@@ -48,6 +49,8 @@ public:
       }
       std::cout << s << '\n';
     }
+    std::cout << "-----------------------------\n";
+    std::cout << "Parsed " << program.size() << " instructions.\n";
     std::cout << "=============================\n\n";
   }
 
@@ -60,8 +63,12 @@ private:
   void skipWhitespace();
   char peek() const;
   void advance();
+  bool match(char c);
   int parseNumber();
-  Address parseAddress();
+  Instruction parseRC(size_t lineEnd);
+  Instruction parseTRA(size_t lineEnd);
+  Address parseAddress(size_t addrEnd);
+  std::vector<BitwiseOperand> parseBitwiseOperands(size_t addrEnd);
   BitwiseOperand parseBitwiseOperand();
   void normalizeBitwiseAddress(Address &addr);
 };

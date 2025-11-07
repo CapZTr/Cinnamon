@@ -2,8 +2,11 @@
 
 #include <cassert>
 #include <cctype>
+#include <cstddef>
+#include <cstring>
 #include <format>
 #include <llvm/Support/LogicalResult.h>
+#include <optional>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -13,30 +16,32 @@ ProgramParser::ProgramParser(std::string input) : input(input) {}
 
 llvm::LogicalResult ProgramParser::parse() {
   while (position < input.size()) {
-    skipWhitespace();
-    if (position >= input.size()) break;
-
+    size_t lineStart = position;
+    size_t lineEnd = input.find('\n', position);
+    if (lineEnd == std::string::npos) {
+      lineEnd = input.size();
+    }
+    size_t i = lineStart;
+    while (i < lineEnd && std::isspace(input[i] && input[i] != '\n')) {
+      ++i;
+    }
+    if ((i >= lineEnd) || (i + 1 < lineEnd && input[i] == '/' && input[i + 1] == '/')) {
+      position = (lineEnd < input.size()) ? lineEnd + 1 : lineEnd;
+      currentLine++;
+      continue;
+    }
     std::string instr;
     while (std::isalpha(peek())) {
       instr += peek();
       advance();
     }
-
     assert(!instr.empty());
-
     Instruction instruction;
-
-    if (instr == "AAP") {
-      instruction.type = Instruction::Type::AAP;
-      skipWhitespace();
-      instruction.operand0 = parseAddress();
-      skipWhitespace();
-      instruction.operand1 = parseAddress();
+    if (instr == "RC") {
+      instruction = parseRC(lineEnd);
     } else {
-      assert(instr == "AP");
-      instruction.type = Instruction::Type::AP;
-      skipWhitespace();
-      instruction.operand0 = parseAddress();
+      assert(instr == "TRA");
+      instruction = parseTRA(lineEnd);
     }
 
     program.push_back(std::move(instruction));
@@ -52,8 +57,7 @@ llvm::LogicalResult ProgramParser::parse() {
 }
 
 void ProgramParser::skipWhitespace() {
-  while (position < input.size() && std::isspace(input[position])) {
-    if (input[position] == '\n') currentLine++;
+  while (position < input.size() && std::isspace(input[position]) && input[position] != '\n') {
     position++;
   }
 }
@@ -69,6 +73,14 @@ void ProgramParser::advance() {
   }
 }
 
+bool ProgramParser::match(char c) {
+  if (peek() == c) {
+    advance();
+    return true;
+  }
+  return false;
+}
+
 int ProgramParser::parseNumber() {
   int val = 0;
   while (std::isdigit(peek())) {
@@ -78,92 +90,155 @@ int ProgramParser::parseNumber() {
   return val;
 }
 
-Address ProgramParser::parseAddress() {
-  const char c = peek();
-  Address addr;
-
-  if (c == 'I' || c == 'O' || c == 'S') {
-    advance();
-    int index = parseNumber();
-
-    addr.type = (c == 'I') ? AddressType::In :
-        (c == 'O') ? AddressType::Out : AddressType::Spill;
-    addr.data = index;
-    addr.str_repr = std::format("{}{}", c, index);
-  } else if (c == 'C') {
-    advance();
-    addr.type = AddressType::Const;
-    if (peek() == '0') {
-      addr.data = false;
-      addr.str_repr = std::format("{}{}", c, 0);
-    } else {
-      assert(peek() == '1');
-      addr.data = true;
-      addr.str_repr = std::format("{}{}", c, 1);
-    }
-    advance();
-  } else if (c == '~') {
-    advance();
-    BitwiseOperand operand = parseBitwiseOperand();
-    operand.inverted = true;
-    addr.type = AddressType::Bitwise;
-    addr.data = std::vector<BitwiseOperand>{operand};
-  } else if (c == '[') {
-    advance();
-    std::vector<BitwiseOperand> operands;
-
-    while (true) {
-      skipWhitespace();
-      if (peek() == ']') {
-        advance();
-        break;
-      }
-
-      bool inverted = false;
-      if (peek() == '~') {
-        inverted = true;
-        advance();
-      }
-
-      BitwiseOperand operand = parseBitwiseOperand();
-      operand.inverted = inverted;
-      operands.push_back(operand);
-
-      skipWhitespace();
-      if (peek() == ',') {
-        advance();
-      } else {
-        assert(peek() == ']');
-      }
-    }
-
-    addr.type = AddressType::Bitwise;
-    addr.data = operands;
-  } else {
-    BitwiseOperand operand = parseBitwiseOperand();
-    addr.type = AddressType::Bitwise;
-    addr.data = std::vector<BitwiseOperand>{operand};
+Instruction ProgramParser::parseRC(size_t lineEnd) {
+  Instruction inst;
+  bool inverted = false;
+  if (match('_')) {
+    assert(input.substr(position, 3) == "INV");
+    position += 3;
+    inverted = true;
   }
+  assert(match('(') && "expected '(' after RC");
+  if (inverted) {
+    assert(input.substr(position, 3) == "DCC");
+  }
+  inst.type = Instruction::Type::AAP;
+  size_t srcEnd = input.find(')', position);
+  assert(srcEnd != std::string::npos);
+  inst.operand0 = parseAddress(srcEnd);
+  if (inverted) {
+    auto index = std::get<int>(inst.operand0.data);
+    if (index == 4) {
+      inst.operand0.data = 5;
+      inst.operand0.str_repr = "B5";
+    } else {
+      assert(index == 6);
+      inst.operand0.data = 7;
+      inst.operand0.str_repr = "B7";
+    }
+  }
+  assert(position == srcEnd && match(')'));
+  skipWhitespace();
+  assert(match('-'));
+  assert(match('>'));
+  skipWhitespace();
+  assert(match('('));
+  size_t dstEnd = input.find(')', position);
+  assert(dstEnd != std::string::npos);
+  inst.operand1 = parseAddress(dstEnd);
+  assert(match(')'));
+  assert(position == lineEnd);
+  return inst;
+}
 
-  if (addr.type == AddressType::Bitwise) normalizeBitwiseAddress(addr);
+Instruction ProgramParser::parseTRA(size_t lineEnd) {
+  assert(match('(') && "expected '(' after TRA");
+  Instruction inst;
+  size_t traEnd = input.find(')', position);
+  assert(traEnd != std::string::npos);
+  inst.operand0 = parseAddress(traEnd);
+  assert(position == traEnd && match(')'));
+  if (position == lineEnd) {
+    inst.type = Instruction::Type::AP;
+    inst.operand1 = std::nullopt;
+  } else {
+    skipWhitespace();
+    assert(match('-'));
+    assert(match('>'));
+    skipWhitespace();
+    assert(match('('));
+    size_t dstEnd = input.find(')', position);
+    assert(dstEnd != std::string::npos);
+    inst.operand1 = parseAddress(dstEnd);
+    assert(match(')'));
+    inst.type = Instruction::Type::AAP;
+  }
+  return inst;
+}
 
-  return addr;
+Address ProgramParser::parseAddress(size_t addrEnd) {
+  Address addr;
+  if (match('D')) {
+    if (match('[')) {
+      int index = parseNumber();
+      assert(match(']') && position == addrEnd);
+      addr.type = AddressType::Data;
+      addr.data = index;
+      addr.str_repr = std::format("D{}", index);
+      return addr;
+    } else {
+      position--;
+      addr.type = AddressType::Bitwise;
+      addr.data = parseBitwiseOperands(addrEnd);
+      normalizeBitwiseAddress(addr);
+      assert(position == addrEnd);
+      return addr;
+    }
+  } else if (std::strncmp(&input[position], "true", 4) == 0) {
+    position+=4;
+    addr.type = AddressType::Const;
+    addr.data = true;
+    addr.str_repr = "C1";
+    assert(position == addrEnd);
+    return addr;
+  } else if (std::strncmp(&input[position], "false", 5) == 0) {
+    position+=5;
+    addr.type = AddressType::Const;
+    addr.data = false;
+    addr.str_repr = "C0";
+    assert(position == addrEnd);
+    return addr;
+  } else {
+    assert(match('T') || match('!'));
+    position--;
+    addr.type = AddressType::Bitwise;
+    addr.data = parseBitwiseOperands(addrEnd);
+    normalizeBitwiseAddress(addr);
+    assert(position == addrEnd);
+    return addr;
+  }
+}
+
+std::vector<BitwiseOperand> ProgramParser::parseBitwiseOperands(size_t addrEnd) {
+  std::vector<BitwiseOperand> operands;
+  while (position < addrEnd) {
+    skipWhitespace();
+    assert(match('T') || match('D') || match('!'));
+    position--;
+    operands.emplace_back(parseBitwiseOperand());
+    if (position < addrEnd) {
+      assert(match(','));
+      assert(match(' '));
+      assert(position < addrEnd);
+    }
+  }
+  return operands;
 }
 
 BitwiseOperand ProgramParser::parseBitwiseOperand() {
   BitwiseOperand operand;
-
-  if (peek() == 'T') {
+  if (match('T')) {
     operand.type = BitwiseOperandType::T;
-    advance();
+    assert(match('['));
     operand.index = parseNumber();
-  } else {
-    assert(input.substr(position, 3) == "DCC");
+    operand.inverted = false;
+    assert(match(']'));
+  } else if (input.substr(position, 3) == "DCC") {
     position += 3;
+    assert(match('['));
     operand.type = BitwiseOperandType::DCC;
     operand.index = parseNumber();
+    operand.inverted = false;
+    assert(match(']'));
+  } else {
+    assert(input.substr(position, 4) == "!DCC");
+    position+=4;
+    assert(match('['));
+    operand.type = BitwiseOperandType::DCC;
+    operand.index = parseNumber();
+    operand.inverted = true;
+    assert(match(']'));
   }
-
   return operand;
 }
 

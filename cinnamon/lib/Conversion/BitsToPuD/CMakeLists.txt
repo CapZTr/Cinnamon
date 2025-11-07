@@ -26,6 +26,8 @@ add_mlir_conversion_library(MLIRBitsToPuD
     PuDIR
 )
 
+target_link_libraries(MLIRBitsToPuD PUBLIC PuDCodegen)
+
 target_include_directories(MLIRBitsToPuD PRIVATE
   ${CMAKE_SOURCE_DIR}/extern/lime/mockturtle/include
   ${CMAKE_SOURCE_DIR}/extern/lime/src
