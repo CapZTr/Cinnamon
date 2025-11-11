@@ -10,6 +10,7 @@
 #include "cinm-mlir/Conversion/CinmPasses.h"
 #include "cinm-mlir/Conversion/CnmPasses.h"
 #include "cinm-mlir/Conversion/MemristorPasses.h"
+#include "cinm-mlir/Conversion/PuDPasses.h"
 #include "cinm-mlir/Conversion/UPMEMPasses.h"
 #include "cinm-mlir/Conversion/UPMEMToLLVM/UPMEMToLLVM.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsBase.h"
@@ -72,6 +73,7 @@ int main(int argc, char *argv[]) {
   registerCimConversionPasses();
   registerCnmConversionPasses();
   registerMemristorConversionPasses();
+  registerPuDConversionPasses();
   cim::registerCimTransformsPasses();
   cnm::registerCnmBufferizationExternalModels(registry);
   cnm::registerCnmTransformsPasses();

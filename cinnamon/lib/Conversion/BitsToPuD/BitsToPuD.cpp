@@ -406,7 +406,6 @@ struct ConvertBitsToPuD
       //   }
       // }
 
-      allocator.printStatus();
       for (auto &inst : program) {
         if (inst.type == Instruction::Type::AAP) {
           auto operand0 = inst.operand0;
@@ -416,8 +415,6 @@ struct ConvertBitsToPuD
               if (!allocated.contains(operand0.str_repr)) {
                 assert(roundIdx == 0);
                 auto addr = allocator.allocate(bitWidth);
-                std::cout << operand0.str_repr << " 419\n";
-                allocator.printStatus();
                 allocated[operand0.str_repr] = addr;
                 auto firstRow = getOrCreateDRow(addr);
                 firstRows[operand0.str_repr] = firstRow;
@@ -437,8 +434,6 @@ struct ConvertBitsToPuD
                   // do nothing
                 } else {
                   auto addr = allocator.allocate(1);
-                  std::cout << operand0.str_repr << " 440\n";
-                  allocator.printStatus();
                   allocated[operand0.str_repr] = addr;
                   auto cinRow = getOrCreateDRow(addr);
                   assert(!carryRows.contains(operand0.str_repr));
@@ -452,9 +447,6 @@ struct ConvertBitsToPuD
           if (operand1.type == AddressType::Data) {
             const auto index = std::get<int>(operand1.data);
             assert(index >= inputNum);
-            std::cout << index << " HERE\n";
-            std::cout << inputNum << "\n";
-            std::cout << carryNum << "\n";
             if (index - inputNum < carryNum * 2 || isRed) {
               if (!allocated.contains(operand1.str_repr)) {
                 assert(roundIdx == 0);
@@ -469,7 +461,6 @@ struct ConvertBitsToPuD
                   assert(carryRows.contains(cinName) && allocated.contains(cinName));
                   allocated.try_emplace(operand1.str_repr, allocated.lookup(cinName));
                   carryRows.try_emplace(operand1.str_repr, carryRows.lookup(cinName));
-                  std::cout << operand1.str_repr << "\n";
                 }
               }
               continue;
@@ -477,8 +468,6 @@ struct ConvertBitsToPuD
             if (!allocated.contains(operand1.str_repr) && index == inputNum + carryNum * 2) {
               assert(roundIdx == 0);
               auto addr = allocator.allocate(bitWidth);
-              std::cout << operand1.str_repr << " 476\n";
-              allocator.printStatus();
               allocated[operand1.str_repr] = addr;
               auto firstRow = getOrCreateDRow(addr);
               firstRows[operand1.str_repr] = firstRow;
@@ -722,7 +711,6 @@ struct ConvertBitsToPuD
                 } else {
                   auto firstRow = allocated[operand1.str_repr];
                   if (addrOffset == 0) {
-                    std::cout << operand1.str_repr << "\n";
                     assert(firstRows.contains(operand1.str_repr));
                     addr1 = firstRows.lookup(operand1.str_repr);
                   } else {
