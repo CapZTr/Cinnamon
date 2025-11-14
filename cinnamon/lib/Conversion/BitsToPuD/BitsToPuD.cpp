@@ -113,7 +113,7 @@ struct ConvertBitsToPuD
       signalPassFailure();
     }
     std::vector<Instruction> program = parser.getProgram();
-    parser.printProgram();
+    // parser.printProgram();
 
     // // MulFSignNtk and MulFExponentNtk
     // std::vector<Instruction> program_mulf_sign;

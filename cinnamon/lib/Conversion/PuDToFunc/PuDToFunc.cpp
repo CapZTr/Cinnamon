@@ -48,7 +48,6 @@ struct ConvertPuDToFunc
         return existing;
       auto loc = module.getLoc();
       auto fn  = builder.create<func::FuncOp>(loc, name, type);
-      fn.setPrivate();
       return fn;
     };
 
