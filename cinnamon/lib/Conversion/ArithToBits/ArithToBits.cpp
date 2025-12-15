@@ -42,13 +42,6 @@ struct SliceCache {
   }
 };
 
-// struct AddResultCache {
-//   static llvm::DenseMap<AddIOp, llvm::SmallVector<SliceType, 2>> &get() {
-//     static llvm::DenseMap<AddIOp, llvm::SmallVector<SliceType, 2>> cache;
-//     return cache;
-//   }
-// };
-
 template<typename SourceOp, typename TargetOp>
 struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
   using OpConversionPattern<SourceOp>::OpConversionPattern;
