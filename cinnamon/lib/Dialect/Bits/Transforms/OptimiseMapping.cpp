@@ -25,7 +25,7 @@ namespace mlir::bits {
 //===----------------------------------------------------------------------===//
 
 int numBanks = 32;
-int cloneDelay = 1;
+int cloneDelay = 2;
 
 struct Node {
   AddIOp op;
@@ -70,7 +70,7 @@ void modelAndSolveILP(const DAG &dag) {
   }
 
   for (int i = 0; i < N; ++i) {
-    model.addConstr(end[i] == start[i] + 1, "duration_" + std::to_string(i));
+    model.addConstr(end[i] == start[i] + 3, "duration_" + std::to_string(i));
   }
 
   std::vector<std::vector<bool>> dep(N, std::vector(N, false));
@@ -91,7 +91,7 @@ void modelAndSolveILP(const DAG &dag) {
   }
 
   GRBLinExpr totalClones = 0;
-  const int M = 1000000;
+  const int M = 100;
   for (int i = 0; i < N; ++i) {
     for (int j : dag.nodes[i].succs) {
       GRBVar cloneVar = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
@@ -109,7 +109,6 @@ void modelAndSolveILP(const DAG &dag) {
       model.addConstr(cloneVar + sumB == 1,
           "clone_link_" + std::to_string(i) + "_" + std::to_string(j));
       model.addConstr(start[j] >= end[i] + cloneDelay * cloneVar,
-      // model.addConstr(start[j] >= end[i] + 1,
           "sched_dep_" + std::to_string(i) + "_" + std::to_string(j));
     }
   }
@@ -157,7 +156,7 @@ void modelAndSolveILP(const DAG &dag) {
   chosen.reserve(N);
 
   for (int i = 0; i < N; ++i) {
-    for (int n = 0; n < numBanks; ++i) {
+    for (int n = 0; n < numBanks; ++n) {
       double val = x[i][n].get(GRB_DoubleAttr_X);
       if (val > 0.5) {
         chosen.emplace_back(i, n);
@@ -204,6 +203,7 @@ struct BitsOptimiseMappingPass
           }
 
           int predID = it->second;
+          std::cout << predID << " -> " << id << "\n";
           dag.nodes[predID].succs.push_back(id);
           dag.nodes[id].preds.push_back(predID);
         }

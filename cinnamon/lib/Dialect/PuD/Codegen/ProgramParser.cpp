@@ -4,9 +4,9 @@
 #include <cctype>
 #include <cstddef>
 #include <cstring>
-#include <format>
 #include <llvm/Support/LogicalResult.h>
 #include <optional>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -164,7 +164,7 @@ Address ProgramParser::parseAddress(size_t addrEnd) {
       assert(match(']') && position == addrEnd);
       addr.type = AddressType::Data;
       addr.data = index;
-      addr.str_repr = std::format("D{}", index);
+      addr.str_repr = "D" + std::to_string(index);
       return addr;
     } else {
       position--;
@@ -326,5 +326,5 @@ void ProgramParser::normalizeBitwiseAddress(Address &addr) {
 
   assert(index >= 0);
   addr.data = index;
-  addr.str_repr = std::format("{}{}", 'B', index);
+  addr.str_repr = "B" + std::to_string(index);
 }

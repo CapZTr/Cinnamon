@@ -26,6 +26,9 @@ foreach(dir ${LIB_DIRS})
   endif()
 endforeach()
 
+target_link_libraries(PuDCodegen PUBLIC cinm::fmt)
+target_compile_definitions(PuDCodegen PRIVATE FMT_HEADER_ONLY)
+
 set_source_files_properties(
   ${CMAKE_CURRENT_SOURCE_DIR}/InstructionMapper.cpp
   PROPERTIES COMPILE_FLAGS "-frtti"

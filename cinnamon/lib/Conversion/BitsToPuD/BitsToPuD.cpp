@@ -33,7 +33,6 @@
 
 #include <cassert>
 #include <cstdint>
-#include <format>
 #include <memory>
 #include <mockturtle/generators/arithmetic.hpp>
 #include <mockturtle/io/write_dot.hpp>

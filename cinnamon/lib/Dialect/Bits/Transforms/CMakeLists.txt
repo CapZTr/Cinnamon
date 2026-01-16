@@ -10,7 +10,8 @@ LINK_LIBS PUBLIC
   MLIRTransformUtils
 )
 
-set(GUROBI_ROOT "/home/tianruiz/gurobi/linux64")
+# set(GUROBI_ROOT "/home/tianruiz/gurobi/linux64")
+set(GUROBI_ROOT "/opt/gurobi1300/linux64")
 
 target_include_directories(BitsTransforms PRIVATE
   "${GUROBI_ROOT}/include"

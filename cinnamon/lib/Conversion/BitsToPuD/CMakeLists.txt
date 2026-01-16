@@ -41,4 +41,6 @@ foreach(dir ${LIB_DIRS})
   endif()
 endforeach()
 
-target_link_libraries(MLIRBitsToPuD PRIVATE lime_base fmt-local)
+target_link_libraries(MLIRBitsToPuD PUBLIC cinm::fmt)
+# target_link_libraries(MLIRBitsToPuD PRIVATE lime_base fmt-local)
+target_link_libraries(MLIRBitsToPuD PRIVATE lime_base)

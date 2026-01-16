@@ -4,7 +4,6 @@
 
 #include <cassert>
 #include <cstdint>
-#include <format>
 #include <iostream>
 #include <string>
 
@@ -24,12 +23,11 @@ struct RowAddress {
   }
 
   std::string str() {
-    return std::format("{} {} {} {} {}",
-        channel,
-        rank,
-        bank,
-        subarray,
-        row);
+    return std::to_string(channel) + " " +
+           std::to_string(rank) + " " +
+           std::to_string(bank) + " " +
+           std::to_string(subarray) + " " +
+           std::to_string(row);
   }
 };
 
@@ -50,12 +48,11 @@ public:
   }
 
   void printStatus() const {
-    auto status = std::format("Allocator status: {} {} {} {} {}",
-        currentChannel,
-        currentRank,
-        currentBank,
-        currentSubarray,
-        currentRow);
+    auto status = std::to_string(currentChannel) + " " +
+                  std::to_string(currentRank) + " " +
+                  std::to_string(currentBank) + " " +
+                  std::to_string(currentSubarray) + " " +
+                  std::to_string(currentRow);
     std::cout << status << "\n";
   }
 

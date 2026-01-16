@@ -40,7 +40,6 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <format>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -530,7 +529,7 @@ void storeAndInitInput(std::string baseAddr, size_t inputIdx, bool isMulF) {
     llvm::SmallVector<std::unique_ptr<OperandExpr>> exprVec;
     auto addr = intToHex(base + i);
     assert(!exprMap.contains(addr));
-    auto name = std::format("I{}_{}", inputIdx, i);
+    auto name = "I" + std::to_string(inputIdx) + "_" + std::to_string(i);
     for (size_t j = 0; j < VEC_LEN; ++j) {
       auto expr = std::make_unique<DataExpr>(name, inputLiteralVec[j][bitIdx]);
       exprVec.push_back(std::move(expr));
@@ -587,11 +586,34 @@ void printMaskRow() {
   std::cout << "\n";
 }
 
-std::string getTraceLine(const int cycle, const std::string &opName,
-    const std::string &addr0, const std::optional<std::string> addr1) {
-  std::string line = std::format(
-      "{} {} {} {} 0", cycle, opName, addr0, DUMMY_DATA);
-  return addr1.has_value() ? std::format("{} {}", line, *addr1) : line;
+// std::string getTraceLine(const int cycle, const std::string &opName,
+//     const std::string &addr0, const std::optional<std::string> addr1) {
+//   std::string line = std::format(
+//       "{} {} {} {} 0", cycle, opName, addr0, DUMMY_DATA);
+//   return addr1.has_value() ? std::format("{} {}", line, *addr1) : line;
+// }
+std::string getTraceLine(const int cycle,
+                         const std::string &opName,
+                         const std::string &addr0,
+                         const std::optional<std::string> &addr1) {
+  std::string line;
+  line.reserve(128);
+
+  line += std::to_string(cycle);
+  line += ' ';
+  line += opName;
+  line += ' ';
+  line += addr0;
+  line += ' ';
+  line += DUMMY_DATA;
+  line += " 0";
+
+  if (addr1) {
+    line += ' ';
+    line += *addr1;
+  }
+
+  return line;
 }
 
 int main(int argc, char **argv) {
@@ -820,7 +842,7 @@ int main(int argc, char **argv) {
             llvm::SmallVector<std::unique_ptr<OperandExpr>> exprVec;
             auto withOffset = intToHex(base + i);
             assert(!exprMap.contains(withOffset));
-            auto name = std::format("I_bias_{}", i);
+            auto name = "I_bias_" + std::to_string(i);
             for (size_t j = 0; j < VEC_LEN; ++j) {
               auto expr = std::make_unique<DataExpr>(name, biasAPInt[bitIdx]);
               exprVec.push_back(std::move(expr));
