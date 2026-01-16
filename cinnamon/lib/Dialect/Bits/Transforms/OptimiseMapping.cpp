@@ -25,7 +25,7 @@ namespace mlir::bits {
 //===----------------------------------------------------------------------===//
 
 int numBanks = 32;
-int cloneDelay = 2;
+int cloneDelay = 10;
 
 struct Node {
   AddIOp op;
@@ -70,7 +70,7 @@ void modelAndSolveILP(const DAG &dag) {
   }
 
   for (int i = 0; i < N; ++i) {
-    model.addConstr(end[i] == start[i] + 3, "duration_" + std::to_string(i));
+    model.addConstr(end[i] == start[i] + 9, "duration_" + std::to_string(i));
   }
 
   std::vector<std::vector<bool>> dep(N, std::vector(N, false));
@@ -90,12 +90,20 @@ void modelAndSolveILP(const DAG &dag) {
     }
   }
 
+  struct CloneEdge {
+    int src;
+    int dst;
+    GRBVar active;
+  };
+  llvm::SmallVector<CloneEdge> cloneEdges;
+
   GRBLinExpr totalClones = 0;
   const int M = 100;
   for (int i = 0; i < N; ++i) {
     for (int j : dag.nodes[i].succs) {
       GRBVar cloneVar = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
           "clone_" + std::to_string(i) + "_" + std::to_string(j));
+      cloneEdges.push_back(CloneEdge{i, j, cloneVar});
       totalClones += cloneVar;
       GRBLinExpr sumB;
       for (int k = 0; k < numBanks; ++k) {
@@ -110,6 +118,106 @@ void modelAndSolveILP(const DAG &dag) {
           "clone_link_" + std::to_string(i) + "_" + std::to_string(j));
       model.addConstr(start[j] >= end[i] + cloneDelay * cloneVar,
           "sched_dep_" + std::to_string(i) + "_" + std::to_string(j));
+
+      for (int k = 0; k < N; ++k) {
+        GRBLinExpr sumBsrc;
+        for (int bank = 0; bank < numBanks; ++bank) {
+          GRBVar b = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+              "b_src_" + std::to_string(i) + "_" + std::to_string(j) + "_" +
+                  std::to_string(k) + "_" + std::to_string(bank));
+          model.addConstr(b <= x[i][bank]);
+          model.addConstr(b <= x[k][bank]);
+          model.addConstr(b >= x[i][bank] + x[k][bank] - 1);
+          sumBsrc += b;
+        }
+        GRBVar sameBankSrc = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+            "same_src_" + std::to_string(i) + "_" + std::to_string(j) + "_" +
+                std::to_string(k));
+        model.addConstr(sumBsrc == sameBankSrc,
+            "same_src_link_" + std::to_string(i) + "_" + std::to_string(j) +
+                "_" + std::to_string(k));
+        GRBVar orderSrc = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+            "order_src_" + std::to_string(i) + "_" + std::to_string(j) + "_" +
+                std::to_string(k));
+        model.addConstr(end[k] <= end[i] +
+                M * (2 - cloneVar - sameBankSrc + orderSrc),
+            "clone_src_before_" + std::to_string(i) + "_" + std::to_string(j) +
+                "_" + std::to_string(k));
+        model.addConstr(start[k] >= end[i] + cloneDelay -
+                M * (2 - cloneVar - sameBankSrc + (1 - orderSrc)),
+            "clone_src_after_" + std::to_string(i) + "_" + std::to_string(j) +
+                "_" + std::to_string(k));
+
+        GRBLinExpr sumBdst;
+        for (int bank = 0; bank < numBanks; ++bank) {
+          GRBVar b = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+              "b_dst_" + std::to_string(i) + "_" + std::to_string(j) + "_" +
+                  std::to_string(k) + "_" + std::to_string(bank));
+          model.addConstr(b <= x[j][bank]);
+          model.addConstr(b <= x[k][bank]);
+          model.addConstr(b >= x[j][bank] + x[k][bank] - 1);
+          sumBdst += b;
+        }
+        GRBVar sameBankDst = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+            "same_dst_" + std::to_string(i) + "_" + std::to_string(j) + "_" +
+                std::to_string(k));
+        model.addConstr(sumBdst == sameBankDst,
+            "same_dst_link_" + std::to_string(i) + "_" + std::to_string(j) +
+                "_" + std::to_string(k));
+        GRBVar orderDst = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+            "order_dst_" + std::to_string(i) + "_" + std::to_string(j) + "_" +
+                std::to_string(k));
+        model.addConstr(end[k] <= end[i] +
+                M * (2 - cloneVar - sameBankDst + orderDst),
+            "clone_dst_before_" + std::to_string(i) + "_" + std::to_string(j) +
+                "_" + std::to_string(k));
+        model.addConstr(start[k] >= end[i] + cloneDelay -
+                M * (2 - cloneVar - sameBankDst + (1 - orderDst)),
+            "clone_dst_after_" + std::to_string(i) + "_" + std::to_string(j) +
+                "_" + std::to_string(k));
+      }
+    }
+  }
+
+  for (size_t e1 = 0; e1 < cloneEdges.size(); ++e1) {
+    for (size_t e2 = e1 + 1; e2 < cloneEdges.size(); ++e2) {
+      const CloneEdge &c1 = cloneEdges[e1];
+      const CloneEdge &c2 = cloneEdges[e2];
+      auto addCloneOrderConstraints = [&](int a, int b,
+                                          llvm::StringRef tag) {
+        GRBLinExpr sumB;
+        for (int bank = 0; bank < numBanks; ++bank) {
+          GRBVar bVar = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+              "b_" + std::string(tag) + "_" + std::to_string(a) + "_" +
+                  std::to_string(b) + "_" + std::to_string(bank));
+          model.addConstr(bVar <= x[a][bank]);
+          model.addConstr(bVar <= x[b][bank]);
+          model.addConstr(bVar >= x[a][bank] + x[b][bank] - 1);
+          sumB += bVar;
+        }
+        GRBVar sameBank = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+            "same_" + std::string(tag) + "_" + std::to_string(a) + "_" +
+                std::to_string(b));
+        model.addConstr(sumB == sameBank,
+            "same_link_" + std::string(tag) + "_" + std::to_string(a) + "_" +
+                std::to_string(b));
+        GRBVar orderVar = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+            "order_" + std::string(tag) + "_" + std::to_string(a) + "_" +
+                std::to_string(b));
+        model.addConstr(end[c1.src] + cloneDelay <= end[c2.src] +
+                M * (3 - c1.active - c2.active - sameBank + orderVar),
+            "clone_serial_ab_" + std::string(tag) + "_" + std::to_string(a) +
+                "_" + std::to_string(b));
+        model.addConstr(end[c2.src] + cloneDelay <= end[c1.src] +
+                M * (3 - c1.active - c2.active - sameBank + (1 - orderVar)),
+            "clone_serial_ba_" + std::string(tag) + "_" + std::to_string(a) +
+                "_" + std::to_string(b));
+      };
+
+      addCloneOrderConstraints(c1.src, c2.src, "src_src");
+      addCloneOrderConstraints(c1.dst, c2.dst, "dst_dst");
+      addCloneOrderConstraints(c1.src, c2.dst, "src_dst");
+      addCloneOrderConstraints(c1.dst, c2.src, "dst_src");
     }
   }
 
