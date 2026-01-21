@@ -6,6 +6,7 @@
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/LogicalResult.h>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/IR/BuiltinOps.h>
 
 #include <mlir/IR/Value.h>
@@ -18,7 +19,42 @@ namespace mlir::bits {
 
 class NetworkBuilder {
 public:
+  struct SubgraphNetwork {
+    int64_t bankId = 0;
+    SmallVector<int64_t> nodeIds;
+    SmallVector<int64_t> inputValueIds;
+    SmallVector<int64_t> outputValueIds;
+    MIG mig;
+    MIG mulFSignNtk;
+    MIG mulFExponentNtk;
+    MIG gtNtk;
+    MIG ltNtk;
+    bool isMulF = false;
+    bool isMax = false;
+    bool isMin = false;
+    DenseMap<int, int> carryMap;
+  };
+
+  struct SubgraphDependency {
+    size_t producerBankId = 0;
+    size_t consumerBankId = 0;
+    SmallVector<int64_t> valueIds;
+
+    void print(llvm::raw_ostream &os) const {
+      os << "SubgraphDependency { producer=" << producerBankId
+         << ", consumer=" << consumerBankId << ", values=[";
+      for (size_t i = 0; i < valueIds.size(); ++i) {
+        if (i > 0) {
+          os << ", ";
+        }
+        os << valueIds[i];
+      }
+      os << "] }\n";
+    }
+  };
+
   explicit NetworkBuilder(ModuleOp module);
+  explicit NetworkBuilder(func::FuncOp func);
 
   LogicalResult build();
 
@@ -44,6 +80,16 @@ public:
 
   ArrayRef<TypedValue<SliceType>> getOutputSlices() const {
     return outputSlices;
+  }
+
+  bool hasSubgraphs() const { return !subgraphNetworks.empty(); }
+
+  ArrayRef<SubgraphNetwork> getSubgraphNetworks() const {
+    return subgraphNetworks;
+  }
+
+  ArrayRef<SubgraphDependency> getSubgraphDependencies() const {
+    return subgraphDependencies;
   }
 
   static void debugPrint(MIG const &mig, llvm::raw_ostream &os = llvm::errs()) {
@@ -88,6 +134,7 @@ public:
 
 private:
   ModuleOp module;
+  func::FuncOp func;
   MIG mig;
   MIG mulFSignNtk;
   MIG mulFExponentNtk;
@@ -103,6 +150,8 @@ private:
   DenseMap<int, int> carryMap;
   SmallVector<TypedValue<SliceType>> inputSlices;
   SmallVector<TypedValue<SliceType>, 1> outputSlices;
+  SmallVector<SubgraphNetwork, 0> subgraphNetworks;
+  SmallVector<SubgraphDependency> subgraphDependencies;
 
   std::pair<MIG::signal, MIG::signal> buildAdd(MIG &ntk,
                                                MIG::signal const &lhs,

@@ -5,6 +5,7 @@
 #pragma once
 
 #include "cinm-mlir/Conversion/ArithToBits/ArithToBits.h"
+#include "cinm-mlir/Conversion/LinalgToBits/LinalgToBits.h"
 
 namespace mlir {
 

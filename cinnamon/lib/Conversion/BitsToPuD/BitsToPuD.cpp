@@ -72,11 +72,25 @@ struct ConvertBitsToPuD
     // ======================== Network Generation =============================
     // =========================================================================
 
-    NetworkBuilder builder(func->getParentOfType<ModuleOp>());
+    // NetworkBuilder builder(func->getParentOfType<ModuleOp>());
+    NetworkBuilder builder(func);
     if (failed(builder.build())) {
       signalPassFailure();
     }
     auto mig = builder.getNetwork();
+    if (builder.hasSubgraphs()) {
+      // auto subgraphs = builder.getSubgraphNetworks();
+      // for (size_t idx = 0; idx < subgraphs.size(); ++idx) {
+      //   NetworkBuilder::debugPrint(subgraphs[idx].mig);
+      //   mockturtle::write_dot(subgraphs[idx].mig, std::cout);
+      // }
+      for (const auto &dep : builder.getSubgraphDependencies()) {
+        dep.print(llvm::errs());
+      }
+    } else {
+      NetworkBuilder::debugPrint(mig);
+    }
+    return;
     auto mulFSignNtk = builder.getMulFSignNtk();
     auto mulFExponentNtk = builder.getMulFExponentNtk();
     const auto isMulF = builder.isMulFNtk();

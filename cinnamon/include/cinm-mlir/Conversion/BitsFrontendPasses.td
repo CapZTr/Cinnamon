@@ -20,4 +20,16 @@ def ConvertArithToBits : Pass<"convert-arith-to-bits", operation="func::FuncOp">
   ];
 }
 
+def ConvertLinalgToBits : Pass<"convert-linalg-to-bits", operation="func::FuncOp"> {
+  let summary = "Convert Linalg dialect to Bits Dialect";
+  let constructor = "mlir::bits_frontend::createConvertLinalgToBitsPass()";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::bits::BitsDialect",
+    "mlir::func::FuncDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::tensor::TensorDialect"
+  ];
+}
+
 #endif // BITS_FRONTEND_CONVERSION_PASSES

@@ -4,9 +4,12 @@
 #include <exception>
 #include <iostream>
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/Casting.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/IR/IRMapping.h>
+#include <mlir/IR/Value.h>
 #include <mlir/Pass/Pass.h>
 #include <mlir/Transforms/DialectConversion.h>
 #include <string>
@@ -38,7 +41,8 @@ struct DAG {
   llvm::DenseMap<Operation *, int> opToNodeID;
 };
 
-void modelAndSolveILP(const DAG &dag) {
+// void modelAndSolveILP(const DAG &dag) {
+std::vector<int> modelAndSolveILP(const DAG &dag) {
   const int N = dag.nodes.size();
 
   GRBEnv env = GRBEnv(true);
@@ -260,23 +264,31 @@ void modelAndSolveILP(const DAG &dag) {
     std::cerr << "Solving ended with status: " << status << "\n";
   }
 
-  std::vector<std::pair<int, int>> chosen;
-  chosen.reserve(N);
+  // std::vector<std::pair<int, int>> chosen;
+  // chosen.reserve(N);
+  std::vector<int> chosen(N, -1);
 
   for (int i = 0; i < N; ++i) {
     for (int n = 0; n < numBanks; ++n) {
       double val = x[i][n].get(GRB_DoubleAttr_X);
       if (val > 0.5) {
-        chosen.emplace_back(i, n);
+        // chosen.emplace_back(i, n);
+        chosen[i] = n;
         break;
       }
     }
   }
 
   std::cout << "Chosen mapping (operator -> bank):\n";
-  for (auto [i, n] : chosen) {
-    std::cout << "Op " << i << " -> bank " << n << "\n";
+  // for (auto [i, n] : chosen) {
+  //   std::cout << "Op " << i << " -> bank " << n << "\n";
+  for (int i = 0; i < N; ++i) {
+    if (chosen[i] < 0) {
+      continue;
+    }
+    std::cout << "Op " << i << " -> bank " << chosen[i] << "\n";
   }
+  return chosen;
 }
 
 struct BitsOptimiseMappingPass
@@ -319,7 +331,124 @@ struct BitsOptimiseMappingPass
     }
 
     try {
-      modelAndSolveILP(dag);
+      // modelAndSolveILP(dag);
+      std::vector<int> chosen = modelAndSolveILP(dag);
+      DenseMap<Operation *, int> opToBank;
+      DenseSet<int> banksInUse;
+      for (int i = 0; i < static_cast<int>(dag.nodes.size()); ++i) {
+        if (chosen[i] < 0) {
+          continue;
+        }
+        Operation *op = dag.nodes[i].op.getOperation();
+        opToBank[op] = chosen[i];
+        op->setAttr("bits.bank_id",
+                    IntegerAttr::get(IntegerType::get(func.getContext(), 64),
+                                     chosen[i]));
+        op->setAttr("bits.node_id",
+                    IntegerAttr::get(IntegerType::get(func.getContext(), 64),
+                                     i));
+        banksInUse.insert(chosen[i]);
+      }
+
+      DenseMap<Value, int64_t> valueIds;
+      int64_t nextValueId = 0;
+      // for (BlockArgument arg : block.getArguments()) {
+      //   valueIds[arg] = nextValueId;
+      //   func.setArgAttr(arg.getArgNumber(), "bits.value_id",
+      //                   IntegerAttr::get(IntegerType::get(func.getContext(), 64),
+      //                                    nextValueId));
+      //   ++nextValueId;
+      // }
+      for (Operation &op : block) {
+        if (op.getNumResults() == 0) {
+          continue;
+        }
+        SmallVector<Attribute> ids;
+        ids.reserve(op.getNumResults());
+        for (Value result : op.getResults()) {
+          valueIds[result] = nextValueId;
+          ids.push_back(IntegerAttr::get(
+              IntegerType::get(func.getContext(), 64), nextValueId));
+          ++nextValueId;
+        }
+        op.setAttr("bits.value_ids", ArrayAttr::get(func.getContext(), ids));
+      }
+
+      DenseMap<int, DenseSet<int64_t>> subgraphInputs;
+      DenseMap<int, DenseSet<int64_t>> subgraphOutputs;
+      DenseMap<int, SmallVector<int64_t>> subgraphNodes;
+
+      for (int i = 0; i < static_cast<int>(dag.nodes.size()); ++i) {
+        int bank = chosen[i];
+        if (bank < 0) {
+          continue;
+        }
+        subgraphNodes[bank].push_back(i);
+        AddIOp add = dag.nodes[i].op;
+        for (Value operand : add->getOperands()) {
+          bool internal = false;
+          if (auto *defOp = operand.getDefiningOp()) {
+            if (auto predAdd = llvm::dyn_cast<AddIOp>(defOp)) {
+              auto it = opToBank.find(predAdd.getOperation());
+              if (it != opToBank.end() && it->second == bank) {
+                internal = true;
+              }
+            }
+          }
+          if (!internal) {
+            subgraphInputs[bank].insert(valueIds.lookup(operand));
+          }
+        }
+
+        Value result = add.getResult();
+        bool isOutput = false;
+        for (OpOperand &use : result.getUses()) {
+          Operation *user = use.getOwner();
+          if (auto userAdd = llvm::dyn_cast<AddIOp>(user)) {
+            auto it = opToBank.find(userAdd.getOperation());
+            if (it != opToBank.end() && it->second == bank) {
+              continue;
+            }
+          }
+          isOutput = true;
+          break;
+        }
+        if (isOutput) {
+          subgraphOutputs[bank].insert(valueIds.lookup(result));
+        }
+      }
+
+      Builder builder(func.getContext());
+      SmallVector<Attribute> subgraphAttrs;
+      for (int bank : banksInUse) {
+        SmallVector<Attribute> nodeAttrs;
+        for (int64_t nodeId : subgraphNodes[bank]) {
+          nodeAttrs.push_back(builder.getI64IntegerAttr(nodeId));
+        }
+        SmallVector<int64_t> inputIds(subgraphInputs[bank].begin(),
+                                      subgraphInputs[bank].end());
+        llvm::sort(inputIds);
+        SmallVector<Attribute> inputAttrs;
+        for (int64_t valueId : inputIds) {
+          inputAttrs.push_back(builder.getI64IntegerAttr(valueId));
+        }
+        SmallVector<int64_t> outputIds(subgraphOutputs[bank].begin(),
+                                       subgraphOutputs[bank].end());
+        llvm::sort(outputIds);
+        SmallVector<Attribute> outputAttrs;
+        for (int64_t valueId : outputIds) {
+          outputAttrs.push_back(builder.getI64IntegerAttr(valueId));
+        }
+        NamedAttrList subgraph;
+        subgraph.set("bank_id", builder.getI64IntegerAttr(bank));
+        subgraph.set("nodes", ArrayAttr::get(func.getContext(), nodeAttrs));
+        subgraph.set("inputs", ArrayAttr::get(func.getContext(), inputAttrs));
+        subgraph.set("outputs", ArrayAttr::get(func.getContext(), outputAttrs));
+        subgraphAttrs.push_back(
+            DictionaryAttr::get(func.getContext(), subgraph));
+      }
+      func->setAttr("bits.subgraphs",
+                    ArrayAttr::get(func.getContext(), subgraphAttrs));
     } catch (GRBException &e) {
       std::cerr << "Gurobi error: " << e.getMessage() << "\n";
     } catch (std::exception &ex) {

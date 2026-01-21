@@ -1,4 +1,4 @@
-#include "cinm-mlir/Conversion/ArithToBits/ArithToBits.h"
+#include "cinm-mlir/Conversion/LinalgToBits/LinalgToBits.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsBase.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
@@ -43,26 +43,44 @@ struct SliceCache {
   }
 };
 
-template<typename SourceOp, typename TargetOp>
-struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
-  using OpConversionPattern<SourceOp>::OpConversionPattern;
+struct ConvertLinalgGenericToBits
+    : public OpConversionPattern<linalg::GenericOp> {
+  using OpConversionPattern<linalg::GenericOp>::OpConversionPattern;
 
   LogicalResult matchAndRewrite(
-      SourceOp op,
-      SourceOp::Adaptor,
+      linalg::GenericOp op,
+      linalg::GenericOp::Adaptor,
       ConversionPatternRewriter &rewriter) const override {
     
+    if (op.getInputs().size() != 2 || op.getOutputs().size() != 1)
+      return failure();
+
+    if (op.getNumLoops() != 1)
+      return failure();
+
+    for (AffineMap map : op.getIndexingMapsArray()) {
+      if (!map.isIdentity())
+        return failure();
+    }
+
+    for (utils::IteratorType iteratorType : op.getIteratorTypesArray()) {
+      if (iteratorType != utils::IteratorType::parallel)
+        return failure();
+    }
+
+    auto outputType = dyn_cast<RankedTensorType>(op.getResultTypes().front());
+    if (!outputType || outputType.getRank() != 1)
+      return failure();
+
+    auto inputType = dyn_cast<RankedTensorType>(op.getInputs().front().getType());
+    if (!inputType || inputType.getRank() != 1)
+      return failure();
+
     Location loc = op.getLoc();
-    auto lhs = op.getLhs();
-    auto rhs = op.getRhs();
-
-    auto lhsType = cast<RankedTensorType>(lhs.getType());
-    auto rhsType = cast<RankedTensorType>(rhs.getType());
-
-    auto elemType = lhsType.getElementType();
+    auto elemType = inputType.getElementType();
     auto ctx = rewriter.getContext();
     int64_t bitWidth = elemType.getIntOrFloatBitWidth();
-    int64_t vectorLen = lhsType.getShape()[0];
+    int64_t vectorLen = inputType.getShape()[0];
 
     auto &inputCache = InputCache::get();
     auto &sliceCache = SliceCache::get();
@@ -88,14 +106,59 @@ struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
       return slice;
     };
 
-    Value lhsSlice = getOrCreateSlice(lhs);
-    Value rhsSlice = getOrCreateSlice(rhs);
+    auto &block = op.getRegion().front();
+    if (block.getOperations().size() != 2)
+      return failure();
 
-    auto newOp = rewriter.create<TargetOp>(loc, sliceType, lhsSlice, rhsSlice);
+    auto yieldOp = dyn_cast<linalg::YieldOp>(block.getTerminator());
+    if (!yieldOp || yieldOp.getValues().size() != 1)
+      return failure();
 
-    sliceCache[op] = newOp.getResult();
+    Value yieldedValue = yieldOp.getValues().front();
+    Operation *yieldedOp = yieldedValue.getDefiningOp();
+    if (!yieldedOp || yieldedOp->getNumOperands() != 2)
+      return failure();
 
-    Value result = rewriter.create<AssembleOp>(loc, lhsType, newOp.getResult());
+    auto lhsArg = dyn_cast<BlockArgument>(yieldedOp->getOperand(0));
+    auto rhsArg = dyn_cast<BlockArgument>(yieldedOp->getOperand(1));
+    if (!lhsArg || !rhsArg)
+      return failure();
+
+    if (lhsArg.getOwner() != &block || rhsArg.getOwner() != &block)
+      return failure();
+
+    if (lhsArg.getArgNumber() >= op.getInputs().size() ||
+        rhsArg.getArgNumber() >= op.getInputs().size())
+      return failure();
+
+    Value lhsInput = op.getInputs()[lhsArg.getArgNumber()];
+    Value rhsInput = op.getInputs()[rhsArg.getArgNumber()];
+
+    Value lhsSlice = getOrCreateSlice(lhsInput);
+    Value rhsSlice = getOrCreateSlice(rhsInput);
+
+    Value newResult;
+    if (isa<arith::AddIOp>(yieldedOp)) {
+      newResult = rewriter.create<AddIOp>(loc, sliceType, lhsSlice, rhsSlice);
+    } else if (isa<arith::MulFOp>(yieldedOp)) {
+      newResult = rewriter.create<MulFOp>(loc, sliceType, lhsSlice, rhsSlice);
+    } else if (isa<arith::AndIOp>(yieldedOp)) {
+      newResult = rewriter.create<AndOp>(loc, sliceType, lhsSlice, rhsSlice);
+    } else if (isa<arith::OrIOp>(yieldedOp)) {
+      newResult = rewriter.create<OrOp>(loc, sliceType, lhsSlice, rhsSlice);
+    } else if (isa<arith::XOrIOp>(yieldedOp)) {
+      newResult = rewriter.create<XOrOp>(loc, sliceType, lhsSlice, rhsSlice);
+    } else if (isa<arith::MaxUIOp>(yieldedOp)) {
+      newResult = rewriter.create<MaxOp>(loc, sliceType, lhsSlice, rhsSlice);
+    } else if (isa<arith::MinUIOp>(yieldedOp)) {
+      newResult = rewriter.create<MinOp>(loc, sliceType, lhsSlice, rhsSlice);
+    } else {
+      return failure();
+    }
+
+    sliceCache[op] = newResult;
+
+    Value result = rewriter.create<AssembleOp>(loc, outputType, newResult);
 
     rewriter.replaceOp(op, result);
 
@@ -103,45 +166,39 @@ struct ConvertArithTensorOpToBits : OpConversionPattern<SourceOp> {
   }
 };
 
-struct ConvertArithToBits
-    : public ConvertArithToBitsBase<ConvertArithToBits> {
+struct ConvertLinalgToBits
+    : public ConvertLinalgToBitsBase<ConvertLinalgToBits> {
 
   void runOnOperation() override {
     func::FuncOp func = getOperation();
     auto &ctx = getContext();
 
     RewritePatternSet patterns(&ctx);
-    patterns.add<
-        ConvertArithTensorOpToBits<arith::AddIOp, AddIOp>>(&ctx);
-    patterns.add<
-        ConvertArithTensorOpToBits<arith::MulFOp, MulFOp>>(&ctx);
-    patterns.add<
-        ConvertArithTensorOpToBits<arith::AndIOp, AndOp>>(&ctx);
-    patterns.add<
-        ConvertArithTensorOpToBits<arith::OrIOp, OrOp>>(&ctx);
-    patterns.add<
-        ConvertArithTensorOpToBits<arith::XOrIOp, XOrOp>>(&ctx);
-    patterns.add<
-        ConvertArithTensorOpToBits<arith::MaxUIOp, MaxOp>>(&ctx);
-    patterns.add<
-        ConvertArithTensorOpToBits<arith::MinUIOp, MinOp>>(&ctx);
+    patterns.add<ConvertLinalgGenericToBits>(&ctx);
     
     ConversionTarget target(ctx);
     target.markUnknownOpDynamicallyLegal([](...) { return true; });
     target.addLegalDialect<BitsDialect>();
-    target.addIllegalOp<arith::AddIOp>();
-    target.addIllegalOp<arith::MulFOp>();
-    target.addIllegalOp<arith::AndIOp>();
-    target.addIllegalOp<arith::OrIOp>();
-    target.addIllegalOp<arith::XOrIOp>();
-    target.addIllegalOp<arith::MaxUIOp>();
-    target.addIllegalOp<arith::MinUIOp>();
+    target.addIllegalOp<linalg::GenericOp>();
 
     if (applyPartialConversion(func, target, std::move(patterns)).failed()) {
       signalPassFailure();
     }
 
     removeUnnecessaryAssembles(func);
+    removeUnusedTensorEmpties(func);
+  }
+
+  static void removeUnusedTensorEmpties(func::FuncOp func) {
+    SmallVector<Operation *, 8> toErase;
+    func.walk([&](tensor::EmptyOp emptyOp) {
+      if (emptyOp.getResult().use_empty()) {
+        toErase.push_back(emptyOp);
+      }
+    });
+
+    for (Operation *op : toErase)
+      op->erase();
   }
 
   static void removeUnnecessaryAssembles(func::FuncOp func) {
@@ -223,6 +280,6 @@ struct ConvertArithToBits
 
 } // namespace
 
-std::unique_ptr<Pass> bits_frontend::createConvertArithToBitsPass() {
-  return std::make_unique<ConvertArithToBits>();
+std::unique_ptr<Pass> bits_frontend::createConvertLinalgToBitsPass() {
+  return std::make_unique<ConvertLinalgToBits>();
 }
