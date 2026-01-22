@@ -90,7 +90,7 @@ struct ConvertBitsToPuD
     } else {
       NetworkBuilder::debugPrint(mig);
     }
-    return;
+    // return;
     auto mulFSignNtk = builder.getMulFSignNtk();
     auto mulFExponentNtk = builder.getMulFExponentNtk();
     const auto isMulF = builder.isMulFNtk();

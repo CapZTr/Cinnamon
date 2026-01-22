@@ -7,3 +7,5 @@
 /torch-mlir/
 /upmem/
 /.env
+/gurobi.log
+/.clangd
