@@ -51,13 +51,6 @@ using MIG = mockturtle::mig_network;
 
 namespace {
 
-struct GlobalAddressAllocator {
-  static AddressAllocator &get() {
-    static AddressAllocator allocator;
-    return allocator;
-  }
-};
-
 // =============================================================================
 // ========================== Pass Structure ===================================
 // =============================================================================
@@ -100,33 +93,13 @@ struct ConvertBitsToPuD
     const auto isMin = builder.isMinNtk();
     assert((int)isMulF + (int)isMax + (int)isMin <= 1);
     auto ntkInputs = builder.getInputSlices();
-    const int inputNum = ntkInputs.size();
-    const bool isRed = inputNum == 1 ? true : false;
+    const bool isRed = ntkInputs.size() == 1;
     auto carryMap = builder.getCarryMap();
-    const int carryNum = carryMap.size();
 
     // NetworkBuilder::debugPrint(mig);
 
     // std::cout << " ===== Generated Network ===== \n";
     // mockturtle::write_dot(mig, std::cout);
-
-    // =========================================================================
-    // ======================== Lime Optimization ==============================
-    // =========================================================================
-
-    const auto program_str = getProgram(mig);
-    // std::cout << "\nGenerated program:\n" << program_str << "\n";
-
-    // =========================================================================
-    // ======================== Program Parsing ================================
-    // =========================================================================
-
-    ProgramParser parser(program_str);
-    if (failed(parser.parse())) {
-      signalPassFailure();
-    }
-    std::vector<Instruction> program = parser.getProgram();
-    // parser.printProgram();
 
     // // MulFSignNtk and MulFExponentNtk
     // std::vector<Instruction> program_mulf_sign;
@@ -231,6 +204,36 @@ struct ConvertBitsToPuD
           tensorType.getShape(), i1Type, tensorType.getEncoding());
     }
 
+    DenseMap<Value, int64_t> valueToValueId;
+    AssembleOp assembleOp;
+    for (Operation &op : oldEntry) {
+      if (auto valuesAttr = op.getAttrOfType<ArrayAttr>("bits.value_ids")) {
+        for (auto [idx, valueAttr] :
+             llvm::enumerate(valuesAttr.getAsRange<IntegerAttr>())) {
+          auto valueId = valueAttr.getInt();
+          Value result = op.getResult(idx);
+          valueToValueId[result] = valueId;
+        }
+      }
+      if (auto assemble = dyn_cast<AssembleOp>(op)) {
+        assembleOp = assemble;
+      }
+    }
+    for (BlockArgument arg : oldEntry.getArguments()) {
+      if (auto attr = func.getArgAttrOfType<IntegerAttr>(
+              arg.getArgNumber(), "bits.value_id")) {
+        valueToValueId[arg] = attr.getInt();
+      }
+    }
+
+    int64_t outputValueId = -1;
+    if (assembleOp) {
+      auto it = valueToValueId.find(assembleOp.getInput());
+      if (it != valueToValueId.end()) {
+        outputValueId = it->second;
+      }
+    }
+
     Block *newEntry = new Block();
     func.getBody().push_back(newEntry);
 
@@ -258,6 +261,17 @@ struct ConvertBitsToPuD
       mapping.map(oldTranspose.getOutput(), newTranspose.getOutput());
     }
 
+    DenseMap<int64_t, TypedValue<SliceType>> valueIdToSlice;
+    for (Operation *oldOp : toKeep) {
+      auto transpose = cast<TransposeOp>(oldOp);
+      auto it = valueToValueId.find(transpose.getOutput());
+      if (it != valueToValueId.end()) {
+        auto newSlice =
+            cast<TypedValue<SliceType>>(mapping.lookup(transpose.getOutput()));
+        valueIdToSlice[it->second] = newSlice;
+      }
+    }
+
     oldEntry.dropAllReferences();
     oldEntry.erase();
 
@@ -272,137 +286,113 @@ struct ConvertBitsToPuD
       return i64Vals.lookup(num);
     };
 
-    // =========================================================================
-    // ======================= Address Allocation ==============================
-    // =========================================================================
-
-    auto &allocator = GlobalAddressAllocator::get();
-    
-    llvm::StringMap<RowAddress> allocated;
-    llvm::StringMap<TypedValue<RowType>> firstRows;
-    llvm::StringMap<TypedValue<RowType>> rowMap;
-    llvm::StringMap<TypedValue<RowType>> carryRows;
-
-    RowAddress outputFirstRowAddress;
-    TypedValue<RowType> outputFirstRow;
-    SmallVector<TypedValue<SliceType>> outputSlices;
-
-    const auto bRowType = RowType::get(ctx, 0);
-    const auto cRowType = RowType::get(ctx, 1);
-    const auto dRowType = RowType::get(ctx, 2);
-
-    auto getOrCreateDRow = [
-        &loc, &opBuilder, &dRowType, &rowMap, &getOrCreateI64Val]
-        (RowAddress addr) -> TypedValue<RowType> {
-      auto addrStr = addr.str();
-      if (!rowMap.contains(addrStr)) {
-        Value rowVal = opBuilder.create<GetRowOp>(
-            loc,
-            dRowType,
-            getOrCreateI64Val(addr.channel),
-            getOrCreateI64Val(addr.rank),
-            getOrCreateI64Val(addr.bank),
-            getOrCreateI64Val(addr.subarray),
-            getOrCreateI64Val(addr.row)
-        );
-        rowMap[addrStr] = cast<TypedValue<RowType>>(rowVal);
+    auto lowerNetwork = [&](MIG localMig,
+                            ArrayRef<TypedValue<SliceType>> localInputs,
+                            const DenseMap<int, int> &localCarryMap,
+                            bool localIsMulF,
+                            bool localIsMax,
+                            bool localIsMin,
+                            int64_t bankId)
+        -> FailureOr<TypedValue<SliceType>> {
+      const auto program_str = getProgram(localMig);
+      ProgramParser parser(program_str);
+      if (failed(parser.parse())) {
+        return failure();
       }
-      return rowMap.lookup(addrStr);
-    };
+      std::vector<Instruction> program = parser.getProgram();
 
-    const Value zero = getOrCreateI64Val(0);
+      const int inputNum = localInputs.size();
+      const bool localIsRed = inputNum == 1;
+      const int carryNum = localCarryMap.size();
 
-    // =========================================================================
-    // ================= Bitwise & Control Rows Generation =====================
-    // TODO: This is a workaround.
-    //       Currently we use B and C group rows from subarry (0, 0, 0, 0) only.
-    //       We need an algorithm to find the optimality with lowest latency of
-    //       inter-subarray row clone.
-    // =========================================================================
+      AddressAllocator allocator(bankId);
 
-    SmallVector<TypedValue<RowType>, 16> bRows;
-    for (int i = 0; i < 16; ++i) {
-      Value bRow = opBuilder.create<GetRowOp>(
-          loc,
-          bRowType,
-          zero,
-          zero,
-          zero,
-          zero,
-          getOrCreateI64Val(i)
-      );
-      bRows.push_back(cast<TypedValue<RowType>>(bRow));
-    }
+      llvm::StringMap<RowAddress> allocated;
+      llvm::StringMap<TypedValue<RowType>> firstRows;
+      llvm::StringMap<TypedValue<RowType>> rowMap;
+      llvm::StringMap<TypedValue<RowType>> carryRows;
 
-    const TypedValue<RowType> c0 = opBuilder.create<GetRowOp>(
-        loc,
-        cRowType,
-        zero,
-        zero,
-        zero,
-        zero,
-        zero
-    );
-    const TypedValue<RowType> c1 = opBuilder.create<GetRowOp>(
-        loc,
-        cRowType,
-        zero,
-        zero,
-        zero,
-        zero,
-        getOrCreateI64Val(1)
-    );
+      RowAddress outputFirstRowAddress;
+      TypedValue<RowType> outputFirstRow;
+      SmallVector<TypedValue<SliceType>> outputSlices;
+      TypedValue<RowType> maskRow;
 
-    // =========================================================================
-    // ====================== Data Rows Allocation =============================
-    // =========================================================================
+      const auto bRowType = RowType::get(ctx, 0);
+      const auto cRowType = RowType::get(ctx, 1);
+      const auto dRowType = RowType::get(ctx, 2);
 
-    // if (isMulF) {
-    //   exponentBiasT = SliceType::get(ctx, exponentBitWidth, vecLen);
-    //   exponentBias = opBuilder.create<bits::CreateSliceOp>(loc, exponentBiasT);
-    // }
+      auto getOrCreateDRow = [&loc, &opBuilder, &dRowType, &rowMap,
+                              &getOrCreateI64Val](RowAddress addr)
+          -> TypedValue<RowType> {
+        auto addrStr = addr.str();
+        if (!rowMap.contains(addrStr)) {
+          Value rowVal = opBuilder.create<GetRowOp>(
+              loc, dRowType, getOrCreateI64Val(addr.channel),
+              getOrCreateI64Val(addr.rank), getOrCreateI64Val(addr.bank),
+              getOrCreateI64Val(addr.subarray), getOrCreateI64Val(addr.row));
+          rowMap[addrStr] = cast<TypedValue<RowType>>(rowVal);
+        }
+        return rowMap.lookup(addrStr);
+      };
 
-    const auto maxColNum = allocator.getMaxColumnNum();
-    int lastSliceVecLen = vecLen % maxColNum;
-    if (lastSliceVecLen == 0)
-      lastSliceVecLen = maxColNum;
-    int round = (vecLen - 1) / maxColNum + 1;
-    const Value maxColVal = getOrCreateI64Val(maxColNum);
-    auto standardSliceType = isRed ? SliceType::get(ctx, 1, maxColNum)
-        : SliceType::get(ctx, bitWidth, maxColNum);
-    
-    SmallVector<SmallVector<TypedValue<SliceType>>> slicesToStore;
-    for (const auto &oldSlice : ntkInputs) {
-      assert(mapping.contains(oldSlice));
-      auto newSlice = cast<TypedValue<SliceType>>(mapping.lookup(oldSlice));
-      SmallVector<TypedValue<SliceType>> v;
-      v.push_back(newSlice);
-      for (int roundIdx = 0; roundIdx < round - 1; ++roundIdx) {
-        auto toSplit = v[roundIdx];
-        auto secondColNum = toSplit.getType().getVectorLength() - maxColNum;
-        if (roundIdx + 2 == round)
-          assert(secondColNum <= maxColNum);
-        auto secondType = SliceType::get(ctx, bitWidth, secondColNum);
-        auto splitOp = opBuilder.create<SplitSliceVerticallyOp>(
-            loc,
-            standardSliceType,
-            secondType,
-            toSplit,
-            maxColVal
-        );
-        v[roundIdx] = splitOp.getFirst();
-        v.push_back(splitOp.getSecond());
+      const Value zero = getOrCreateI64Val(0);
+      const Value bankVal = getOrCreateI64Val(bankId);
+
+      // =========================================================================
+      // ================= Bitwise & Control Rows Generation =====================
+      // TODO: This is a workaround.
+      //       Currently we use B and C group rows from subarry (0, 0, 0, 0) only.
+      //       We need an algorithm to find the optimality with lowest latency of
+      //       inter-subarray row clone.
+      // =========================================================================
+
+      SmallVector<TypedValue<RowType>, 16> bRows;
+      for (int i = 0; i < 16; ++i) {
+        Value bRow = opBuilder.create<GetRowOp>(
+            loc, bRowType, zero, zero, bankVal, zero, getOrCreateI64Val(i));
+        bRows.push_back(cast<TypedValue<RowType>>(bRow));
       }
-      slicesToStore.push_back(v);
-    }
 
-    RowAddress biasFirstRowAddress;
-    TypedValue<RowType> biasCinRow;
-    TypedValue<RowType> biasCoutRow;
+      const TypedValue<RowType> c0 = opBuilder.create<GetRowOp>(
+          loc, cRowType, zero, zero, bankVal, zero, zero);
+      const TypedValue<RowType> c1 = opBuilder.create<GetRowOp>(
+          loc, cRowType, zero, zero, bankVal, zero, getOrCreateI64Val(1));
 
-    for (int roundIdx = 0; roundIdx < round; ++roundIdx) {
-      allocator.reset();
-      StringSet<> stored;
+      // =========================================================================
+      // ====================== Data Rows Allocation =============================
+      // =========================================================================
+
+      const auto maxColNum = allocator.getMaxColumnNum();
+      int lastSliceVecLen = vecLen % maxColNum;
+      if (lastSliceVecLen == 0)
+        lastSliceVecLen = maxColNum;
+      int round = (vecLen - 1) / maxColNum + 1;
+      const Value maxColVal = getOrCreateI64Val(maxColNum);
+      auto standardSliceType = localIsRed
+          ? SliceType::get(ctx, 1, maxColNum)
+          : SliceType::get(ctx, bitWidth, maxColNum);
+
+      SmallVector<SmallVector<TypedValue<SliceType>>> slicesToStore;
+      for (const auto &slice : localInputs) {
+        SmallVector<TypedValue<SliceType>> v;
+        v.push_back(slice);
+        for (int roundIdx = 0; roundIdx < round - 1; ++roundIdx) {
+          auto toSplit = v[roundIdx];
+          auto secondColNum = toSplit.getType().getVectorLength() - maxColNum;
+          if (roundIdx + 2 == round)
+            assert(secondColNum <= maxColNum);
+          auto secondType = SliceType::get(ctx, bitWidth, secondColNum);
+          auto splitOp = opBuilder.create<SplitSliceVerticallyOp>(
+              loc, standardSliceType, secondType, toSplit, maxColVal);
+          v[roundIdx] = splitOp.getFirst();
+          v.push_back(splitOp.getSecond());
+        }
+        slicesToStore.push_back(v);
+      }
+
+      for (int roundIdx = 0; roundIdx < round; ++roundIdx) {
+        allocator.reset(bankId);
+        StringSet<> stored;
 
       // std::vector<Instruction> program_gtLt;
       // if (isMax || isMin) {
@@ -419,7 +409,7 @@ struct ConvertBitsToPuD
       //   }
       // }
 
-      for (auto &inst : program) {
+        for (auto &inst : program) {
         if (inst.type == Instruction::Type::AAP) {
           auto operand0 = inst.operand0;
           if (operand0.type == AddressType::Data) {
@@ -443,7 +433,7 @@ struct ConvertBitsToPuD
             } else {
               if (!allocated.contains(operand0.str_repr)) {
                 assert(roundIdx == 0);
-                if (isMax || isMin || isRed) {
+                if (localIsMax || localIsMin || localIsRed) {
                   // do nothing
                 } else {
                   auto addr = allocator.allocate(1);
@@ -460,10 +450,10 @@ struct ConvertBitsToPuD
           if (operand1.type == AddressType::Data) {
             const auto index = std::get<int>(operand1.data);
             assert(index >= inputNum);
-            if (index - inputNum < carryNum * 2 || isRed) {
+            if (index - inputNum < carryNum * 2 || localIsRed) {
               if (!allocated.contains(operand1.str_repr)) {
                 assert(roundIdx == 0);
-                if (isRed) {
+                if (localIsRed) {
                   auto addr = allocator.allocate(1);
                   allocated[operand1.str_repr] = addr;
                   auto outRow = getOrCreateDRow(addr);
@@ -493,7 +483,7 @@ struct ConvertBitsToPuD
         } else {
           assert(inst.type == Instruction::Type::AP);
         }
-      }
+        }
 
       // llvm::StringMap<RowAddress> biasSFirstRowMap;
       // if (isMulF) {
@@ -518,7 +508,7 @@ struct ConvertBitsToPuD
       //   }
       // }
 
-      if (this->unroll) {
+        if (this->unroll) {
 
         // Sign-bit Computation
         // if (isMulF) {
@@ -628,13 +618,13 @@ struct ConvertBitsToPuD
         //   opBuilder.create<AAPOp>(loc, bRows[2], maskRow);
         // }
 
-        int iterCount = isMulF ? bitWidth - 1 : bitWidth;
+        int iterCount = localIsMulF ? bitWidth - 1 : bitWidth;
 
         int64_t iterIndex = 0;
         int64_t addrOffset = bitWidth;
         while (iterIndex < iterCount) {
           addrOffset--;
-          if (iterIndex == 2 && isRed)
+          if (iterIndex == 2 && localIsRed)
             addrOffset--;
           llvm::StringSet<> refreshedCin;
           TypedValue<RowType> i1RowForReduction;
@@ -659,9 +649,9 @@ struct ConvertBitsToPuD
                 addr0 = std::get<bool>(operand0.data) ? c1 : c0;
               } else {
                 assert(operand0.type == AddressType::Data);
-                if ((isMax || isMin) && operand0.str_repr == "I2") {
+                if ((localIsMax || localIsMin) && operand0.str_repr == "I2") {
                   addr0 = maskRow;
-                } else if (isRed && operand0.str_repr == "I1") {
+                } else if (localIsRed && operand0.str_repr == "I1") {
                   if (iterIndex == 0) {
                     if (!i1RowForReduction) {
                       auto firstRow = allocated["I0"];
@@ -706,7 +696,7 @@ struct ConvertBitsToPuD
                 addr1 = bRows[index];
               } else {
                 assert(operand1.type == AddressType::Data);
-                if (isRed) {
+                if (localIsRed) {
                   if (iterIndex == iterCount - 1) {
                     addr1 = outputFirstRow;
                   } else {
@@ -739,7 +729,7 @@ struct ConvertBitsToPuD
           }
 
           iterIndex++;
-          if (iterIndex == 1 && isRed)
+          if (iterIndex == 1 && localIsRed)
             iterIndex++;
 
         }
@@ -814,7 +804,7 @@ struct ConvertBitsToPuD
         //   }
         // }
 
-      } else {
+        } else {
 
         auto loop = opBuilder.create<affine::AffineForOp>(loc, 0, bitWidth, 1);
         opBuilder.setInsertionPointToStart(loop.getBody());
@@ -883,37 +873,137 @@ struct ConvertBitsToPuD
 
       }
 
-      SliceType sType = standardSliceType;
-      if (roundIdx + 1 == round) {
-        sType = isRed ? SliceType::get(ctx, 1, lastSliceVecLen)
-            : SliceType::get(ctx, bitWidth, lastSliceVecLen);
+        SliceType sType = standardSliceType;
+        if (roundIdx + 1 == round) {
+          sType = localIsRed ? SliceType::get(ctx, 1, lastSliceVecLen)
+              : SliceType::get(ctx, bitWidth, lastSliceVecLen);
+        }
+        TypedValue<SliceType> slice = opBuilder.create<LoadOp>(
+            loc, sType, outputFirstRow, getOrCreateI64Val(bitWidth));
+        outputSlices.push_back(slice);
       }
-      TypedValue<SliceType> slice = opBuilder.create<LoadOp>(
-          loc, sType, outputFirstRow, getOrCreateI64Val(bitWidth));
-      outputSlices.push_back(slice);
 
+      auto resultSlice = outputSlices[0];
+      if (round > 1) {
+        for (int i = 1; i < round; ++i) {
+          auto second = outputSlices[i];
+          auto vecLen = resultSlice.getType().getVectorLength() +
+              second.getType().getVectorLength();
+          auto sType = localIsRed ? SliceType::get(ctx, 1, vecLen)
+              : SliceType::get(ctx, bitWidth, vecLen);
+          resultSlice = opBuilder.create<MergeSliceVerticallyOp>(
+              loc, sType, resultSlice, second);
+        }
+      }
+
+      return resultSlice;
+    };
+
+    FailureOr<TypedValue<SliceType>> maybeResult;
+    if (builder.hasSubgraphs()) {
+      DenseMap<int64_t, const NetworkBuilder::SubgraphNetwork *> bankToSubgraph;
+      for (const auto &subgraph : builder.getSubgraphNetworks()) {
+        bankToSubgraph[subgraph.bankId] = &subgraph;
+      }
+
+      DenseMap<int64_t, SmallVector<int64_t>> adjacency;
+      DenseMap<int64_t, int> indegree;
+      for (const auto &entry : bankToSubgraph) {
+        indegree[entry.first] = 0;
+      }
+
+      for (const auto &dep : builder.getSubgraphDependencies()) {
+        int64_t producer = static_cast<int64_t>(dep.producerBankId);
+        int64_t consumer = static_cast<int64_t>(dep.consumerBankId);
+        adjacency[producer].push_back(consumer);
+        indegree[consumer] += 1;
+      }
+
+      SmallVector<int64_t> ready;
+      for (const auto &entry : indegree) {
+        if (entry.second == 0) {
+          ready.push_back(entry.first);
+        }
+      }
+      llvm::sort(ready);
+
+      SmallVector<int64_t> orderedBanks;
+      while (!ready.empty()) {
+        int64_t bankId = ready.pop_back_val();
+        orderedBanks.push_back(bankId);
+        for (int64_t consumer : adjacency[bankId]) {
+          auto &count = indegree[consumer];
+          count -= 1;
+          if (count == 0) {
+            ready.push_back(consumer);
+            llvm::sort(ready);
+          }
+        }
+      }
+
+      if (orderedBanks.size() != bankToSubgraph.size()) {
+        orderedBanks.clear();
+        for (const auto &subgraph : builder.getSubgraphNetworks()) {
+          orderedBanks.push_back(subgraph.bankId);
+        }
+      }
+
+      for (int64_t bankId : orderedBanks) {
+        auto it = bankToSubgraph.find(bankId);
+        if (it == bankToSubgraph.end()) {
+          continue;
+        }
+        const auto &subgraph = *it->second;
+        SmallVector<TypedValue<SliceType>> subgraphInputs;
+        for (int64_t valueId : subgraph.inputValueIds) {
+          if (!valueIdToSlice.contains(valueId)) {
+            signalPassFailure();
+            return;
+          }
+          subgraphInputs.push_back(valueIdToSlice.lookup(valueId));
+        }
+
+        auto resultSlice = lowerNetwork(
+            subgraph.mig, subgraphInputs, subgraph.carryMap, subgraph.isMulF,
+            subgraph.isMax, subgraph.isMin, subgraph.bankId);
+        if (failed(resultSlice)) {
+          signalPassFailure();
+          return;
+        }
+
+        for (int64_t valueId : subgraph.outputValueIds) {
+          valueIdToSlice[valueId] = *resultSlice;
+        }
+      }
+    } else {
+      SmallVector<TypedValue<SliceType>> mappedInputs;
+      mappedInputs.reserve(ntkInputs.size());
+      for (const auto &oldSlice : ntkInputs) {
+        assert(mapping.contains(oldSlice));
+        mappedInputs.push_back(
+            cast<TypedValue<SliceType>>(mapping.lookup(oldSlice)));
+      }
+      maybeResult = lowerNetwork(mig, mappedInputs, carryMap, isMulF, isMax,
+                                 isMin, /*bankId=*/0);
+      if (failed(maybeResult)) {
+        signalPassFailure();
+        return;
+      }
     }
 
-    auto resultSlice = outputSlices[0];
-    if (round > 1) {
-      for (int i = 1; i < round; ++i) {
-        auto second = outputSlices[i];
-        auto vecLen = resultSlice.getType().getVectorLength() +
-            second.getType().getVectorLength();
-        auto sType = isRed ? SliceType::get(ctx, 1, vecLen)
-            : SliceType::get(ctx, bitWidth, vecLen);
-        resultSlice = opBuilder.create<MergeSliceVerticallyOp>(
-            loc,
-            sType,
-            resultSlice,
-            second
-        );
+    TypedValue<SliceType> resultSlice;
+    if (builder.hasSubgraphs()) {
+      if (outputValueId < 0 || !valueIdToSlice.contains(outputValueId)) {
+        signalPassFailure();
+        return;
       }
+      resultSlice = valueIdToSlice.lookup(outputValueId);
+    } else {
+      resultSlice = *maybeResult;
     }
 
-    Value resultTensor = opBuilder.create<AssembleOp>(
-        loc, tensorType, resultSlice);
-
+    Value resultTensor =
+        opBuilder.create<AssembleOp>(loc, tensorType, resultSlice);
     opBuilder.create<func::ReturnOp>(loc, resultTensor);
 
   }

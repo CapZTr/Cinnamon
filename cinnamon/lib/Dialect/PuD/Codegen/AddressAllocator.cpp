@@ -4,6 +4,24 @@
 RowAddress AddressAllocator::allocate(int64_t numRows) {
   assert(numRows <= MAX_ROW);
 
+  if (fixedBank >= 0) {
+    if (currentRow + numRows > MAX_ROW) {
+      currentRow = 0;
+      ++currentSubarray;
+      if (currentSubarray > MAX_SUBARRAY) {
+        currentSubarray = 0;
+      }
+    }
+
+    RowAddress addr = {currentChannel,
+                       currentRank,
+                       fixedBank,
+                       currentSubarray,
+                       currentRow};
+    currentRow += numRows;
+    return addr;
+  }
+
   auto subArrayID = checkSpace(numRows);
   auto saLocalID = subArrayID % 64;
 

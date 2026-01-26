@@ -28,7 +28,7 @@ namespace mlir::bits {
 //===----------------------------------------------------------------------===//
 
 int numBanks = 32;
-int cloneDelay = 10;
+int cloneDelay = 1;
 
 struct Node {
   AddIOp op;

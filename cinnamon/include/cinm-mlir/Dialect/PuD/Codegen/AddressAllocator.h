@@ -34,17 +34,28 @@ struct RowAddress {
 class AddressAllocator {
 public:
   AddressAllocator() = default;
+  explicit AddressAllocator(int64_t bankId) { setBank(bankId); }
 
   RowAddress allocate(int64_t numRows);
 
   RowAddress getRowFromOffset(const RowAddress &base, const int64_t offset);
 
   void reset() {
+    reset(-1);
+  }
+
+  void reset(int64_t bankId) {
     currentChannel = 0;
     currentRank = 0;
-    currentBank = 0;
+    fixedBank = bankId;
+    currentBank = bankId >= 0 ? bankId : 0;
     currentSubarray = 0;
     currentRow = 0;
+  }
+
+  void setBank(int64_t bankId) {
+    fixedBank = bankId;
+    currentBank = bankId;
   }
 
   void printStatus() const {
@@ -75,6 +86,8 @@ private:
   int64_t currentRow = 0;
 
   llvm::DenseMap<int64_t, int64_t> restSpace;
+
+  int64_t fixedBank = -1;
 
   int checkSpace(int64_t numRows) const;
 
