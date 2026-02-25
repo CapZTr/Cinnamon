@@ -6,6 +6,7 @@
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 
 #include <llvm/Support/LogicalResult.h>
+#include <mlir/IR/BuiltinAttributes.h>
 #include <mlir/IR/BuiltinTypes.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
@@ -96,6 +97,25 @@ LogicalResult AssembleOp::verify() {
   return success();
 }
 
+LogicalResult ExtensionIOp::verify() {
+  auto operandBitWidth = getSlice().getType().getBitWidth();
+  auto resultBitWidth = getResult().getType().getBitWidth();
+  if (auto constantOp = dyn_cast<arith::ConstantOp>(getRowNumToExt().getDefiningOp())) {
+    if (auto intAttr = dyn_cast<IntegerAttr>(constantOp.getValue())) {
+      auto rowNum = intAttr.getInt();
+      if (rowNum + operandBitWidth != resultBitWidth) {
+        return emitOpError("rowNum doesn't match after extension");
+      }
+    } else {
+      return emitOpError("rowNumToExt must have explicit value");
+    }
+  } else {
+    return emitOpError("rowNumToExt must be constant");
+  }
+
+  return success();
+}
+
 LogicalResult SplitSliceVerticallyOp::verify() {
   auto vecLen = getSlice().getType().getVectorLength();
   if (auto constantOp = dyn_cast<arith::ConstantOp>(
@@ -157,6 +177,24 @@ LogicalResult AddIOp::verify() {
   if (lhsType.getBitWidth() != rhsType.getBitWidth() ||
       lhsType.getBitWidth() != resType.getBitWidth())
     return emitOpError("bit widths of operands and result must match");
+
+  if (lhsType.getVectorLength() != resType.getVectorLength()
+      || rhsType.getVectorLength() != resType.getVectorLength())
+    return emitOpError("vector lengths of operands and result must match");
+  
+  return success();
+}
+
+LogicalResult MulIOp::verify() {
+  auto lhsType = cast<SliceType>(getLhs().getType());
+  auto rhsType = cast<SliceType>(getRhs().getType());
+  auto resType = cast<SliceType>(getResult().getType());
+
+  if (!lhsType || !rhsType || !resType)
+    return emitOpError("operands and result must all be of SliceType");
+
+  if (lhsType.getBitWidth() + rhsType.getBitWidth() != resType.getBitWidth())
+    return emitOpError("sum of bit widths of operands and result must match");
 
   if (lhsType.getVectorLength() != resType.getVectorLength()
       || rhsType.getVectorLength() != resType.getVectorLength())

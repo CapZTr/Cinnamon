@@ -39,6 +39,24 @@ def AssembleOp : Bits_Op<"assemble", [Pure]> {
   let hasVerifier = 1;
 }
 
+def ExtensionIOp : Bits_Op<"ext_i", [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let arguments = (ins
+    SliceType:$slice,
+    I64:$rowNumToExt
+  );
+  let results = (outs
+    SliceType:$result
+  );
+
+  let assemblyFormat = "$slice `,` $rowNumToExt attr-dict `:` "
+      "qualified(type($slice)) `,` type($rowNumToExt) `->` "
+      "qualified(type($result))";
+  let hasVerifier = 1;
+}
+
 def SplitSliceVerticallyOp : Bits_Op<"split_vertically", [Pure]> {
   let summary = "";
   let description = [{}];
@@ -88,6 +106,25 @@ def AddIOp : Bits_Op<"add_i", [Pure]> {
 
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:`"
       "qualified(type($lhs)) `,` qualified(type($rhs))"
+      "`->` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
+def MulIOp : Bits_Op<"mul_i", [Pure]> {
+  let summary = "Bit-serial multiplication of two slice operands "
+      "in integer";
+  let description = [{}];
+
+  let arguments = (ins
+    SliceType:$lhs,
+    SliceType:$rhs
+  );
+  let results = (outs
+    SliceType:$result
+  );
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) "
       "`->` qualified(type($result))";
   let hasVerifier = 1;
 }
