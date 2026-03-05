@@ -4,6 +4,7 @@
 
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 
+#include <cstdint>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/DialectImplementation.h>
 #include <mlir/IR/OpImplementation.h>
@@ -34,7 +35,7 @@ void BitsDialect::registerTypes() {
 }
 
 Type SliceType::parse(AsmParser &parser) {
-  SmallVector<int64_t> shape;
+  SmallVector<int64_t, 2> shape;
 
   if (parser.parseLess() ||
       parser.parseDimensionList(shape, /*allowDynamic=*/false, /*withTrailingX=*/false) ||
@@ -47,4 +48,20 @@ Type SliceType::parse(AsmParser &parser) {
 
 void SliceType::print(AsmPrinter &printer) const {
   printer << "<" << getBitWidth() << "x" << getVectorLength() << ">";
+}
+
+Type CubeType::parse(AsmParser &parser) {
+  SmallVector<int64_t, 3> shape;
+
+  if (parser.parseLess() ||
+      parser.parseDimensionList(shape, false, false) ||
+      parser.parseGreater()) {
+    return  Type();
+  }
+
+  return CubeType::get(parser.getContext(), shape[0], shape[1], shape[2]);
+}
+
+void CubeType::print(AsmPrinter &printer) const {
+  printer << "<" << getBitWidth() << "x" << getVectorLength() << "x" << getHeight() << ">";
 }

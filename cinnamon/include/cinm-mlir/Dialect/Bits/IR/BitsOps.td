@@ -16,11 +16,11 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 
 
 def TransposeOp : Bits_Op<"transpose", [Pure]> {
-  let summary = "Transpose 1-D tensor of integers to Slice type";
+  let summary = "Transpose 1-D tensor to Slice type, or 2-D tansor to Cube type";
   let description = [{}];
 
   let arguments = (ins TensorOf<[AnyInteger, AnyFloat]>:$input);
-  let results = (outs SliceType:$output);
+  let results = (outs AnyTypeOf<[SliceType, CubeType]>:$output);
 
   let assemblyFormat = "$input attr-dict `:` type($input) `->` "
       "qualified(type($output))";
@@ -28,10 +28,10 @@ def TransposeOp : Bits_Op<"transpose", [Pure]> {
 }
 
 def AssembleOp : Bits_Op<"assemble", [Pure]> {
-  let summary = "Assemble a bit-slice to 1-D tensor";
+  let summary = "Assemble a bit-slice to 1-D tensor, or a bit-cube to 2-D tensor";
   let description = [{}];
 
-  let arguments = (ins SliceType:$input);
+  let arguments = (ins AnyTypeOf<[SliceType, CubeType]>:$input);
   let results = (outs TensorOf<[AnyInteger, AnyFloat]>:$output);
 
   let assemblyFormat = "$input attr-dict `:` qualified(type($input)) `->` "
@@ -277,6 +277,38 @@ def MinOp : Bits_Op<"min", [Pure]> {
     SliceType:$result
   );
 
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) "
+      "`->` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
+def MatmulIOp : Bits_Op<"matmul_i",  [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let arguments = (ins
+      CubeType:$lhs,
+      CubeType:$rhs
+  );
+
+  let results = (outs CubeType:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) "
+      "`->` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
+def MatvecIOp : Bits_Op<"matvec_i",  [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let arguments = (ins
+      CubeType:$lhs,
+      SliceType:$rhs
+  );
+
+  let results = (outs SliceType:$result);
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` "
       "qualified(type($lhs)) `,` qualified(type($rhs)) "
       "`->` qualified(type($result))";

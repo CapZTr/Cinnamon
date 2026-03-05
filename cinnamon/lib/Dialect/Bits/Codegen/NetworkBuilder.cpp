@@ -3,6 +3,7 @@
 #include "mockturtle/generators/arithmetic.hpp"
 
 #include <llvm/ADT/DenseSet.h>
+#include <llvm/ADT/FunctionExtras.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/LogicalResult.h>
@@ -27,6 +28,181 @@ NetworkBuilder::NetworkBuilder(func::FuncOp func)
     : module(func->getParentOfType<ModuleOp>()), func(func) {}
 
 LogicalResult NetworkBuilder::build() {
+  std::vector<MIG::signal> inputA;
+  for (int i = 0; i < 4; ++i) {
+    inputA.emplace_back(mig.create_pi());
+  }
+  std::vector<MIG::signal> inputB;
+  for (int i = 0; i < 4; ++i) {
+    inputB.emplace_back(mig.create_pi());
+  }
+  auto res = mockturtle::carry_ripple_multiplier(mig, inputA, inputB);
+  for (auto output : res) {
+    mig.create_po(output);
+  }
+  return success();
+  auto isBinaryOp = [](Operation *op) {
+    return isa<AddIOp>(op) || isa<MulFOp>(op) || isa<AndOp>(op)
+        || isa<OrOp>(op) || isa<XOrOp>(op) || isa<MaxOp>(op)
+        || isa<MinOp>(op) || isa<ReduceAndOp>(op) || isa<ReduceOrOp>(op)
+        || isa<ReduceXOrOp>(op);
+  };
+
+  auto hasOnlyMulFOrNone = [](ArrayRef<Operation *> ops) {
+    const bool noneMulF = llvm::none_of(ops, [](Operation *op) {
+      return isa<MulFOp>(op);
+    });
+    const bool allMulF = llvm::all_of(ops, [](Operation *op) {
+      return isa<MulFOp>(op);
+    });
+    return std::pair{noneMulF, allMulF};
+  };
+
+  auto operandsBuiltIn = [](Operation *op,
+                            const DenseMap<Value, MIG::signal> &signalMap) {
+    return llvm::all_of(op->getOperands(), [&](Value operand) {
+      return signalMap.count(operand);
+    });
+  };
+
+  auto processBinaryOp =
+      [&](Operation *op,
+          DenseMap<Value, MIG::signal> &signalMap,
+          MIG &ntk,
+          DenseMap<int, int> &carryMapRef,
+          llvm::function_ref<void(MulFOp)> onMul,
+          llvm::function_ref<void(MaxOp)> onMax,
+          llvm::function_ref<void(MinOp)> onMin) -> LogicalResult {
+    if (auto add = dyn_cast<AddIOp>(op)) {
+      const auto lhs = signalMap.lookup(add.getLhs());
+      const auto rhs = signalMap.lookup(add.getRhs());
+      const auto cin = ntk.create_pi();
+      const auto [sum, cout] = mockturtle::full_adder(ntk, lhs, rhs, cin);
+      ntk.create_po(cout);
+      signalMap[add.getResult()] = sum;
+      const int cinIndex = ntk.num_pis() - 1;
+      carryMapRef[cinIndex] = ntk.num_pos() - 1;
+      return success();
+    }
+
+    if (auto andOp = dyn_cast<AndOp>(op)) {
+      const auto lhs = signalMap.lookup(andOp.getLhs());
+      const auto rhs = signalMap.lookup(andOp.getRhs());
+      signalMap[andOp.getResult()] = ntk.create_and(lhs, rhs);
+      return success();
+    }
+
+    if (auto orOp = dyn_cast<OrOp>(op)) {
+      const auto lhs = signalMap.lookup(orOp.getLhs());
+      const auto rhs = signalMap.lookup(orOp.getRhs());
+      signalMap[orOp.getResult()] = ntk.create_or(lhs, rhs);
+      return success();
+    }
+
+    if (auto xorOp = dyn_cast<XOrOp>(op)) {
+      const auto lhs = signalMap.lookup(xorOp.getLhs());
+      const auto rhs = signalMap.lookup(xorOp.getRhs());
+      signalMap[xorOp.getResult()] = ntk.create_xor(lhs, rhs);
+      return success();
+    }
+
+    if (auto redAnd = dyn_cast<ReduceAndOp>(op)) {
+      const auto in0 = signalMap.lookup(redAnd.getInput());
+      signalMap[redAnd.getResult()] = ntk.create_and(in0, ntk.create_pi());
+      return success();
+    }
+
+    if (auto redOr = dyn_cast<ReduceOrOp>(op)) {
+      const auto in0 = signalMap.lookup(redOr.getInput());
+      signalMap[redOr.getResult()] = ntk.create_or(in0, ntk.create_pi());
+      return success();
+    }
+
+    if (auto redXor = dyn_cast<ReduceXOrOp>(op)) {
+      const auto in0 = signalMap.lookup(redXor.getInput());
+      signalMap[redXor.getResult()] = ntk.create_xor(in0, ntk.create_pi());
+      return success();
+    }
+
+    if (auto mul = dyn_cast<MulFOp>(op)) {
+      onMul(mul);
+      const auto lhs = signalMap.lookup(mul.getLhs());
+      const auto rhs = signalMap.lookup(mul.getRhs());
+      const auto cin = ntk.create_pi();
+      const auto [sum, cout] = buildAdd(ntk, lhs, rhs, cin);
+      (void)cout;
+      signalMap[mul.getResult()] = sum;
+      const int cinIndex = ntk.num_pis() - 1;
+      carryMapRef[cinIndex] = ntk.num_pos() - 1;
+      return success();
+    }
+
+    if (auto maxOp = dyn_cast<MaxOp>(op)) {
+      onMax(maxOp);
+      const auto lhsSignal = signalMap.lookup(maxOp.getLhs());
+      const auto rhsSignal = signalMap.lookup(maxOp.getRhs());
+      signalMap[maxOp.getResult()] =
+          buildMux2(ntk, ntk.create_pi(), lhsSignal, rhsSignal);
+      return success();
+    }
+
+    if (auto minOp = dyn_cast<MinOp>(op)) {
+      onMin(minOp);
+      const auto lhsSignal = signalMap.lookup(minOp.getLhs());
+      const auto rhsSignal = signalMap.lookup(minOp.getRhs());
+      signalMap[minOp.getResult()] =
+          buildMux2(ntk, ntk.create_pi(), lhsSignal, rhsSignal);
+      return success();
+    }
+
+    return failure();
+  };
+
+  auto buildPendingOps =
+      [&](SmallVectorImpl<Operation *> &pendingOps,
+          DenseMap<Value, MIG::signal> &signalMap,
+          MIG &ntk,
+          DenseMap<int, int> &carryMapRef,
+          llvm::function_ref<void(MulFOp)> onMul,
+          llvm::function_ref<void(MaxOp)> onMax,
+          llvm::function_ref<void(MinOp)> onMin,
+          bool emitUnsupportedError,
+          bool emitMissingOperandError) -> LogicalResult {
+    bool progress = true;
+    while (progress && !pendingOps.empty()) {
+      progress = false;
+
+      for (auto it = pendingOps.begin(); it != pendingOps.end();) {
+        Operation *op = *it;
+        if (!operandsBuiltIn(op, signalMap)) {
+          ++it;
+          continue;
+        }
+
+        if (failed(processBinaryOp(op, signalMap, ntk, carryMapRef,
+                                   onMul, onMax, onMin))) {
+          if (emitUnsupportedError) {
+            emitError(op->getLoc(),
+                      "NetworkBuilder: Unsupported type of binary op");
+          }
+          return failure();
+        }
+
+        it = pendingOps.erase(it);
+        progress = true;
+      }
+    }
+
+    if (!pendingOps.empty()) {
+      if (emitMissingOperandError) {
+        llvm::errs() << "NetworkBuilder: Some binary ops could not be parsed "
+                        "due to missing operands\n";
+      }
+      return failure();
+    }
+
+    return success();
+  };
 
   auto buildBinaryNetwork = [&](ArrayRef<Operation *> ops,
                                 ArrayRef<Value> inputs,
@@ -40,20 +216,12 @@ LogicalResult NetworkBuilder::build() {
     }
 
     for (Operation *op : ops) {
-      if (isa<AddIOp>(op) || isa<MulFOp>(op) || isa<AndOp>(op)
-          || isa<OrOp>(op) || isa<XOrOp>(op) || isa<MaxOp>(op)
-          || isa<MinOp>(op) || isa<ReduceAndOp>(op) || isa<ReduceOrOp>(op)
-          || isa<ReduceXOrOp>(op)) {
+      if (isBinaryOp(op)) {
         pendingBinaryOps.push_back(op);
       }
     }
 
-    bool noneMulF = llvm::none_of(pendingBinaryOps, [](Operation *op) {
-      return isa<MulFOp>(op);
-    });
-    bool allMulF = llvm::all_of(pendingBinaryOps, [](Operation *op) {
-      return isa<MulFOp>(op);
-    });
+    const auto [noneMulF, allMulF] = hasOnlyMulFOrNone(pendingBinaryOps);
 
     if (!(noneMulF || allMulF)) {
       return failure();
@@ -76,85 +244,16 @@ LogicalResult NetworkBuilder::build() {
       }
     }
 
-    bool progress = true;
-    while (progress && !pendingBinaryOps.empty()) {
-      progress = false;
-
-      for (auto it = pendingBinaryOps.begin(); it != pendingBinaryOps.end();) {
-        Operation *op = *it;
-        bool operandsReady = true;
-        for (Value operand : op->getOperands()) {
-          if (!localSignalMap.count(operand)) {
-            operandsReady = false;
-            break;
-          }
-        }
-        if (!operandsReady) {
-          ++it;
-          continue;
-        }
-
-        if (auto add = dyn_cast<AddIOp>(op)) {
-          auto lhs = localSignalMap.lookup(add.getLhs());
-          auto rhs = localSignalMap.lookup(add.getRhs());
-          auto cin = out.mig.create_pi();
-          auto [sum, cout] = mockturtle::full_adder(out.mig, lhs, rhs, cin);
-          out.mig.create_po(cout);
-          localSignalMap[add.getResult()] = sum;
-          const int cinIndex = out.mig.num_pis() - 1;
-          out.carryMap[cinIndex] = out.mig.num_pos() - 1;
-        } else if (auto andOp = dyn_cast<AndOp>(op)) {
-          auto lhs = localSignalMap.lookup(andOp.getLhs());
-          auto rhs = localSignalMap.lookup(andOp.getRhs());
-          localSignalMap[andOp.getResult()] = out.mig.create_and(lhs, rhs);
-        } else if (auto orOp = dyn_cast<OrOp>(op)) {
-          auto lhs = localSignalMap.lookup(orOp.getLhs());
-          auto rhs = localSignalMap.lookup(orOp.getRhs());
-          localSignalMap[orOp.getResult()] = out.mig.create_or(lhs, rhs);
-        } else if (auto xorOp = dyn_cast<XOrOp>(op)) {
-          auto lhs = localSignalMap.lookup(xorOp.getLhs());
-          auto rhs = localSignalMap.lookup(xorOp.getRhs());
-          localSignalMap[xorOp.getResult()] = out.mig.create_xor(lhs, rhs);
-        } else if (auto redAnd = dyn_cast<ReduceAndOp>(op)) {
-          auto in0 = localSignalMap.lookup(redAnd.getInput());
-          localSignalMap[redAnd.getResult()] = out.mig.create_and(
-              in0, out.mig.create_pi());
-        } else if (auto redOr = dyn_cast<ReduceOrOp>(op)) {
-          auto in0 = localSignalMap.lookup(redOr.getInput());
-          localSignalMap[redOr.getResult()] = out.mig.create_or(
-              in0, out.mig.create_pi());
-        } else if (auto redXor = dyn_cast<ReduceXOrOp>(op)) {
-          auto in0 = localSignalMap.lookup(redXor.getInput());
-          localSignalMap[redXor.getResult()] = out.mig.create_xor(
-              in0, out.mig.create_pi());
-        } else if (auto mul = dyn_cast<MulFOp>(op)) {
-          auto lhs = localSignalMap.lookup(mul.getLhs());
-          auto rhs = localSignalMap.lookup(mul.getRhs());
-          auto cin = out.mig.create_pi();
-          auto [sum, cout] = buildAdd(out.mig, lhs, rhs, cin);
-          localSignalMap[mul.getResult()] = sum;
-          const int cinIndex = out.mig.num_pis() - 1;
-          out.carryMap[cinIndex] = out.mig.num_pos() - 1;
-        } else if (auto maxOp = dyn_cast<MaxOp>(op)) {
-          const auto &lhsSignal = localSignalMap.lookup(maxOp.getLhs());
-          const auto &rhsSignal = localSignalMap.lookup(maxOp.getRhs());
-          localSignalMap[maxOp.getResult()] = buildMux2(
-              out.mig, out.mig.create_pi(), lhsSignal, rhsSignal);
-        } else if (auto minOp = dyn_cast<MinOp>(op)) {
-          const auto &lhsSignal = localSignalMap.lookup(minOp.getLhs());
-          const auto &rhsSignal = localSignalMap.lookup(minOp.getRhs());
-          localSignalMap[minOp.getResult()] = buildMux2(
-              out.mig, out.mig.create_pi(), lhsSignal, rhsSignal);
-        } else {
-          return failure();
-        }
-
-        it = pendingBinaryOps.erase(it);
-        progress = true;
-      }
-    }
-
-    if (!pendingBinaryOps.empty()) {
+    if (failed(buildPendingOps(
+            pendingBinaryOps,
+            localSignalMap,
+            out.mig,
+            out.carryMap,
+            [](MulFOp) {},
+            [](MaxOp) {},
+            [](MinOp) {},
+            /*emitUnsupportedError=*/false,
+            /*emitMissingOperandError=*/false))) {
       return failure();
     }
 
@@ -193,22 +292,14 @@ LogicalResult NetworkBuilder::build() {
         mulFSignSignalMap[slice] = mulFSignNtk.create_pi();
       }
       inputSlices.push_back(slice);
-    } else if (isa<AddIOp>(op) || isa<MulFOp>(op) || isa<AndOp>(op)
-        || isa<OrOp>(op) || isa<XOrOp>(op) || isa<MaxOp>(op) || isa<MinOp>(op)
-        || isa<ReduceAndOp>(op) || isa<ReduceOrOp>(op) || isa<ReduceXOrOp>(op))
-    {
+    } else if (isBinaryOp(op)) {
       pendingBinaryOps.push_back(op);
     } else if (auto assembleOp = dyn_cast<AssembleOp>(op)) {
       assemble = assembleOp;
     }
   });
 
-  bool noneMulF = llvm::none_of(pendingBinaryOps, [](Operation *op) {
-    return isa<MulFOp>(op);
-  });
-  bool allMulF = llvm::all_of(pendingBinaryOps, [](Operation *op) {
-    return isa<MulFOp>(op);
-  });
+  const auto [noneMulF, allMulF] = hasOnlyMulFOrNone(pendingBinaryOps);
 
   assert((noneMulF || allMulF) &&
       "pendingBinaryOps must contain either all MulFOp or none MulFOp");
@@ -232,128 +323,35 @@ LogicalResult NetworkBuilder::build() {
 
   assert((int)isMulF + (int)isMax + (int)isMin <= 1);
 
-  bool progress = true;
-  while (progress && !pendingBinaryOps.empty()) {
-    progress = false;
-
-    for (auto it = pendingBinaryOps.begin(); it != pendingBinaryOps.end();) {
-      if (operandsBuilt(*it)) {
-        if (auto add = dyn_cast<AddIOp>(*it)) {
-          auto lhs = migSignalMap.lookup(add.getLhs());
-          auto rhs = migSignalMap.lookup(add.getRhs());
-          auto cin = mig.create_pi();
-          auto [sum, cout] = mockturtle::full_adder(mig, lhs, rhs, cin);
-          mig.create_po(cout);
-          migSignalMap[add.getResult()] = sum;
-          const int cinIdex = mig.num_pis() - 1;
-          assert(!carryMap.contains(cinIdex));
-          carryMap[cinIdex] = mig.num_pos() - 1;
-
-          it = pendingBinaryOps.erase(it);
-          progress = true;
-        } else if (auto andOp = dyn_cast<AndOp>(*it)) {
-          auto lhs = migSignalMap.lookup(andOp.getLhs());
-          auto rhs = migSignalMap.lookup(andOp.getRhs());
-          migSignalMap[andOp.getResult()] = mig.create_and(lhs, rhs);
-          it = pendingBinaryOps.erase(it);
-          progress = true;
-        } else if (auto orOp = dyn_cast<OrOp>(*it)) {
-          auto lhs = migSignalMap.lookup(orOp.getLhs());
-          auto rhs = migSignalMap.lookup(orOp.getRhs());
-          migSignalMap[orOp.getResult()] = mig.create_or(lhs, rhs);
-          it = pendingBinaryOps.erase(it);
-          progress = true;
-        } else if (auto xorOp = dyn_cast<XOrOp>(*it)) {
-          auto lhs = migSignalMap.lookup(xorOp.getLhs());
-          auto rhs = migSignalMap.lookup(xorOp.getRhs());
-          migSignalMap[xorOp.getResult()] = mig.create_xor(lhs, rhs);
-          it = pendingBinaryOps.erase(it);
-          progress = true;
-        } else if (auto redAnd = dyn_cast<ReduceAndOp>(*it)) {
-          auto in0 = migSignalMap.lookup(redAnd.getInput());
-          migSignalMap[redAnd.getResult()] = mig.create_and(
-              in0, mig.create_pi());
-          it = pendingBinaryOps.erase(it);
-          progress = true;
-        } else if (auto redOr = dyn_cast<ReduceOrOp>(*it)) {
-          auto in0 = migSignalMap.lookup(redOr.getInput());
-          migSignalMap[redOr.getResult()] = mig.create_or(
-              in0, mig.create_pi());
-          it = pendingBinaryOps.erase(it);
-          progress = true;
-        } else if (auto redXor = dyn_cast<ReduceXOrOp>(*it)) {
-          auto in0 = migSignalMap.lookup(redXor.getInput());
-          migSignalMap[redXor.getResult()] = mig.create_xor(
-              in0, mig.create_pi());
-          it = pendingBinaryOps.erase(it);
-          progress = true;
-        } else if (auto mul = dyn_cast<MulFOp>(*it)) {
-          // sign
-          const auto &lhsSign = mulFSignSignalMap[mul.getLhs()];
-          const auto &rhsSign = mulFSignSignalMap[mul.getRhs()];
-          mulFSignSignalMap[mul.getResult()] = mulFSignNtk.create_xor(
-              lhsSign, rhsSign);
-
-          // exponent and mantissa
-          auto lhs = migSignalMap.lookup(mul.getLhs());
-          auto rhs = migSignalMap.lookup(mul.getRhs());
-          auto cin = mig.create_pi();
-          auto [sum, cout] = buildAdd(mig, lhs, rhs, cin);
-          migSignalMap[mul.getResult()] = sum;
-          const int cinIdex = mig.num_pis() - 1;
-          assert(!carryMap.contains(cinIdex));
-          carryMap[cinIdex] = mig.num_pos() - 1;
-
-          it = pendingBinaryOps.erase(it);
-          progress = true;
-        } else if (auto maxOp = dyn_cast<MaxOp>(*it)) {
-          const auto lhs = maxOp.getLhs();
-          const auto rhs = maxOp.getRhs();
-          // GT
-          const auto &lhsGTSignal = gtSignalMap[lhs];
-          const auto &rhsGTSignal = gtSignalMap[rhs];
-          gtNtk.create_po(
-              gtNtk.create_and(lhsGTSignal, gtNtk.create_not(rhsGTSignal)));
-          
-          // Mux
-          const auto &lhsSignal = migSignalMap[lhs];
-          const auto &rhsSignal = migSignalMap[rhs];
-          migSignalMap[maxOp.getResult()] = buildMux2(
-              mig, mig.create_pi(), lhsSignal, rhsSignal);
-
-          it = pendingBinaryOps.erase(it);
-          progress = true;
-        } else if (auto minOp = dyn_cast<MinOp>(*it)) {
-          const auto lhs = minOp.getLhs();
-          const auto rhs = minOp.getRhs();
-          // LT
-          const auto &lhsLTSignal = ltSignalMap[lhs];
-          const auto &rhsLTSignal = ltSignalMap[rhs];
-          ltNtk.create_po(
-              ltNtk.create_and(ltNtk.create_not(lhsLTSignal), rhsLTSignal));
-          
-          // Mux
-          const auto &lhsSignal = migSignalMap[lhs];
-          const auto &rhsSignal = migSignalMap[rhs];
-          migSignalMap[minOp.getResult()] = buildMux2(
-              mig, mig.create_pi(), lhsSignal, rhsSignal);
-
-          it = pendingBinaryOps.erase(it);
-          progress = true;
-        } else {
-          emitError((*it)->getLoc(),
-                    "NetworkBuilder: Unsupported type of binary op");
-          return failure();
-        }
-      } else {
-        ++it;
-      }
-    }
-  }
-
-  if (!pendingBinaryOps.empty()) {
-    llvm::errs() << "NetworkBuilder: Some binary ops could not be parsed "
-        "due to missing operands\n";
+  if (failed(buildPendingOps(
+          pendingBinaryOps,
+          migSignalMap,
+          mig,
+          carryMap,
+          [&](MulFOp mul) {
+            const auto lhsSign = mulFSignSignalMap.lookup(mul.getLhs());
+            const auto rhsSign = mulFSignSignalMap.lookup(mul.getRhs());
+            mulFSignSignalMap[mul.getResult()] =
+                mulFSignNtk.create_xor(lhsSign, rhsSign);
+          },
+          [&](MaxOp maxOp) {
+            const auto lhs = maxOp.getLhs();
+            const auto rhs = maxOp.getRhs();
+            const auto lhsGTSignal = gtSignalMap.lookup(lhs);
+            const auto rhsGTSignal = gtSignalMap.lookup(rhs);
+            gtNtk.create_po(
+                gtNtk.create_and(lhsGTSignal, gtNtk.create_not(rhsGTSignal)));
+          },
+          [&](MinOp minOp) {
+            const auto lhs = minOp.getLhs();
+            const auto rhs = minOp.getRhs();
+            const auto lhsLTSignal = ltSignalMap.lookup(lhs);
+            const auto rhsLTSignal = ltSignalMap.lookup(rhs);
+            ltNtk.create_po(
+                ltNtk.create_and(ltNtk.create_not(lhsLTSignal), rhsLTSignal));
+          },
+          /*emitUnsupportedError=*/true,
+          /*emitMissingOperandError=*/true))) {
     return failure();
   }
 
@@ -514,12 +512,4 @@ MIG::signal NetworkBuilder::buildMux2(MIG &ntk,
   auto and1 = ntk.create_and(s, lhs);
   auto and2 = ntk.create_and(ntk.create_not(s), rhs);
   return ntk.create_or(and1, and2);
-}
-
-bool NetworkBuilder::operandsBuilt(Operation *op) const {
-  for (auto operand : op->getOperands()) {
-    if (!migSignalMap.count(operand))
-      return false;
-  }
-  return true;
 }

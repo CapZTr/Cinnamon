@@ -37,62 +37,52 @@ void BitsDialect::registerOps() {
 
 LogicalResult TransposeOp::verify() {
   auto inputType = cast<RankedTensorType>(getInput().getType());
-  if (!inputType || inputType.getRank() != 1)
-    return emitOpError("input must be a 1D ranked tensor");
+  if (!inputType || (inputType.getRank() != 1 && inputType.getRank() != 2))
+    return emitOpError("input must be a 1D/2D ranked tensor");
 
-  auto outputType = cast<SliceType>(getOutput().getType());
-  if (!outputType)
-    return emitOpError("output must be of SliceType");
+  if (inputType.getRank() == 1) {
+    auto outputType = cast<SliceType>(getOutput().getType());
+    if (!outputType)
+      return emitOpError("output must be of SliceType if input is 1D");
+  } else {
+    auto outputType = cast<CubeType>(getOutput().getType());
+    if (!outputType)
+      return emitOpError("output must be of CubeType if input is 2D");
+  }
 
   Type elemType = inputType.getElementType();
-  unsigned bitWidth = 0;
-
   if (auto intTy = dyn_cast<IntegerType>(elemType)) {
-    bitWidth = intTy.getWidth();
   } else if (auto floatTy = dyn_cast<FloatType>(elemType)) {
-    bitWidth = floatTy.getWidth();
   } else {
     return emitOpError() << "tensor elements must be integer or float, but got "
                          << elemType;
   }
-
-  if (outputType.getBitWidth() != bitWidth)
-    return emitOpError(
-        "bit width mismatch between input tensor element and output slice");
-
-  if (outputType.getVectorLength() != inputType.getDimSize(0))
-    return emitOpError("vector length mismatch between input and output");
 
   return success();
 }
 
 LogicalResult AssembleOp::verify() {
-  auto inputType = cast<SliceType>(getInput().getType());
-  if (!inputType)
-    return emitOpError("input must be of SliceType");
-
   auto outputType = cast<RankedTensorType>(getOutput().getType());
-  if (!outputType || outputType.getRank() != 1)
-    return emitOpError("output must be a 1D ranked tensor");
+  if (!outputType || (outputType.getRank() != 1 && outputType.getRank() != 2))
+    return emitOpError("output must be a 1D/2D ranked tensor");
+
+  if (outputType.getRank() == 1) {
+    auto inputType = cast<SliceType>(getInput().getType());
+    if (!inputType)
+      return emitOpError("input must be of SliceType if output is 1D tensor");
+  } else {
+    auto inputType = cast<CubeType>(getInput().getType());
+    if (!inputType)
+      return emitOpError("input must be of CubeType if output is 2D tensor");
+  }
 
   Type elemType = outputType.getElementType();
-  unsigned bitWidth = 0;
-
   if (auto intTy = dyn_cast<IntegerType>(elemType)) {
-    bitWidth = intTy.getWidth();
   } else if (auto floatTy = dyn_cast<FloatType>(elemType)) {
-    bitWidth = floatTy.getWidth();
   } else {
     return emitOpError() << "tensor elements must be integer or float, but got "
                          << elemType;
   }
-
-  if (inputType.getBitWidth() != bitWidth)
-    return emitOpError(
-        "bit width mismatch between input slice and output tensor element");
-
-  if (inputType.getVectorLength() != outputType.getDimSize(0))
-    return emitOpError("vector length mismatch between input and output");
 
   return success();
 }
@@ -314,5 +304,44 @@ LogicalResult MinOp::verify() {
       || rhsType.getVectorLength() != resType.getVectorLength())
     return emitOpError("vector lengths of operands and result must match");
   
+  return success();
+}
+
+LogicalResult MatmulIOp::verify() {
+  auto lhsType = cast<CubeType>(getLhs().getType());
+  auto rhsType = cast<CubeType>(getRhs().getType());
+  auto resType = cast<CubeType>(getResult().getType());
+
+  if (!lhsType || !rhsType || !resType)
+    return emitOpError("operands and result must all be of CubeType");
+
+  if (lhsType.getBitWidth() != rhsType.getBitWidth() ||
+      lhsType.getBitWidth() * 2 != resType.getBitWidth())
+    return emitOpError("bit widths of operands and result must match");
+  
+  if (lhsType.getVectorLength() != resType.getVectorLength() ||
+      rhsType.getHeight() != resType.getHeight() ||
+      lhsType.getHeight() != rhsType.getVectorLength())
+    return emitOpError("wrong size");
+
+  return success();
+}
+
+LogicalResult MatvecIOp::verify() {
+  auto lhsType = cast<CubeType>(getLhs().getType());
+  auto rhsType = cast<SliceType>(getRhs().getType());
+  auto resType = cast<SliceType>(getResult().getType());
+
+  if (!lhsType || !rhsType || !resType)
+    return emitOpError("wrong type");
+
+  if (lhsType.getBitWidth() != rhsType.getBitWidth() ||
+      lhsType.getBitWidth() * 2 != resType.getBitWidth())
+    return emitOpError("bit widths of operands and result must match");
+  
+  if (lhsType.getVectorLength() != resType.getVectorLength() ||
+      lhsType.getHeight() != rhsType.getVectorLength())
+    return emitOpError("wrong size");
+
   return success();
 }

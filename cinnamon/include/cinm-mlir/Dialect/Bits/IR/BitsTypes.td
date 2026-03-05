@@ -19,4 +19,16 @@ def SliceType : Bits_Type<"Slice"> {
   let hasCustomAssemblyFormat = 1;
 }
 
+def CubeType : Bits_Type<"Cube"> {
+  let mnemonic = "cube";
+  let summary = "";
+
+  let parameters = (ins
+      "int64_t":$bitWidth,
+      "int64_t":$vectorLength,
+      "int64_t":$height
+  );
+  let hasCustomAssemblyFormat = 1;
+}
+
 #endif

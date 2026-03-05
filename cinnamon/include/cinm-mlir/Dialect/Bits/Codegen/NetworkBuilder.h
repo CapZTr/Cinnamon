@@ -76,9 +76,9 @@ public:
 
   const DenseMap<int, int> &getCarryMap() const { return carryMap; }
 
-  ArrayRef<TypedValue<SliceType>> getInputSlices() const { return inputSlices; }
+  ArrayRef<Value> getInputSlices() const { return inputSlices; }
 
-  ArrayRef<TypedValue<SliceType>> getOutputSlices() const {
+  ArrayRef<Value> getOutputSlices() const {
     return outputSlices;
   }
 
@@ -148,8 +148,8 @@ private:
   DenseMap<Value, MIG::signal> gtSignalMap;
   DenseMap<Value, MIG::signal> ltSignalMap;
   DenseMap<int, int> carryMap;
-  SmallVector<TypedValue<SliceType>> inputSlices;
-  SmallVector<TypedValue<SliceType>, 1> outputSlices;
+  SmallVector<Value> inputSlices;
+  SmallVector<Value, 1> outputSlices;
   SmallVector<SubgraphNetwork, 0> subgraphNetworks;
   SmallVector<SubgraphDependency> subgraphDependencies;
 
@@ -162,7 +162,6 @@ private:
                         MIG::signal const &lhs,
                         MIG::signal const &rhs);
 
-  bool operandsBuilt(Operation *op) const;
 };
 
 }

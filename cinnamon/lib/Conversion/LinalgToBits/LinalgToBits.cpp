@@ -51,10 +51,6 @@ struct ConvertLinalgGenericToBits
       linalg::GenericOp op,
       linalg::GenericOp::Adaptor,
       ConversionPatternRewriter &rewriter) const override {
-    
-    if (op.getInputs().size() != 2 || op.getOutputs().size() != 1)
-      return failure();
-
     if (op.getNumLoops() != 1)
       return failure();
 
@@ -68,24 +64,19 @@ struct ConvertLinalgGenericToBits
         return failure();
     }
 
+    if (op.getOutputs().size() != 1)
+      return failure();
+
     auto outputType = dyn_cast<RankedTensorType>(op.getResultTypes().front());
     if (!outputType || outputType.getRank() != 1)
       return failure();
 
-    auto inputType = dyn_cast<RankedTensorType>(op.getInputs().front().getType());
-    if (!inputType || inputType.getRank() != 1)
-      return failure();
-
     Location loc = op.getLoc();
-    auto elemType = inputType.getElementType();
     auto ctx = rewriter.getContext();
-    int64_t bitWidth = elemType.getIntOrFloatBitWidth();
-    int64_t vectorLen = inputType.getShape()[0];
+    int64_t vectorLen = outputType.getShape()[0];
 
     auto &inputCache = InputCache::get();
     auto &sliceCache = SliceCache::get();
-
-    auto sliceType = SliceType::get(ctx, bitWidth, vectorLen);
 
     auto getOrCreateSlice = [&](Value operand) -> Value {
       Operation *defOp = operand.getDefiningOp();
@@ -99,11 +90,68 @@ struct ConvertLinalgGenericToBits
       if (it != inputCache.end())
         return it->second;
 
-      Value slice = rewriter.create<TransposeOp>(loc, sliceType, operand);
+      auto operandType = dyn_cast<RankedTensorType>(operand.getType());
+      if (!operandType)
+        return {};
+
+      auto rank = operandType.getRank();
+      if (rank != 1 && rank != 2) {
+        return {};
+      }
+
+      auto operandElemType = operandType.getElementType();
+      int64_t operandBitWidth = operandElemType.getIntOrFloatBitWidth();
+      Value slice;
+      if (rank == 1) {
+        auto operandSliceType = SliceType::get(ctx, operandBitWidth, vectorLen);
+        slice = rewriter.create<TransposeOp>(loc, operandSliceType, operand);
+      } else {
+      }
 
       inputCache[operand] = slice;
 
       return slice;
+    };
+
+    auto getExtSIGenericSource = [&](Value tensorValue) -> Value {
+      auto generic = dyn_cast_or_null<linalg::GenericOp>(
+          tensorValue.getDefiningOp());
+      if (!generic || generic.getInputs().size() != 1
+          || generic.getOutputs().size() != 1) {
+        return {};
+      }
+
+      auto &gBlock = generic.getRegion().front();
+      auto yield = dyn_cast<linalg::YieldOp>(gBlock.getTerminator());
+      if (!yield || yield.getValues().size() != 1)
+        return {};
+
+      auto ext = dyn_cast_or_null<arith::ExtSIOp>(
+          yield.getValues().front().getDefiningOp());
+      if (!ext)
+        return {};
+
+      auto arg = dyn_cast<BlockArgument>(ext.getIn());
+      if (!arg || arg.getOwner() != &gBlock || arg.getArgNumber() != 0)
+        return {};
+
+      return generic.getInputs().front();
+    };
+
+    auto getMulOperandSlice = [&](Value tensorOperand) -> Value {
+      if (auto source = getExtSIGenericSource(tensorOperand)) {
+        return getOrCreateSlice(source);
+      }
+
+      if (auto assemble =
+              dyn_cast_or_null<bits::AssembleOp>(tensorOperand.getDefiningOp())) {
+        if (auto ext =
+                dyn_cast_or_null<bits::ExtensionIOp>(assemble.getInput().getDefiningOp())) {
+          return ext.getSlice();
+        }
+      }
+
+      return getOrCreateSlice(tensorOperand);
     };
 
     auto &block = op.getRegion().front();
@@ -116,8 +164,58 @@ struct ConvertLinalgGenericToBits
 
     Value yieldedValue = yieldOp.getValues().front();
     Operation *yieldedOp = yieldedValue.getDefiningOp();
-    if (!yieldedOp || yieldedOp->getNumOperands() != 2)
+    if (!yieldedOp)
       return failure();
+
+    if (op.getInputs().size() == 1) {
+      auto extOp = dyn_cast<arith::ExtSIOp>(yieldedOp);
+      if (!extOp)
+        return failure();
+
+      auto arg = dyn_cast<BlockArgument>(extOp.getIn());
+      if (!arg || arg.getOwner() != &block || arg.getArgNumber() != 0)
+        return failure();
+
+      auto inputType = dyn_cast<RankedTensorType>(op.getInputs().front().getType());
+      if (!inputType || inputType.getRank() != 1)
+        return failure();
+
+      auto inputElemType = dyn_cast<IntegerType>(inputType.getElementType());
+      auto outputElemType = dyn_cast<IntegerType>(outputType.getElementType());
+      if (!inputElemType || !outputElemType)
+        return failure();
+
+      const int64_t inputBitWidth = inputElemType.getWidth();
+      const int64_t outputBitWidth = outputElemType.getWidth();
+      if (outputBitWidth < inputBitWidth)
+        return failure();
+
+      Value inputSlice = getOrCreateSlice(op.getInputs().front());
+      if (!inputSlice)
+        return failure();
+      auto extResultType = SliceType::get(ctx, outputBitWidth, vectorLen);
+      auto rowNumToExt = rewriter.create<arith::ConstantIntOp>(
+          loc, outputBitWidth - inputBitWidth, 64);
+      Value newResult = rewriter.create<ExtensionIOp>(loc,
+                                                      extResultType,
+                                                      inputSlice,
+                                                      rowNumToExt);
+
+      sliceCache[op] = newResult;
+      Value result = rewriter.create<AssembleOp>(loc, outputType, newResult);
+      rewriter.replaceOp(op, result);
+      return success();
+    }
+
+    if (op.getInputs().size() != 2 || yieldedOp->getNumOperands() != 2)
+      return failure();
+
+    auto inputType = dyn_cast<RankedTensorType>(op.getInputs().front().getType());
+    if (!inputType || inputType.getRank() != 1)
+      return failure();
+    auto elemType = inputType.getElementType();
+    int64_t bitWidth = elemType.getIntOrFloatBitWidth();
+    auto sliceType = SliceType::get(ctx, bitWidth, vectorLen);
 
     auto lhsArg = dyn_cast<BlockArgument>(yieldedOp->getOperand(0));
     auto rhsArg = dyn_cast<BlockArgument>(yieldedOp->getOperand(1));
@@ -136,10 +234,25 @@ struct ConvertLinalgGenericToBits
 
     Value lhsSlice = getOrCreateSlice(lhsInput);
     Value rhsSlice = getOrCreateSlice(rhsInput);
+    if (isa<arith::MulIOp>(yieldedOp)) {
+      lhsSlice = getMulOperandSlice(lhsInput);
+      rhsSlice = getMulOperandSlice(rhsInput);
+    }
+    if (!lhsSlice || !rhsSlice)
+      return failure();
 
     Value newResult;
     if (isa<arith::AddIOp>(yieldedOp)) {
       newResult = rewriter.create<AddIOp>(loc, sliceType, lhsSlice, rhsSlice);
+    } else if (isa<arith::MulIOp>(yieldedOp)) {
+      auto lhsSliceType = cast<SliceType>(lhsSlice.getType());
+      auto rhsSliceType = cast<SliceType>(rhsSlice.getType());
+      auto mulResultSliceType =
+          SliceType::get(ctx,
+                         lhsSliceType.getBitWidth() + rhsSliceType.getBitWidth(),
+                         vectorLen);
+      newResult = rewriter.create<MulIOp>(loc, mulResultSliceType, lhsSlice,
+                                          rhsSlice);
     } else if (isa<arith::MulFOp>(yieldedOp)) {
       newResult = rewriter.create<MulFOp>(loc, sliceType, lhsSlice, rhsSlice);
     } else if (isa<arith::AndIOp>(yieldedOp)) {
@@ -179,13 +292,15 @@ struct ConvertLinalgToBits
     ConversionTarget target(ctx);
     target.markUnknownOpDynamicallyLegal([](...) { return true; });
     target.addLegalDialect<BitsDialect>();
-    target.addIllegalOp<linalg::GenericOp>();
+    // target.addIllegalOp<linalg::GenericOp>();
+    target.addIllegalDialect<linalg::LinalgDialect>();
 
     if (applyPartialConversion(func, target, std::move(patterns)).failed()) {
       signalPassFailure();
     }
 
     removeUnnecessaryAssembles(func);
+    removeUnusedExtensionsAndConstants(func);
     removeUnusedTensorEmpties(func);
   }
 
@@ -221,59 +336,30 @@ struct ConvertLinalgToBits
       op->erase();
   }
 
-  static void simplify(func::FuncOp func) {
-    SmallVector<std::tuple<OpOperand *, Value>, 8> toRewire;
-    SmallVector<Operation *, 8> toErase;
+  static void removeUnusedExtensionsAndConstants(func::FuncOp func) {
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      SmallVector<Operation *> toErase;
 
-    func->walk([&](AssembleOp assemble) {
-      bool usedByReturn = false;
-
-      for (Operation* user : assemble->getUsers()) {
-        if (auto returnOp = dyn_cast<func::ReturnOp>(user)) {
-          usedByReturn = true;
-          break;
+      func.walk([&](bits::ExtensionIOp extOp) {
+        if (extOp.getResult().use_empty()) {
+          toErase.push_back(extOp);
         }
-      }
+      });
 
-      if (usedByReturn)
-        return;
-
-      SmallVector<Operation *, 2> transposesToErase;
-      unsigned userCount = 0;
-      for (Operation* user : assemble->getUsers()) {
-        ++userCount;
-        auto transpose = dyn_cast<TransposeOp>(user);
-        // if (!transpose || transpose->hasOneUse())
-        //   continue;
-
-        auto add = dyn_cast<AddIOp>(*transpose->user_begin());
-        // if (!add)
-        //   continue;
-
-        Value originalSlice = assemble.getInput();
-        for (OpOperand &operand : add->getOpOperands()) {
-          if (operand.get() == transpose.getOutput()) {
-            toRewire.emplace_back(&operand, originalSlice);
-          }
+      func.walk([&](arith::ConstantOp cstOp) {
+        if (cstOp.getResult().use_empty()) {
+          toErase.push_back(cstOp);
         }
+      });
 
-        transposesToErase.push_back(transpose);
-      }
+      if (toErase.empty())
+        break;
 
-      if (transposesToErase.size() == userCount) {
-        for (auto *transpose : transposesToErase) {
-          toErase.push_back(transpose);
-        }
-        toErase.push_back(assemble);
-      }
-    });
-
-    for (auto [operandPtr, slice] : toRewire) {
-      operandPtr->set(slice);
-    }
-
-    for (auto *op : toErase) {
-      op->erase();
+      changed = true;
+      for (Operation *op : toErase)
+        op->erase();
     }
   }
 };
