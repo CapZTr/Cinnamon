@@ -5,6 +5,7 @@
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 
+#include <cstdint>
 #include <llvm/Support/LogicalResult.h>
 #include <mlir/IR/BuiltinAttributes.h>
 #include <mlir/IR/BuiltinTypes.h>
@@ -40,23 +41,34 @@ LogicalResult TransposeOp::verify() {
   if (!inputType || (inputType.getRank() != 1 && inputType.getRank() != 2))
     return emitOpError("input must be a 1D/2D ranked tensor");
 
+  int64_t outputBitWidth = 0;
   if (inputType.getRank() == 1) {
     auto outputType = cast<SliceType>(getOutput().getType());
     if (!outputType)
       return emitOpError("output must be of SliceType if input is 1D");
+    outputBitWidth = outputType.getBitWidth();
   } else {
     auto outputType = cast<CubeType>(getOutput().getType());
     if (!outputType)
       return emitOpError("output must be of CubeType if input is 2D");
+    outputBitWidth = outputType.getBitWidth();
   }
 
   Type elemType = inputType.getElementType();
+  int64_t bitWidth = 0;
+
   if (auto intTy = dyn_cast<IntegerType>(elemType)) {
+    bitWidth = intTy.getWidth();
   } else if (auto floatTy = dyn_cast<FloatType>(elemType)) {
+    bitWidth = floatTy.getWidth();
   } else {
     return emitOpError() << "tensor elements must be integer or float, but got "
                          << elemType;
   }
+
+  if (outputBitWidth != bitWidth)
+    return emitOpError(
+        "bit width mismatch between input tensor element and output slice");
 
   return success();
 }
@@ -66,23 +78,34 @@ LogicalResult AssembleOp::verify() {
   if (!outputType || (outputType.getRank() != 1 && outputType.getRank() != 2))
     return emitOpError("output must be a 1D/2D ranked tensor");
 
+  int64_t inputBitWidth = 0;
   if (outputType.getRank() == 1) {
     auto inputType = cast<SliceType>(getInput().getType());
     if (!inputType)
       return emitOpError("input must be of SliceType if output is 1D tensor");
+    inputBitWidth = inputType.getBitWidth();
   } else {
     auto inputType = cast<CubeType>(getInput().getType());
     if (!inputType)
       return emitOpError("input must be of CubeType if output is 2D tensor");
+    inputBitWidth = inputType.getBitWidth();
   }
 
   Type elemType = outputType.getElementType();
+  unsigned bitWidth = 0;
+
   if (auto intTy = dyn_cast<IntegerType>(elemType)) {
+    bitWidth = intTy.getWidth();
   } else if (auto floatTy = dyn_cast<FloatType>(elemType)) {
+    bitWidth = floatTy.getWidth();
   } else {
     return emitOpError() << "tensor elements must be integer or float, but got "
                          << elemType;
   }
+
+  if (inputBitWidth != bitWidth)
+    return emitOpError(
+        "bit width mismatch between input slice and output tensor element");
 
   return success();
 }
