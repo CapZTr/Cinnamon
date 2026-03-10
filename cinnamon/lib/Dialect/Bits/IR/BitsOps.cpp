@@ -6,6 +6,7 @@
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 
 #include <cstdint>
+#include <llvm/Support/Casting.h>
 #include <llvm/Support/LogicalResult.h>
 #include <mlir/IR/BuiltinAttributes.h>
 #include <mlir/IR/BuiltinTypes.h>
@@ -107,6 +108,24 @@ LogicalResult AssembleOp::verify() {
     return emitOpError(
         "bit width mismatch between input slice and output tensor element");
 
+  return success();
+}
+
+LogicalResult ExtractSliceOp::verify() {
+  if (getCube().getType().getBitWidth() != getSlice().getType().getBitWidth() ||
+      getCube().getType().getVectorLength() != getSlice().getType().getVectorLength()) {
+    return emitOpError("bitwidth and vectorlength of cube and slice must match");
+  }
+
+  return success();
+}
+
+LogicalResult InsertSliceOp::verify() {
+  if (getCube().getType().getBitWidth() != getSlice().getType().getBitWidth() ||
+      getCube().getType().getVectorLength() != getSlice().getType().getVectorLength()) {
+    return emitOpError("bitwidth and vectorlength of cube and slice must match");
+  }
+  
   return success();
 }
 

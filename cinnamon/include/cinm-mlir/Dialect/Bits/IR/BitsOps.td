@@ -39,6 +39,43 @@ def AssembleOp : Bits_Op<"assemble", [Pure]> {
   let hasVerifier = 1;
 }
 
+def ExtractSliceOp : Bits_Op<"extract_slice", [Pure]> {
+  let summary = "Extract one slice with the given layer from a cube";
+  let description = [{}];
+
+  let arguments = (ins CubeType:$cube, I64:$layer);
+  let results = (outs SliceType:$slice);
+
+  let assemblyFormat = "$cube `,` $layer attr-dict `:` "
+      "qualified(type($cube)) `,` type($layer) `->` "
+      "qualified(type($slice))";
+  let hasVerifier = 1;
+}
+
+def InsertSliceOp : Bits_Op<"insert_slice", [Pure]> {
+  let summary = "Insert a slice to the given layer of a cube";
+  let description = [{}];
+
+  let arguments = (ins CubeType:$cube, SliceType:$slice, I64:$layer);
+  let results = (outs CubeType:$resultCube);
+
+  let assemblyFormat = "$cube `,` $slice `,` $layer attr-dict `:` "
+      "qualified(type($cube)) `,` qualified(type($slice)) `,` type($layer) "
+      "`->` qualified(type($resultCube))";
+  let hasVerifier = 1;
+}
+
+def ExtractAndReplicateColumnOp : Bits_Op<"extract_and_replicate", [Pure]> {
+  let summary = "Extract one column with the given index from a slice and replicate given time as a new slice";
+  let description = [{}];
+
+  let arguments = (ins SliceType:$slice, I64:$index, I64:$time);
+  let results = (outs SliceType:$resultSlice);
+
+  let assemblyFormat = "$slice `,` $index `,` $time attr-dict `:`"
+      "qualified(type($slice)) `,` type($index) `,` type($time) `->` qualified(type($resultSlice))";
+}
+
 def ExtensionIOp : Bits_Op<"ext_i", [Pure]> {
   let summary = "";
   let description = [{}];
@@ -319,8 +356,20 @@ def CreateSliceOp : Bits_Op<"create_slice", [Pure]> {
   let summary = "";
   let description = [{}];
 
+  let arguments = (ins I64:$bitWidth, I64:$vectorLength);
   let results = (outs SliceType:$slice);
-  let assemblyFormat = "attr-dict `:` qualified(type($slice))";
+  let assemblyFormat = "$bitWidth `,` $vectorLength attr-dict `:` "
+      "type($bitWidth) `,` type($vectorLength) `->` qualified(type($slice))";
+}
+
+def CreateCubeOp : Bits_Op<"create_cube", [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let arguments = (ins I64:$bitWidth, I64:$vectorLength, I64:$height);
+  let results = (outs CubeType:$cube);
+  let assemblyFormat = "$bitWidth `,` $vectorLength `,` $height attr-dict `:` "
+      "type($bitWidth) `,` type($vectorLength) `,` type($height) `->` qualified(type($cube))";
 }
 
 #endif

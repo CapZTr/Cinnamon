@@ -594,11 +594,12 @@ struct ConvertLinalgToBits
       signalPassFailure();
     }
 
-    removeUnnecessaryAssembles(func);
+    // removeUnnecessaryAssembles(func);
     removeUnusedExtensionsAndConstants(func);
     rewriteTruncGenericsToAssemble(func);
     removeDeadLinalgGenerics(func);
     removeUnusedTensorEmpties(func);
+    removeUnnecessaryAssembles(func);
   }
 
   static void rewriteTruncGenericsToAssemble(func::FuncOp func) {

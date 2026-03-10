@@ -15,4 +15,10 @@ def BitsOptmiseMappingPass : Pass<"bits-opt-mapping", "func::FuncOp"> {
   let dependentDialects = [];
 }
 
+def BitsCubeToSlicePass : Pass<"bits-cube-to-slice", "func::FuncOp"> {
+  let summary = "Transform cube computation with slice computaton with loop structure.";
+  let description = [{}];
+  let dependentDialects = [];
+}
+
 #endif // BITS_TRANSFORM_PASSES
