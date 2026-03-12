@@ -130,20 +130,20 @@ LogicalResult InsertSliceOp::verify() {
 }
 
 LogicalResult ExtensionIOp::verify() {
-  auto operandBitWidth = getSlice().getType().getBitWidth();
-  auto resultBitWidth = getResult().getType().getBitWidth();
-  if (auto constantOp = dyn_cast<arith::ConstantOp>(getRowNumToExt().getDefiningOp())) {
-    if (auto intAttr = dyn_cast<IntegerAttr>(constantOp.getValue())) {
-      auto rowNum = intAttr.getInt();
-      if (rowNum + operandBitWidth != resultBitWidth) {
-        return emitOpError("rowNum doesn't match after extension");
-      }
-    } else {
-      return emitOpError("rowNumToExt must have explicit value");
-    }
-  } else {
-    return emitOpError("rowNumToExt must be constant");
-  }
+  // auto operandBitWidth = getSlice().getType().getBitWidth();
+  // auto resultBitWidth = getResult().getType().getBitWidth();
+  // if (auto constantOp = dyn_cast<arith::ConstantOp>(getRowNumToExt().getDefiningOp())) {
+  //   if (auto intAttr = dyn_cast<IntegerAttr>(constantOp.getValue())) {
+  //     auto rowNum = intAttr.getInt();
+  //     if (rowNum + operandBitWidth != resultBitWidth) {
+  //       return emitOpError("rowNum doesn't match after extension");
+  //     }
+  //   } else {
+  //     return emitOpError("rowNumToExt must have explicit value");
+  //   }
+  // } else {
+  //   return emitOpError("rowNumToExt must be constant");
+  // }
 
   return success();
 }

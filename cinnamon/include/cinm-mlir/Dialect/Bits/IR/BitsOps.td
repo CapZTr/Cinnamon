@@ -52,6 +52,28 @@ def ExtractSliceOp : Bits_Op<"extract_slice", [Pure]> {
   let hasVerifier = 1;
 }
 
+def ExtractSubSliceOp : Bits_Op<"extract_sub_slice", [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let arguments = (ins SliceType:$slice, I64:$rowNum);
+  let results = (outs SliceType:$resultSlice);
+
+  let assemblyFormat = "$slice `,` $rowNum attr-dict `:` "
+      "qualified(type($slice)) `,` type($rowNum) `->` qualified(type($resultSlice))";
+}
+
+def ExtractRowSliceOp : Bits_Op<"extract_row_as_slice", [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let arguments = (ins SliceType:$slice, I64:$rowIdx);
+  let results = (outs SliceType:$rowSlice);
+
+  let assemblyFormat = "$slice `,` $rowIdx attr-dict `:` "
+      "qualified(type($slice)) `,` type($rowIdx) `->` qualified(type($rowSlice))";
+}
+
 def InsertSliceOp : Bits_Op<"insert_slice", [Pure]> {
   let summary = "Insert a slice to the given layer of a cube";
   let description = [{}];
@@ -320,6 +342,18 @@ def MinOp : Bits_Op<"min", [Pure]> {
   let hasVerifier = 1;
 }
 
+def MuxOp : Bits_Op<"mux", [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let arguments = (ins SliceType:$lhs, SliceType:$rhs, SliceType:$s);
+  let results = (outs SliceType:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs `,` $s attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) `,` qualified(type($s)) "
+      "`->` qualified(type($result))";
+}
+
 def MatmulIOp : Bits_Op<"matmul_i",  [Pure]> {
   let summary = "";
   let description = [{}];
@@ -352,7 +386,29 @@ def MatvecIOp : Bits_Op<"matvec_i",  [Pure]> {
   let hasVerifier = 1;
 }
 
+def ShiftUpOp : Bits_Op<"shift_up", [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let arguments = (ins SliceType:$slice, I64:$numToShift);
+  let results = (outs SliceType:$resultSlice);
+
+  let assemblyFormat = "$slice `,` $numToShift attr-dict `:` "
+      "qualified(type($slice)) `,` type($numToShift) `->` "
+      "qualified(type($resultSlice))";
+}
+
 def CreateSliceOp : Bits_Op<"create_slice", [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let arguments = (ins I64:$bitWidth, I64:$vectorLength);
+  let results = (outs SliceType:$slice);
+  let assemblyFormat = "$bitWidth `,` $vectorLength attr-dict `:` "
+      "type($bitWidth) `,` type($vectorLength) `->` qualified(type($slice))";
+}
+
+def CreateAllOneSliceOp : Bits_Op<"create_all_one_slice", [Pure]> {
   let summary = "";
   let description = [{}];
 
