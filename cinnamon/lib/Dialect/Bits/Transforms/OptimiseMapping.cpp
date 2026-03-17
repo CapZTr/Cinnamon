@@ -1,5 +1,7 @@
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 #include "cinm-mlir/Dialect/Bits/Transforms/Passes.h"
+#include "gurobi_c++.h"
+#include "gurobi_c.h"
 
 #include <exception>
 #include <iostream>
@@ -8,15 +10,13 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/Casting.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/IR/IRMapping.h>
 #include <mlir/IR/Value.h>
 #include <mlir/Pass/Pass.h>
 #include <mlir/Transforms/DialectConversion.h>
 #include <string>
 #include <vector>
-
-#include "gurobi_c++.h"
-#include "gurobi_c.h"
 
 namespace mlir::bits {
 
@@ -52,8 +52,9 @@ std::vector<int> modelAndSolveILP(const DAG &dag) {
   std::vector<std::vector<GRBVar>> x(N, std::vector<GRBVar>(numBanks));
   for (int i = 0; i < N; ++i) {
     for (int n = 0; n < numBanks; ++n) {
-      x[i][n] = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-          "x_" + std::to_string(i) + "_" + std::to_string(n));
+      x[i][n] =
+          model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+                       "x_" + std::to_string(i) + "_" + std::to_string(n));
     }
   }
 
@@ -68,9 +69,9 @@ std::vector<int> modelAndSolveILP(const DAG &dag) {
   std::vector<GRBVar> start(N), end(N);
   for (int i = 0; i < N; ++i) {
     start[i] = model.addVar(0.0, GRB_INFINITY, 0.0, GRB_INTEGER,
-        "start_" + std::to_string(i));
+                            "start_" + std::to_string(i));
     end[i] = model.addVar(0.0, GRB_INFINITY, 0.0, GRB_INTEGER,
-        "end_" + std::to_string(i));
+                          "end_" + std::to_string(i));
   }
 
   for (int i = 0; i < N; ++i) {
@@ -88,7 +89,8 @@ std::vector<int> modelAndSolveILP(const DAG &dag) {
     for (int i = 0; i < N; ++i) {
       if (dep[i][k]) {
         for (int j = 0; j < N; ++j) {
-          if (dep[k][j]) dep[i][j] = true;
+          if (dep[k][j])
+            dep[i][j] = true;
         }
       }
     }
@@ -105,28 +107,33 @@ std::vector<int> modelAndSolveILP(const DAG &dag) {
   const int M = 100;
   for (int i = 0; i < N; ++i) {
     for (int j : dag.nodes[i].succs) {
-      GRBVar cloneVar = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-          "clone_" + std::to_string(i) + "_" + std::to_string(j));
+      GRBVar cloneVar =
+          model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+                       "clone_" + std::to_string(i) + "_" + std::to_string(j));
       cloneEdges.push_back(CloneEdge{i, j, cloneVar});
       totalClones += cloneVar;
       GRBLinExpr sumB;
       for (int k = 0; k < numBanks; ++k) {
-        GRBVar b = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-            "b_" + std::to_string(i) + "_" + std::to_string(j) + "_" + std::to_string(k));
+        GRBVar b =
+            model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+                         "b_" + std::to_string(i) + "_" + std::to_string(j) +
+                             "_" + std::to_string(k));
         model.addConstr(b <= x[i][k]);
         model.addConstr(b <= x[j][k]);
         model.addConstr(b >= x[i][k] + x[j][k] - 1);
         sumB += b;
       }
-      model.addConstr(cloneVar + sumB == 1,
-          "clone_link_" + std::to_string(i) + "_" + std::to_string(j));
+      model.addConstr(cloneVar + sumB == 1, "clone_link_" + std::to_string(i) +
+                                                "_" + std::to_string(j));
       model.addConstr(start[j] >= end[i] + cloneDelay * cloneVar,
-          "sched_dep_" + std::to_string(i) + "_" + std::to_string(j));
+                      "sched_dep_" + std::to_string(i) + "_" +
+                          std::to_string(j));
 
       for (int k = 0; k < N; ++k) {
         GRBLinExpr sumBsrc;
         for (int bank = 0; bank < numBanks; ++bank) {
-          GRBVar b = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+          GRBVar b = model.addVar(
+              0.0, 1.0, 0.0, GRB_BINARY,
               "b_src_" + std::to_string(i) + "_" + std::to_string(j) + "_" +
                   std::to_string(k) + "_" + std::to_string(bank));
           model.addConstr(b <= x[i][bank]);
@@ -134,27 +141,31 @@ std::vector<int> modelAndSolveILP(const DAG &dag) {
           model.addConstr(b >= x[i][bank] + x[k][bank] - 1);
           sumBsrc += b;
         }
-        GRBVar sameBankSrc = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-            "same_src_" + std::to_string(i) + "_" + std::to_string(j) + "_" +
-                std::to_string(k));
+        GRBVar sameBankSrc =
+            model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+                         "same_src_" + std::to_string(i) + "_" +
+                             std::to_string(j) + "_" + std::to_string(k));
         model.addConstr(sumBsrc == sameBankSrc,
-            "same_src_link_" + std::to_string(i) + "_" + std::to_string(j) +
-                "_" + std::to_string(k));
-        GRBVar orderSrc = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-            "order_src_" + std::to_string(i) + "_" + std::to_string(j) + "_" +
-                std::to_string(k));
-        model.addConstr(end[k] <= end[i] +
-                M * (2 - cloneVar - sameBankSrc + orderSrc),
+                        "same_src_link_" + std::to_string(i) + "_" +
+                            std::to_string(j) + "_" + std::to_string(k));
+        GRBVar orderSrc =
+            model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+                         "order_src_" + std::to_string(i) + "_" +
+                             std::to_string(j) + "_" + std::to_string(k));
+        model.addConstr(
+            end[k] <= end[i] + M * (2 - cloneVar - sameBankSrc + orderSrc),
             "clone_src_before_" + std::to_string(i) + "_" + std::to_string(j) +
                 "_" + std::to_string(k));
-        model.addConstr(start[k] >= end[i] + cloneDelay -
-                M * (2 - cloneVar - sameBankSrc + (1 - orderSrc)),
+        model.addConstr(
+            start[k] >= end[i] + cloneDelay -
+                            M * (2 - cloneVar - sameBankSrc + (1 - orderSrc)),
             "clone_src_after_" + std::to_string(i) + "_" + std::to_string(j) +
                 "_" + std::to_string(k));
 
         GRBLinExpr sumBdst;
         for (int bank = 0; bank < numBanks; ++bank) {
-          GRBVar b = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+          GRBVar b = model.addVar(
+              0.0, 1.0, 0.0, GRB_BINARY,
               "b_dst_" + std::to_string(i) + "_" + std::to_string(j) + "_" +
                   std::to_string(k) + "_" + std::to_string(bank));
           model.addConstr(b <= x[j][bank]);
@@ -162,21 +173,24 @@ std::vector<int> modelAndSolveILP(const DAG &dag) {
           model.addConstr(b >= x[j][bank] + x[k][bank] - 1);
           sumBdst += b;
         }
-        GRBVar sameBankDst = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-            "same_dst_" + std::to_string(i) + "_" + std::to_string(j) + "_" +
-                std::to_string(k));
+        GRBVar sameBankDst =
+            model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+                         "same_dst_" + std::to_string(i) + "_" +
+                             std::to_string(j) + "_" + std::to_string(k));
         model.addConstr(sumBdst == sameBankDst,
-            "same_dst_link_" + std::to_string(i) + "_" + std::to_string(j) +
-                "_" + std::to_string(k));
-        GRBVar orderDst = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-            "order_dst_" + std::to_string(i) + "_" + std::to_string(j) + "_" +
-                std::to_string(k));
-        model.addConstr(end[k] <= end[i] +
-                M * (2 - cloneVar - sameBankDst + orderDst),
+                        "same_dst_link_" + std::to_string(i) + "_" +
+                            std::to_string(j) + "_" + std::to_string(k));
+        GRBVar orderDst =
+            model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+                         "order_dst_" + std::to_string(i) + "_" +
+                             std::to_string(j) + "_" + std::to_string(k));
+        model.addConstr(
+            end[k] <= end[i] + M * (2 - cloneVar - sameBankDst + orderDst),
             "clone_dst_before_" + std::to_string(i) + "_" + std::to_string(j) +
                 "_" + std::to_string(k));
-        model.addConstr(start[k] >= end[i] + cloneDelay -
-                M * (2 - cloneVar - sameBankDst + (1 - orderDst)),
+        model.addConstr(
+            start[k] >= end[i] + cloneDelay -
+                            M * (2 - cloneVar - sameBankDst + (1 - orderDst)),
             "clone_dst_after_" + std::to_string(i) + "_" + std::to_string(j) +
                 "_" + std::to_string(k));
       }
@@ -187,11 +201,11 @@ std::vector<int> modelAndSolveILP(const DAG &dag) {
     for (size_t e2 = e1 + 1; e2 < cloneEdges.size(); ++e2) {
       const CloneEdge &c1 = cloneEdges[e1];
       const CloneEdge &c2 = cloneEdges[e2];
-      auto addCloneOrderConstraints = [&](int a, int b,
-                                          llvm::StringRef tag) {
+      auto addCloneOrderConstraints = [&](int a, int b, llvm::StringRef tag) {
         GRBLinExpr sumB;
         for (int bank = 0; bank < numBanks; ++bank) {
-          GRBVar bVar = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+          GRBVar bVar = model.addVar(
+              0.0, 1.0, 0.0, GRB_BINARY,
               "b_" + std::string(tag) + "_" + std::to_string(a) + "_" +
                   std::to_string(b) + "_" + std::to_string(bank));
           model.addConstr(bVar <= x[a][bank]);
@@ -199,23 +213,27 @@ std::vector<int> modelAndSolveILP(const DAG &dag) {
           model.addConstr(bVar >= x[a][bank] + x[b][bank] - 1);
           sumB += bVar;
         }
-        GRBVar sameBank = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-            "same_" + std::string(tag) + "_" + std::to_string(a) + "_" +
-                std::to_string(b));
-        model.addConstr(sumB == sameBank,
-            "same_link_" + std::string(tag) + "_" + std::to_string(a) + "_" +
-                std::to_string(b));
-        GRBVar orderVar = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-            "order_" + std::string(tag) + "_" + std::to_string(a) + "_" +
-                std::to_string(b));
-        model.addConstr(end[c1.src] + cloneDelay <= end[c2.src] +
-                M * (3 - c1.active - c2.active - sameBank + orderVar),
-            "clone_serial_ab_" + std::string(tag) + "_" + std::to_string(a) +
-                "_" + std::to_string(b));
-        model.addConstr(end[c2.src] + cloneDelay <= end[c1.src] +
-                M * (3 - c1.active - c2.active - sameBank + (1 - orderVar)),
-            "clone_serial_ba_" + std::string(tag) + "_" + std::to_string(a) +
-                "_" + std::to_string(b));
+        GRBVar sameBank =
+            model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+                         "same_" + std::string(tag) + "_" + std::to_string(a) +
+                             "_" + std::to_string(b));
+        model.addConstr(sumB == sameBank, "same_link_" + std::string(tag) +
+                                              "_" + std::to_string(a) + "_" +
+                                              std::to_string(b));
+        GRBVar orderVar =
+            model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+                         "order_" + std::string(tag) + "_" + std::to_string(a) +
+                             "_" + std::to_string(b));
+        model.addConstr(end[c1.src] + cloneDelay <=
+                            end[c2.src] + M * (3 - c1.active - c2.active -
+                                               sameBank + orderVar),
+                        "clone_serial_ab_" + std::string(tag) + "_" +
+                            std::to_string(a) + "_" + std::to_string(b));
+        model.addConstr(end[c2.src] + cloneDelay <=
+                            end[c1.src] + M * (3 - c1.active - c2.active -
+                                               sameBank + (1 - orderVar)),
+                        "clone_serial_ba_" + std::string(tag) + "_" +
+                            std::to_string(a) + "_" + std::to_string(b));
       };
 
       addCloneOrderConstraints(c1.src, c2.src, "src_src");
@@ -229,29 +247,36 @@ std::vector<int> modelAndSolveILP(const DAG &dag) {
     for (int j = i + 1; j < N; ++j) {
       if (!dep[i][j] && !dep[j][i]) {
         GRBVar orderVar = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-            "order_" + std::to_string(i) + "_" + std::to_string(j));
-        GRBVar diffVar = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-            "diff_" + std::to_string(i) + "_" + std::to_string(j));
+                                       "order_" + std::to_string(i) + "_" +
+                                           std::to_string(j));
+        GRBVar diffVar =
+            model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+                         "diff_" + std::to_string(i) + "_" + std::to_string(j));
         GRBLinExpr sumB;
         for (int k = 0; k < numBanks; ++k) {
-          GRBVar b = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-              "b_" + std::to_string(i) + "_" + std::to_string(j) + "_" + std::to_string(k));
+          GRBVar b =
+              model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+                           "b_" + std::to_string(i) + "_" + std::to_string(j) +
+                               "_" + std::to_string(k));
           model.addConstr(b <= x[i][k]);
           model.addConstr(b <= x[j][k]);
           model.addConstr(b >= x[i][k] + x[j][k] - 1);
           sumB += b;
         }
-        model.addConstr(diffVar + sumB == 1,
-            "diff_link_" + std::to_string(i) + "_" + std::to_string(j));
-        model.addConstr(start[j] >= end[i] - M * (diffVar + 1.0 - orderVar), 
-            "serial_ij_" + std::to_string(i) + "_" + std::to_string(j));
-        model.addConstr(start[i] >= end[j] - M * (diffVar + orderVar), 
-            "serial_ji_" + std::to_string(i) + "_" + std::to_string(j));
+        model.addConstr(diffVar + sumB == 1, "diff_link_" + std::to_string(i) +
+                                                 "_" + std::to_string(j));
+        model.addConstr(start[j] >= end[i] - M * (diffVar + 1.0 - orderVar),
+                        "serial_ij_" + std::to_string(i) + "_" +
+                            std::to_string(j));
+        model.addConstr(start[i] >= end[j] - M * (diffVar + orderVar),
+                        "serial_ji_" + std::to_string(i) + "_" +
+                            std::to_string(j));
       }
     }
   }
 
-  GRBVar makespan = model.addVar(0.0, GRB_INFINITY, 0.0, GRB_INTEGER, "makespan");
+  GRBVar makespan =
+      model.addVar(0.0, GRB_INFINITY, 0.0, GRB_INTEGER, "makespan");
   for (int i = 0; i < N; ++i) {
     model.addConstr(makespan >= end[i], "mkspan_ge_end_" + std::to_string(i));
   }
@@ -306,6 +331,7 @@ struct BitsOptimiseMappingPass
         int id = dag.nodes.size();
         dag.nodes.push_back(Node{add, {}, {}});
         dag.opToNodeID[&op] = id;
+      } else if (auto forOp = llvm::dyn_cast<scf::ForOp>(&op)) {
       }
     }
 
@@ -344,9 +370,9 @@ struct BitsOptimiseMappingPass
         op->setAttr("bits.bank_id",
                     IntegerAttr::get(IntegerType::get(func.getContext(), 64),
                                      chosen[i]));
-        op->setAttr("bits.node_id",
-                    IntegerAttr::get(IntegerType::get(func.getContext(), 64),
-                                     i));
+        op->setAttr(
+            "bits.node_id",
+            IntegerAttr::get(IntegerType::get(func.getContext(), 64), i));
         banksInUse.insert(chosen[i]);
       }
 
@@ -355,7 +381,8 @@ struct BitsOptimiseMappingPass
       // for (BlockArgument arg : block.getArguments()) {
       //   valueIds[arg] = nextValueId;
       //   func.setArgAttr(arg.getArgNumber(), "bits.value_id",
-      //                   IntegerAttr::get(IntegerType::get(func.getContext(), 64),
+      //                   IntegerAttr::get(IntegerType::get(func.getContext(),
+      //                   64),
       //                                    nextValueId));
       //   ++nextValueId;
       // }
