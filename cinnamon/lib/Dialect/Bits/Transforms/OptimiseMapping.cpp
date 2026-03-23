@@ -27,7 +27,7 @@ namespace mlir::bits {
 
 //===----------------------------------------------------------------------===//
 
-int numBanks = 32;
+int numBanks = 16;
 int cloneDelay = 1;
 
 struct Node {

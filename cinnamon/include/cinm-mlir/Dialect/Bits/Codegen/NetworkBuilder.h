@@ -8,7 +8,6 @@
 #include <llvm/Support/LogicalResult.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/IR/BuiltinOps.h>
-
 #include <mlir/IR/Value.h>
 #include <mlir/Support/LLVM.h>
 #include <mockturtle/networks/mig.hpp>
@@ -30,6 +29,7 @@ public:
     MIG gtNtk;
     MIG ltNtk;
     bool isMulF = false;
+    bool isMulI = false;
     bool isMax = false;
     bool isMin = false;
     DenseMap<int, int> carryMap;
@@ -70,6 +70,8 @@ public:
 
   bool isMulFNtk() { return isMulF; }
 
+  bool isMulINtk() { return isMulI; }
+
   bool isMaxNtk() { return isMax; }
 
   bool isMinNtk() { return isMin; }
@@ -78,9 +80,7 @@ public:
 
   ArrayRef<Value> getInputSlices() const { return inputSlices; }
 
-  ArrayRef<Value> getOutputSlices() const {
-    return outputSlices;
-  }
+  ArrayRef<Value> getOutputSlices() const { return outputSlices; }
 
   bool hasSubgraphs() const { return !subgraphNetworks.empty(); }
 
@@ -106,16 +106,17 @@ public:
 
     os << "\n=== Node Details ===\n";
     mig.foreach_node([&](auto node) {
-      if (mig.is_pi(node)) return;
+      if (mig.is_pi(node))
+        return;
 
       os << "  Node " << node << ": ";
-      
+
       if (mig.is_maj(node)) {
         os << "MAJ( ";
-        mig.foreach_fanin(node, [&](auto const& fanin, auto i) {
-          if (i > 0) os << ", ";
-          os << mig.get_node(fanin) 
-            << (mig.is_complemented(fanin) ? "'" : "");
+        mig.foreach_fanin(node, [&](auto const &fanin, auto i) {
+          if (i > 0)
+            os << ", ";
+          os << mig.get_node(fanin) << (mig.is_complemented(fanin) ? "'" : "");
         });
         os << " )";
       } else if (mig.is_constant(node)) {
@@ -141,6 +142,7 @@ private:
   MIG gtNtk;
   MIG ltNtk;
   bool isMulF = false;
+  bool isMulI = false;
   bool isMax = false;
   bool isMin = false;
   DenseMap<Value, MIG::signal> migSignalMap;
@@ -153,15 +155,11 @@ private:
   SmallVector<SubgraphNetwork, 0> subgraphNetworks;
   SmallVector<SubgraphDependency> subgraphDependencies;
 
-  std::pair<MIG::signal, MIG::signal> buildAdd(MIG &ntk,
-                                               MIG::signal const &lhs,
+  std::pair<MIG::signal, MIG::signal> buildAdd(MIG &ntk, MIG::signal const &lhs,
                                                MIG::signal const &rhs,
                                                MIG::signal const &cin);
-  MIG::signal buildMux2(MIG &ntk,
-                        MIG::signal const &s,
-                        MIG::signal const &lhs,
+  MIG::signal buildMux2(MIG &ntk, MIG::signal const &s, MIG::signal const &lhs,
                         MIG::signal const &rhs);
-
 };
 
-}
+} // namespace mlir::bits

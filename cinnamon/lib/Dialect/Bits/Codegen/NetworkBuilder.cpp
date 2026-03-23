@@ -1,7 +1,9 @@
 #include "cinm-mlir/Dialect/Bits/Codegen/NetworkBuilder.h"
-#include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
-#include "mockturtle/generators/arithmetic.hpp"
 
+#include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
+
+#include <cassert>
+#include <cstdint>
 #include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/FunctionExtras.h>
 #include <llvm/ADT/SmallVector.h>
@@ -11,11 +13,9 @@
 #include <mlir/IR/BuiltinTypes.h>
 #include <mlir/IR/Diagnostics.h>
 #include <mlir/IR/Value.h>
-
-#include <cassert>
-#include <cstdint>
+#include <mlir/Support/LLVM.h>
 #include <mockturtle/algorithms/cleanup.hpp>
-
+#include <mockturtle/generators/arithmetic.hpp>
 
 using namespace mlir;
 using namespace mlir::bits;
@@ -42,19 +42,17 @@ LogicalResult NetworkBuilder::build() {
   }
   return success();
   auto isBinaryOp = [](Operation *op) {
-    return isa<AddIOp>(op) || isa<MulFOp>(op) || isa<AndOp>(op)
-        || isa<OrOp>(op) || isa<XOrOp>(op) || isa<MaxOp>(op)
-        || isa<MinOp>(op) || isa<ReduceAndOp>(op) || isa<ReduceOrOp>(op)
-        || isa<ReduceXOrOp>(op);
+    return isa<AddIOp>(op) || isa<MulFOp>(op) || isa<AndOp>(op) ||
+           isa<OrOp>(op) || isa<XOrOp>(op) || isa<MaxOp>(op) ||
+           isa<MinOp>(op) || isa<ReduceAndOp>(op) || isa<ReduceOrOp>(op) ||
+           isa<ReduceXOrOp>(op);
   };
 
   auto hasOnlyMulFOrNone = [](ArrayRef<Operation *> ops) {
-    const bool noneMulF = llvm::none_of(ops, [](Operation *op) {
-      return isa<MulFOp>(op);
-    });
-    const bool allMulF = llvm::all_of(ops, [](Operation *op) {
-      return isa<MulFOp>(op);
-    });
+    const bool noneMulF =
+        llvm::none_of(ops, [](Operation *op) { return isa<MulFOp>(op); });
+    const bool allMulF =
+        llvm::all_of(ops, [](Operation *op) { return isa<MulFOp>(op); });
     return std::pair{noneMulF, allMulF};
   };
 
@@ -66,11 +64,10 @@ LogicalResult NetworkBuilder::build() {
   };
 
   auto processBinaryOp =
-      [&](Operation *op,
-          DenseMap<Value, MIG::signal> &signalMap,
-          MIG &ntk,
+      [&](Operation *op, DenseMap<Value, MIG::signal> &signalMap, MIG &ntk,
           DenseMap<int, int> &carryMapRef,
-          llvm::function_ref<void(MulFOp)> onMul,
+          llvm::function_ref<void(MulFOp)> onMulF,
+          llvm::function_ref<void(MulIOp)> onMulI,
           llvm::function_ref<void(MaxOp)> onMax,
           llvm::function_ref<void(MinOp)> onMin) -> LogicalResult {
     if (auto add = dyn_cast<AddIOp>(op)) {
@@ -125,7 +122,7 @@ LogicalResult NetworkBuilder::build() {
     }
 
     if (auto mul = dyn_cast<MulFOp>(op)) {
-      onMul(mul);
+      onMulF(mul);
       const auto lhs = signalMap.lookup(mul.getLhs());
       const auto rhs = signalMap.lookup(mul.getRhs());
       const auto cin = ntk.create_pi();
@@ -158,16 +155,15 @@ LogicalResult NetworkBuilder::build() {
     return failure();
   };
 
-  auto buildPendingOps =
-      [&](SmallVectorImpl<Operation *> &pendingOps,
-          DenseMap<Value, MIG::signal> &signalMap,
-          MIG &ntk,
-          DenseMap<int, int> &carryMapRef,
-          llvm::function_ref<void(MulFOp)> onMul,
-          llvm::function_ref<void(MaxOp)> onMax,
-          llvm::function_ref<void(MinOp)> onMin,
-          bool emitUnsupportedError,
-          bool emitMissingOperandError) -> LogicalResult {
+  auto buildPendingOps = [&](SmallVectorImpl<Operation *> &pendingOps,
+                             DenseMap<Value, MIG::signal> &signalMap, MIG &ntk,
+                             DenseMap<int, int> &carryMapRef,
+                             llvm::function_ref<void(MulFOp)> onMulF,
+                             llvm::function_ref<void(MulIOp)> onMulI,
+                             llvm::function_ref<void(MaxOp)> onMax,
+                             llvm::function_ref<void(MinOp)> onMin,
+                             bool emitUnsupportedError,
+                             bool emitMissingOperandError) -> LogicalResult {
     bool progress = true;
     while (progress && !pendingOps.empty()) {
       progress = false;
@@ -179,8 +175,8 @@ LogicalResult NetworkBuilder::build() {
           continue;
         }
 
-        if (failed(processBinaryOp(op, signalMap, ntk, carryMapRef,
-                                   onMul, onMax, onMin))) {
+        if (failed(processBinaryOp(op, signalMap, ntk, carryMapRef, onMulF,
+                                   onMulI, onMax, onMin))) {
           if (emitUnsupportedError) {
             emitError(op->getLoc(),
                       "NetworkBuilder: Unsupported type of binary op");
@@ -205,8 +201,7 @@ LogicalResult NetworkBuilder::build() {
   };
 
   auto buildBinaryNetwork = [&](ArrayRef<Operation *> ops,
-                                ArrayRef<Value> inputs,
-                                ArrayRef<Value> outputs,
+                                ArrayRef<Value> inputs, ArrayRef<Value> outputs,
                                 SubgraphNetwork &out) -> LogicalResult {
     DenseMap<Value, MIG::signal> localSignalMap;
     SmallVector<Operation *> pendingBinaryOps;
@@ -245,13 +240,8 @@ LogicalResult NetworkBuilder::build() {
     }
 
     if (failed(buildPendingOps(
-            pendingBinaryOps,
-            localSignalMap,
-            out.mig,
-            out.carryMap,
-            [](MulFOp) {},
-            [](MaxOp) {},
-            [](MinOp) {},
+            pendingBinaryOps, localSignalMap, out.mig, out.carryMap,
+            [](MulFOp) {}, [](MulIOp) {}, [](MaxOp) {}, [](MinOp) {},
             /*emitUnsupportedError=*/false,
             /*emitMissingOperandError=*/false))) {
       return failure();
@@ -282,11 +272,11 @@ LogicalResult NetworkBuilder::build() {
     module.walk(callback);
   };
 
-  walkTarget([&](Operation* op) {
+  walkTarget([&](Operation *op) {
     if (auto transpose = dyn_cast<TransposeOp>(op)) {
       auto slice = transpose.getOutput();
       auto elemType = cast<RankedTensorType>(transpose.getInput().getType())
-          .getElementType();
+                          .getElementType();
       migSignalMap[slice] = mig.create_pi();
       if (isa<FloatType>(elemType)) {
         mulFSignSignalMap[slice] = mulFSignNtk.create_pi();
@@ -302,7 +292,7 @@ LogicalResult NetworkBuilder::build() {
   const auto [noneMulF, allMulF] = hasOnlyMulFOrNone(pendingBinaryOps);
 
   assert((noneMulF || allMulF) &&
-      "pendingBinaryOps must contain either all MulFOp or none MulFOp");
+         "pendingBinaryOps must contain either all MulFOp or none MulFOp");
 
   if (allMulF) {
     isMulF = true;
@@ -324,16 +314,14 @@ LogicalResult NetworkBuilder::build() {
   assert((int)isMulF + (int)isMax + (int)isMin <= 1);
 
   if (failed(buildPendingOps(
-          pendingBinaryOps,
-          migSignalMap,
-          mig,
-          carryMap,
+          pendingBinaryOps, migSignalMap, mig, carryMap,
           [&](MulFOp mul) {
             const auto lhsSign = mulFSignSignalMap.lookup(mul.getLhs());
             const auto rhsSign = mulFSignSignalMap.lookup(mul.getRhs());
             mulFSignSignalMap[mul.getResult()] =
                 mulFSignNtk.create_xor(lhsSign, rhsSign);
           },
+          [&](MulIOp mul) {},
           [&](MaxOp maxOp) {
             const auto lhs = maxOp.getLhs();
             const auto rhs = maxOp.getRhs();
@@ -398,8 +386,8 @@ LogicalResult NetworkBuilder::build() {
       }
     });
     for (BlockArgument arg : func.getArguments()) {
-      if (auto attr = func.getArgAttrOfType<IntegerAttr>(
-              arg.getArgNumber(), "bits.value_id")) {
+      if (auto attr = func.getArgAttrOfType<IntegerAttr>(arg.getArgNumber(),
+                                                         "bits.value_id")) {
         valueIdToValue[attr.getInt()] = arg;
       }
     }
@@ -493,11 +481,9 @@ LogicalResult NetworkBuilder::build() {
   return success();
 }
 
-std::pair<MIG::signal, MIG::signal> NetworkBuilder::buildAdd(
-    MIG &ntk,
-    MIG::signal const &lhs,
-    MIG::signal const &rhs,
-    MIG::signal const &cin) {
+std::pair<MIG::signal, MIG::signal>
+NetworkBuilder::buildAdd(MIG &ntk, MIG::signal const &lhs,
+                         MIG::signal const &rhs, MIG::signal const &cin) {
   auto cout = ntk.create_maj(lhs, rhs, cin);
   ntk.create_po(cout);
   auto maj = ntk.create_maj(lhs, rhs, ntk.create_not(cin));
@@ -505,10 +491,9 @@ std::pair<MIG::signal, MIG::signal> NetworkBuilder::buildAdd(
   return {sum, cout};
 }
 
-MIG::signal NetworkBuilder::buildMux2(MIG &ntk,
-                      MIG::signal const &s,
-                      MIG::signal const &lhs,
-                      MIG::signal const &rhs) {
+MIG::signal NetworkBuilder::buildMux2(MIG &ntk, MIG::signal const &s,
+                                      MIG::signal const &lhs,
+                                      MIG::signal const &rhs) {
   auto and1 = ntk.create_and(s, lhs);
   auto and2 = ntk.create_and(ntk.create_not(s), rhs);
   return ntk.create_or(and1, and2);

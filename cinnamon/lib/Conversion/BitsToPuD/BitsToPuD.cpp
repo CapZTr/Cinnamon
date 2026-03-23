@@ -1,15 +1,17 @@
 #include "cinm-mlir/Conversion/BitsToPuD/BitsToPuD.h"
+
+#include "cinm-mlir/Dialect/Bits/Codegen/NetworkBuilder.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
+#include "cinm-mlir/Dialect/PuD/Codegen/AddressAllocator.h"
+#include "cinm-mlir/Dialect/PuD/Codegen/InstructionMapper.h"
+#include "cinm-mlir/Dialect/PuD/Codegen/ProgramParser.h"
 #include "cinm-mlir/Dialect/PuD/IR/PuDDialect.h"
 #include "cinm-mlir/Dialect/PuD/IR/PuDOps.h"
 #include "cinm-mlir/Dialect/PuD/IR/PuDTypes.h"
 
-#include "cinm-mlir/Dialect/Bits/Codegen/NetworkBuilder.h"
-#include "cinm-mlir/Dialect/PuD/Codegen/AddressAllocator.h"
-#include "cinm-mlir/Dialect/PuD/Codegen/InstructionMapper.h"
-#include "cinm-mlir/Dialect/PuD/Codegen/ProgramParser.h"
-
+#include <cassert>
+#include <cstdint>
 #include <iostream>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
@@ -17,23 +19,20 @@
 #include <llvm/ADT/StringSet.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/LogicalResult.h>
-#include <mlir/IR/Builders.h>
-#include <mlir/IR/BuiltinOps.h>
-#include <mlir/IR/BuiltinTypes.h>
+#include <memory>
 #include <mlir/Dialect/Affine/IR/AffineOps.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
+#include <mlir/IR/Builders.h>
+#include <mlir/IR/BuiltinOps.h>
+#include <mlir/IR/BuiltinTypes.h>
 #include <mlir/IR/IRMapping.h>
 #include <mlir/IR/PatternMatch.h>
 #include <mlir/IR/Value.h>
 #include <mlir/Pass/Pass.h>
 #include <mlir/Support/LLVM.h>
 #include <mlir/Transforms/DialectConversion.h>
-
-#include <cassert>
-#include <cstdint>
-#include <memory>
 #include <mockturtle/generators/arithmetic.hpp>
 #include <mockturtle/io/write_dot.hpp>
 #include <optional>
@@ -55,9 +54,8 @@ namespace {
 // ========================== Pass Structure ===================================
 // =============================================================================
 
-struct ConvertBitsToPuD
-    : public ConvertBitsToPuDBase<ConvertBitsToPuD> {
-  
+struct ConvertBitsToPuD : public ConvertBitsToPuDBase<ConvertBitsToPuD> {
+
   void runOnOperation() override {
     func::FuncOp func = getOperation();
 
@@ -92,6 +90,7 @@ struct ConvertBitsToPuD
     }
     parser.printProgram();
     return;
+
     auto mulFSignNtk = builder.getMulFSignNtk();
     auto mulFExponentNtk = builder.getMulFExponentNtk();
     const auto isMulF = builder.isMulFNtk();
@@ -160,7 +159,6 @@ struct ConvertBitsToPuD
     //   program_lt = parser_lt.getProgram();
     //   parser_lt.printProgram();
     // }
-
 
     // =========================================================================
     // ==================== IR (PuD Dialect) Building ==========================
@@ -284,7 +282,8 @@ struct ConvertBitsToPuD
     // oldEntry.erase();
 
     // DenseMap<int64_t, Value> i64Vals;
-    // auto getOrCreateI64Val = [&opBuilder, &loc, &i64Type, &i64Vals](int64_t num)
+    // auto getOrCreateI64Val = [&opBuilder, &loc, &i64Type, &i64Vals](int64_t
+    // num)
     //     -> Value {
     //   if (!i64Vals.contains(num)) {
     //     Value val = opBuilder.create<arith::ConstantOp>(
@@ -346,13 +345,18 @@ struct ConvertBitsToPuD
     //   const Value zero = getOrCreateI64Val(0);
     //   const Value bankVal = getOrCreateI64Val(bankId);
 
-    //   // =========================================================================
-    //   // ================= Bitwise & Control Rows Generation =====================
+    //   //
+    //   =========================================================================
+    //   // ================= Bitwise & Control Rows Generation
+    //   =====================
     //   // TODO: This is a workaround.
-    //   //       Currently we use B and C group rows from subarry (0, 0, 0, 0) only.
-    //   //       We need an algorithm to find the optimality with lowest latency of
+    //   //       Currently we use B and C group rows from subarry (0, 0, 0, 0)
+    //   only.
+    //   //       We need an algorithm to find the optimality with lowest
+    //   latency of
     //   //       inter-subarray row clone.
-    //   // =========================================================================
+    //   //
+    //   =========================================================================
 
     //   SmallVector<TypedValue<RowType>, 16> bRows;
     //   for (int i = 0; i < 16; ++i) {
@@ -366,9 +370,12 @@ struct ConvertBitsToPuD
     //   const TypedValue<RowType> c1 = opBuilder.create<GetRowOp>(
     //       loc, cRowType, zero, zero, bankVal, zero, getOrCreateI64Val(1));
 
-    //   // =========================================================================
-    //   // ====================== Data Rows Allocation =============================
-    //   // =========================================================================
+    //   //
+    //   =========================================================================
+    //   // ====================== Data Rows Allocation
+    //   =============================
+    //   //
+    //   =========================================================================
 
     //   const auto maxColNum = allocator.getMaxColumnNum();
     //   int lastSliceVecLen = vecLen % maxColNum;
@@ -386,8 +393,8 @@ struct ConvertBitsToPuD
     //     v.push_back(slice);
     //     for (int roundIdx = 0; roundIdx < round - 1; ++roundIdx) {
     //       auto toSplit = v[roundIdx];
-    //       auto secondColNum = toSplit.getType().getVectorLength() - maxColNum;
-    //       if (roundIdx + 2 == round)
+    //       auto secondColNum = toSplit.getType().getVectorLength() -
+    //       maxColNum; if (roundIdx + 2 == round)
     //         assert(secondColNum <= maxColNum);
     //       auto secondType = SliceType::get(ctx, bitWidth, secondColNum);
     //       auto splitOp = opBuilder.create<SplitSliceVerticallyOp>(
@@ -468,15 +475,19 @@ struct ConvertBitsToPuD
     //               outputFirstRow = outRow;
     //             } else {
     //               assert(!carryRows.contains(operand1.str_repr));
-    //               std::string cinName = "D" + std::to_string(index - carryNum);
-    //               assert(carryRows.contains(cinName) && allocated.contains(cinName));
-    //               allocated.try_emplace(operand1.str_repr, allocated.lookup(cinName));
-    //               carryRows.try_emplace(operand1.str_repr, carryRows.lookup(cinName));
+    //               std::string cinName = "D" + std::to_string(index -
+    //               carryNum); assert(carryRows.contains(cinName) &&
+    //               allocated.contains(cinName));
+    //               allocated.try_emplace(operand1.str_repr,
+    //               allocated.lookup(cinName));
+    //               carryRows.try_emplace(operand1.str_repr,
+    //               carryRows.lookup(cinName));
     //             }
     //           }
     //           continue;
     //         }
-    //         if (!allocated.contains(operand1.str_repr) && index == inputNum + carryNum * 2) {
+    //         if (!allocated.contains(operand1.str_repr) && index == inputNum +
+    //         carryNum * 2) {
     //           assert(roundIdx == 0);
     //           auto addr = allocator.allocate(bitWidth);
     //           allocated[operand1.str_repr] = addr;
@@ -600,7 +611,8 @@ struct ConvertBitsToPuD
 
     //       //       opBuilder.create<AAPOp>(loc, addr0, addr1);
     //       //     } else {
-    //       //       TypedValue<RowType> addr = bRows[std::get<int>(inst.operand0.data)];
+    //       //       TypedValue<RowType> addr =
+    //       bRows[std::get<int>(inst.operand0.data)];
     //       //       opBuilder.create<APOp>(loc, addr);
     //       //     }
     //       //   }
@@ -610,8 +622,10 @@ struct ConvertBitsToPuD
     //     //       in0 = getOrCreateDRow(firstAddrIn0);
     //     //       in1 = getOrCreateDRow(firstAddrIn1);
     //     //     } else {
-    //     //       in0 = getOrCreateDRow(allocator.getRowFromOffset(firstAddrIn0, gtLtIdx));
-    //     //       in1 = getOrCreateDRow(allocator.getRowFromOffset(firstAddrIn1, gtLtIdx));
+    //     //       in0 =
+    //     getOrCreateDRow(allocator.getRowFromOffset(firstAddrIn0, gtLtIdx));
+    //     //       in1 =
+    //     getOrCreateDRow(allocator.getRowFromOffset(firstAddrIn1, gtLtIdx));
     //     //     }
     //     //     if (isMax) {
     //     //       opBuilder.create<AAPOp>(loc, in0, bRows[1]);
@@ -657,14 +671,16 @@ struct ConvertBitsToPuD
     //             addr0 = std::get<bool>(operand0.data) ? c1 : c0;
     //           } else {
     //             assert(operand0.type == AddressType::Data);
-    //             if ((localIsMax || localIsMin) && operand0.str_repr == "I2") {
+    //             if ((localIsMax || localIsMin) && operand0.str_repr == "I2")
+    //             {
     //               addr0 = maskRow;
     //             } else if (localIsRed && operand0.str_repr == "I1") {
     //               if (iterIndex == 0) {
     //                 if (!i1RowForReduction) {
     //                   auto firstRow = allocated["I0"];
     //                   addr0 = getOrCreateDRow(
-    //                       allocator.getRowFromOffset(firstRow, addrOffset - 1));
+    //                       allocator.getRowFromOffset(firstRow, addrOffset -
+    //                       1));
     //                 } else {
     //                   addr0 = i1RowForReduction;
     //                 }
@@ -766,7 +782,8 @@ struct ConvertBitsToPuD
     //     //         addr0 = std::get<bool>(operand0.data) ? c1 : c0;
     //     //       } else if (operand0.type == AddressType::Spill) {
     //     //         assert(biasSFirstRowMap.contains(operand0.str_repr));
-    //     //         addr0 = getOrCreateDRow(biasSFirstRowMap[operand0.str_repr]);
+    //     //         addr0 =
+    //     getOrCreateDRow(biasSFirstRowMap[operand0.str_repr]);
     //     //       } else {
     //     //         assert(operand0.type == AddressType::In);
     //     //         if (operand0.str_repr == "I0") {
@@ -781,7 +798,8 @@ struct ConvertBitsToPuD
     //     //             addr0 = c0;
     //     //           } else {
     //     //             if (!cinRefreshed) {
-    //     //               opBuilder.create<AAPOp>(loc, biasCoutRow, biasCinRow);
+    //     //               opBuilder.create<AAPOp>(loc, biasCoutRow,
+    //     biasCinRow);
     //     //               cinRefreshed = true;
     //     //             }
     //     //             addr0 = biasCinRow;
@@ -794,7 +812,8 @@ struct ConvertBitsToPuD
     //     //         addr1 = bRows[index];
     //     //       } else if (operand1.type == AddressType::Spill) {
     //     //         assert(biasSFirstRowMap.contains(operand0.str_repr));
-    //     //         addr1 = getOrCreateDRow(biasSFirstRowMap[operand0.str_repr]);
+    //     //         addr1 =
+    //     getOrCreateDRow(biasSFirstRowMap[operand0.str_repr]);
     //     //       } else {
     //     //         assert(operand1.type == AddressType::Out);
     //     //         if (operand1.str_repr == "O0") {
@@ -814,9 +833,9 @@ struct ConvertBitsToPuD
 
     //     } else {
 
-    //     auto loop = opBuilder.create<affine::AffineForOp>(loc, 0, bitWidth, 1);
-    //     opBuilder.setInsertionPointToStart(loop.getBody());
-    //     Value iterIndex = opBuilder.create<arith::IndexCastOp>(
+    //     auto loop = opBuilder.create<affine::AffineForOp>(loc, 0, bitWidth,
+    //     1); opBuilder.setInsertionPointToStart(loop.getBody()); Value
+    //     iterIndex = opBuilder.create<arith::IndexCastOp>(
     //         loc, i64Type, loop.getInductionVar());
     //     const auto maxOffset = getOrCreateI64Val(bitWidth - 1);
     //     const Value offset = opBuilder.create<arith::SubIOp>(
@@ -909,8 +928,9 @@ struct ConvertBitsToPuD
 
     // FailureOr<TypedValue<SliceType>> maybeResult;
     // if (builder.hasSubgraphs()) {
-    //   DenseMap<int64_t, const NetworkBuilder::SubgraphNetwork *> bankToSubgraph;
-    //   for (const auto &subgraph : builder.getSubgraphNetworks()) {
+    //   DenseMap<int64_t, const NetworkBuilder::SubgraphNetwork *>
+    //   bankToSubgraph; for (const auto &subgraph :
+    //   builder.getSubgraphNetworks()) {
     //     bankToSubgraph[subgraph.bankId] = &subgraph;
     //   }
 
@@ -1013,13 +1033,9 @@ struct ConvertBitsToPuD
     // Value resultTensor =
     //     opBuilder.create<AssembleOp>(loc, tensorType, resultSlice);
     // opBuilder.create<func::ReturnOp>(loc, resultTensor);
-
   }
 
-  void setUnroll(bool doUnroll) {
-    this->unroll = doUnroll;
-  }
-
+  void setUnroll(bool doUnroll) { this->unroll = doUnroll; }
 };
 
 } // namespace
