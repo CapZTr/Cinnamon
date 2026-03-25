@@ -9,7 +9,7 @@
 
 include "cinm-mlir/Dialect/Bits/IR/BitsBase.td"
 
-def RowType : Bits_Type<"Row"> {
+def BitRowType : Bits_Type<"BitRow"> {
   let mnemonic = "row";
   let summary = "Represents a one-dimensional bit-sliced data type";
 

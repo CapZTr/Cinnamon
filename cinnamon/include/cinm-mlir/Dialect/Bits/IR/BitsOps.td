@@ -261,6 +261,41 @@ def XOrOp : Bits_Op<"xor", [Pure]> {
   let hasVerifier = 1;
 }
 
+def MajOp : Bits_Op<"maj", [Pure]> {
+  let summary = "Majority gate over three row operands";
+  let description = [{}];
+
+  let arguments = (ins
+    BitRowType:$lhs,
+    BitRowType:$rhs,
+    BitRowType:$third
+  );
+  let results = (outs
+    BitRowType:$result
+  );
+
+  let assemblyFormat = "$lhs `,` $rhs `,` $third attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) `,` "
+      "qualified(type($third)) `->` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
+def NotOp : Bits_Op<"not", [Pure]> {
+  let summary = "Inverter operation on row operand";
+  let description = [{}];
+
+  let arguments = (ins
+    BitRowType:$input
+  );
+  let results = (outs
+    BitRowType:$result
+  );
+
+  let assemblyFormat = "$input attr-dict `:` "
+      "qualified(type($input)) `->` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
 def ReduceAndOp : Bits_Op<"and_red", [Pure]> {
   let summary = "";
   let description = [{}];

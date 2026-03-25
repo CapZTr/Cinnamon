@@ -34,7 +34,7 @@ void BitsDialect::registerTypes() {
         >();
 }
 
-Type RowType::parse(AsmParser &parser) {
+Type BitRowType::parse(AsmParser &parser) {
   SmallVector<int64_t, 1> shape;
 
   if (parser.parseLess() ||
@@ -44,10 +44,10 @@ Type RowType::parse(AsmParser &parser) {
     return Type();
   }
 
-  return RowType::get(parser.getContext(), shape.front());
+  return BitRowType::get(parser.getContext(), shape.front());
 }
 
-void RowType::print(AsmPrinter &printer) const {
+void BitRowType::print(AsmPrinter &printer) const {
   printer << "<" << getVectorLength() << ">";
 }
 

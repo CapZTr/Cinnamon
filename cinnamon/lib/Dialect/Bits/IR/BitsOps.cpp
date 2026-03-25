@@ -311,6 +311,36 @@ LogicalResult XOrOp::verify() {
   return success();
 }
 
+LogicalResult MajOp::verify() {
+  auto lhsType = cast<BitRowType>(getLhs().getType());
+  auto rhsType = cast<BitRowType>(getRhs().getType());
+  auto thirdType = cast<BitRowType>(getThird().getType());
+  auto resType = cast<BitRowType>(getResult().getType());
+
+  if (!lhsType || !rhsType || !thirdType || !resType)
+    return emitOpError("operands and result must all be of BitRowType");
+
+  if (lhsType.getVectorLength() != resType.getVectorLength() ||
+      rhsType.getVectorLength() != resType.getVectorLength() ||
+      thirdType.getVectorLength() != resType.getVectorLength())
+    return emitOpError("vector lengths of operands and result must match");
+
+  return success();
+}
+
+LogicalResult NotOp::verify() {
+  auto inputType = cast<BitRowType>(getInput().getType());
+  auto resultType = cast<BitRowType>(getResult().getType());
+
+  if (!inputType || !resultType)
+    return emitOpError("input and result must be of BitRowType");
+
+  if (inputType.getVectorLength() != resultType.getVectorLength())
+    return emitOpError("vector lengths of input and result must match");
+
+  return success();
+}
+
 LogicalResult MaxOp::verify() {
   auto lhsType = cast<SliceType>(getLhs().getType());
   auto rhsType = cast<SliceType>(getRhs().getType());
