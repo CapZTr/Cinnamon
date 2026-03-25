@@ -34,6 +34,23 @@ void BitsDialect::registerTypes() {
         >();
 }
 
+Type RowType::parse(AsmParser &parser) {
+  SmallVector<int64_t, 1> shape;
+
+  if (parser.parseLess() ||
+      parser.parseDimensionList(shape, /*allowDynamic=*/false,
+                                /*withTrailingX=*/false) ||
+      parser.parseGreater()) {
+    return Type();
+  }
+
+  return RowType::get(parser.getContext(), shape.front());
+}
+
+void RowType::print(AsmPrinter &printer) const {
+  printer << "<" << getVectorLength() << ">";
+}
+
 Type SliceType::parse(AsmParser &parser) {
   SmallVector<int64_t, 2> shape;
 
