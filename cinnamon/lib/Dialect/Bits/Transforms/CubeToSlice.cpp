@@ -242,8 +242,9 @@ struct BitsCubeToSlicePass
   void runOnOperation() final {
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
-    patterns.add<LowerMatvecIPattern, LowerMatmulIPattern, LowerMulIPattern>(
-        ctx);
+    patterns.add<LowerMatvecIPattern, LowerMatmulIPattern>(ctx);
+    // patterns.add<LowerMatvecIPattern, LowerMatmulIPattern, LowerMulIPattern>(
+    //     ctx);
 
     if (failed(applyPatternsAndFoldGreedily(getOperation(),
                                             std::move(patterns)))) {
