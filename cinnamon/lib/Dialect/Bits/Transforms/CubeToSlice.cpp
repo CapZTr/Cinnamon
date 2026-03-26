@@ -166,76 +166,76 @@ struct LowerMatmulIPattern : public OpRewritePattern<MatmulIOp> {
   }
 };
 
-struct LowerMulIPattern : public OpRewritePattern<MulIOp> {
-  using OpRewritePattern<MulIOp>::OpRewritePattern;
+// struct LowerMulIPattern : public OpRewritePattern<MulIOp> {
+//   using OpRewritePattern<MulIOp>::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(MulIOp op,
-                                PatternRewriter &rewriter) const override {
-    Location loc = op.getLoc();
-    auto ctx = rewriter.getContext();
-    Value lhsSlice = op.getLhs();
-    Value rhsSlice = op.getRhs();
+//   LogicalResult matchAndRewrite(MulIOp op,
+//                                 PatternRewriter &rewriter) const override {
+//     Location loc = op.getLoc();
+//     auto ctx = rewriter.getContext();
+//     Value lhsSlice = op.getLhs();
+//     Value rhsSlice = op.getRhs();
 
-    auto lhsType = cast<SliceType>(lhsSlice.getType());
-    auto rhsType = cast<SliceType>(rhsSlice.getType());
-    if (!lhsType || !rhsType || lhsType.getBitWidth() != rhsType.getBitWidth())
-      return failure();
+//     auto lhsType = cast<SliceType>(lhsSlice.getType());
+//     auto rhsType = cast<SliceType>(rhsSlice.getType());
+//     if (!lhsType || !rhsType || lhsType.getBitWidth() != rhsType.getBitWidth())
+//       return failure();
 
-    Value cstint1 = rewriter.create<arith::ConstantIntOp>(loc, 1, 64);
-    auto operandBitWidth = lhsType.getBitWidth();
-    auto vecLen = lhsType.getVectorLength();
-    Value bitwidthVal =
-        rewriter.create<arith::ConstantIntOp>(loc, operandBitWidth, 64);
-    Value productBitwidthVal =
-        rewriter.create<arith::ConstantIntOp>(loc, operandBitWidth * 2, 64);
-    Value vecLenVal = rewriter.create<arith::ConstantIntOp>(loc, vecLen, 64);
+//     Value cstint1 = rewriter.create<arith::ConstantIntOp>(loc, 1, 64);
+//     auto operandBitWidth = lhsType.getBitWidth();
+//     auto vecLen = lhsType.getVectorLength();
+//     Value bitwidthVal =
+//         rewriter.create<arith::ConstantIntOp>(loc, operandBitWidth, 64);
+//     Value productBitwidthVal =
+//         rewriter.create<arith::ConstantIntOp>(loc, operandBitWidth * 2, 64);
+//     Value vecLenVal = rewriter.create<arith::ConstantIntOp>(loc, vecLen, 64);
 
-    auto rowSliceType = SliceType::get(ctx, 1, vecLen);
-    Value all1Row = rewriter.create<CreateAllOneSliceOp>(loc, rowSliceType,
-                                                         cstint1, vecLenVal);
+//     auto rowSliceType = SliceType::get(ctx, 1, vecLen);
+//     Value all1Row = rewriter.create<CreateAllOneSliceOp>(loc, rowSliceType,
+//                                                          cstint1, vecLenVal);
 
-    Value c0Val = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value c1Val = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    Value bitwidthIndexVal =
-        rewriter.create<arith::ConstantIndexOp>(loc, operandBitWidth);
+//     Value c0Val = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+//     Value c1Val = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+//     Value bitwidthIndexVal =
+//         rewriter.create<arith::ConstantIndexOp>(loc, operandBitWidth);
 
-    Value all0Slice =
-        rewriter.create<CreateSliceOp>(loc, lhsType, bitwidthVal, vecLenVal);
-    auto resSliceType = SliceType::get(ctx, operandBitWidth * 2, vecLen);
-    Value resSlice = rewriter.create<CreateSliceOp>(
-        loc, resSliceType, productBitwidthVal, vecLenVal);
+//     Value all0Slice =
+//         rewriter.create<CreateSliceOp>(loc, lhsType, bitwidthVal, vecLenVal);
+//     auto resSliceType = SliceType::get(ctx, operandBitWidth * 2, vecLen);
+//     Value resSlice = rewriter.create<CreateSliceOp>(
+//         loc, resSliceType, productBitwidthVal, vecLenVal);
 
-    auto loop = rewriter.create<scf::ForOp>(
-        loc, c0Val, bitwidthIndexVal, c1Val, ValueRange{resSlice},
-        [&](OpBuilder &builder, Location bodyLoc, Value iv,
-            ValueRange iterArgs) {
-          Value curRes = iterArgs[0];
-          Value ivI64 = builder.create<arith::IndexCastOp>(
-              bodyLoc, builder.getI64Type(), iv);
-          Value numToShift =
-              builder.create<arith::AddIOp>(bodyLoc, ivI64, cstint1);
+//     auto loop = rewriter.create<scf::ForOp>(
+//         loc, c0Val, bitwidthIndexVal, c1Val, ValueRange{resSlice},
+//         [&](OpBuilder &builder, Location bodyLoc, Value iv,
+//             ValueRange iterArgs) {
+//           Value curRes = iterArgs[0];
+//           Value ivI64 = builder.create<arith::IndexCastOp>(
+//               bodyLoc, builder.getI64Type(), iv);
+//           Value numToShift =
+//               builder.create<arith::AddIOp>(bodyLoc, ivI64, cstint1);
 
-          Value curRow = builder.create<ExtractRowSliceOp>(
-              bodyLoc, rowSliceType, rhsSlice, ivI64);
-          Value maskRow =
-              builder.create<AndOp>(bodyLoc, rowSliceType, curRow, all1Row);
-          Value selected = builder.create<MuxOp>(bodyLoc, lhsType, lhsSlice,
-                                                 all0Slice, maskRow);
-          Value extended = builder.create<ExtensionIOp>(bodyLoc, resSliceType,
-                                                        selected, bitwidthVal);
-          Value shifted = builder.create<ShiftUpOp>(bodyLoc, resSliceType,
-                                                    extended, numToShift);
+//           Value curRow = builder.create<ExtractRowSliceOp>(
+//               bodyLoc, rowSliceType, rhsSlice, ivI64);
+//           Value maskRow =
+//               builder.create<AndOp>(bodyLoc, rowSliceType, curRow, all1Row);
+//           Value selected = builder.create<MuxOp>(bodyLoc, lhsType, lhsSlice,
+//                                                  all0Slice, maskRow);
+//           Value extended = builder.create<ExtensionIOp>(bodyLoc, resSliceType,
+//                                                         selected, bitwidthVal);
+//           Value shifted = builder.create<ShiftUpOp>(bodyLoc, resSliceType,
+//                                                     extended, numToShift);
 
-          Value partialRes =
-              builder.create<AddIOp>(bodyLoc, resSliceType, curRes, shifted);
-          builder.create<scf::YieldOp>(bodyLoc, partialRes);
-        });
+//           Value partialRes =
+//               builder.create<AddIOp>(bodyLoc, resSliceType, curRes, shifted);
+//           builder.create<scf::YieldOp>(bodyLoc, partialRes);
+//         });
 
-    rewriter.replaceOp(op, loop.getResults());
+//     rewriter.replaceOp(op, loop.getResults());
 
-    return success();
-  }
-};
+//     return success();
+//   }
+// };
 
 struct BitsCubeToSlicePass
     : public impl::BitsCubeToSlicePassBase<BitsCubeToSlicePass> {
@@ -243,8 +243,6 @@ struct BitsCubeToSlicePass
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
     patterns.add<LowerMatvecIPattern, LowerMatmulIPattern>(ctx);
-    // patterns.add<LowerMatvecIPattern, LowerMatmulIPattern, LowerMulIPattern>(
-    //     ctx);
 
     if (failed(applyPatternsAndFoldGreedily(getOperation(),
                                             std::move(patterns)))) {

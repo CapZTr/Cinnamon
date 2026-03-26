@@ -63,15 +63,28 @@ def ExtractSubSliceOp : Bits_Op<"extract_sub_slice", [Pure]> {
       "qualified(type($slice)) `,` type($rowNum) `->` qualified(type($resultSlice))";
 }
 
-def ExtractRowSliceOp : Bits_Op<"extract_row_as_slice", [Pure]> {
+def ExtractRowOp : Bits_Op<"extract_row", [Pure]> {
   let summary = "";
   let description = [{}];
 
   let arguments = (ins SliceType:$slice, I64:$rowIdx);
-  let results = (outs SliceType:$rowSlice);
+  let results = (outs BitRowType:$row);
 
   let assemblyFormat = "$slice `,` $rowIdx attr-dict `:` "
-      "qualified(type($slice)) `,` type($rowIdx) `->` qualified(type($rowSlice))";
+      "qualified(type($slice)) `,` type($rowIdx) `->` qualified(type($row))";
+}
+
+def InsertRowOp : Bits_Op<"insert_row", [Pure]> {
+  let arguments = (ins
+    SliceType:$slice,
+    BitRowType:$row,
+    I64:$index
+  );
+  let results = (outs SliceType:$resultSlice);
+
+  let assemblyFormat = "$slice `,` $row `,` $index attr-dict `:` "
+      "qualified(type($slice)) `,` qualified(type($row)) `,` type($index) "
+      "`->` qualified(type($resultSlice))";
 }
 
 def InsertSliceOp : Bits_Op<"insert_slice", [Pure]> {
@@ -169,6 +182,23 @@ def AddIOp : Bits_Op<"add_i", [Pure]> {
   let hasVerifier = 1;
 }
 
+def RowAddOp : Bits_Op<"row_add", [Pure]> {
+  let arguments = (ins
+    BitRowType:$lhs,
+    BitRowType:$rhs,
+    BitRowType:$cin
+  );
+  let results = (outs
+    BitRowType:$sum,
+    BitRowType:$cout
+  );
+
+  let assemblyFormat = "$lhs `,` $rhs `,` $cin attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) `,` "
+      "qualified(type($cin)) `->` qualified(type($sum)) `,` "
+      "qualified(type($cout))";
+}
+
 def MulIOp : Bits_Op<"mul_i", [Pure]> {
   let summary = "Bit-serial multiplication of two slice operands "
       "in integer";
@@ -223,6 +253,20 @@ def AndOp : Bits_Op<"and", [Pure]> {
       "qualified(type($lhs)) `,` qualified(type($rhs)) "
       "`->` qualified(type($result))";
   let hasVerifier = 1;
+}
+
+def RowAndOp : Bits_Op<"row_and", [Pure]> {
+  let arguments = (ins
+    BitRowType:$lhs,
+    BitRowType:$rhs
+  );
+  let results = (outs
+    BitRowType:$result
+  );
+
+  let assemblyFormat = "$lhs `,` $rhs `,` attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) `,` "
+      "`->` qualified(type($result))";
 }
 
 def OrOp : Bits_Op<"or", [Pure]> {
@@ -441,6 +485,20 @@ def CreateSliceOp : Bits_Op<"create_slice", [Pure]> {
   let results = (outs SliceType:$slice);
   let assemblyFormat = "$bitWidth `,` $vectorLength attr-dict `:` "
       "type($bitWidth) `,` type($vectorLength) `->` qualified(type($slice))";
+}
+
+def CreateRowOp : Bits_Op<"create_row", [Pure]> {
+  let arguments = (ins I64:$vectorLength);
+  let results = (outs BitRowType:$row);
+  let assemblyFormat = "$vectorLength attr-dict `:` "
+      "type($vectorLength) `->` qualified(type($row))";
+}
+
+def CreateAllZeroRowOp : Bits_Op<"create_all_zero_row", [Pure]> {
+  let arguments = (ins I64:$vectorLength);
+  let results = (outs BitRowType:$row);
+  let assemblyFormat = "$vectorLength attr-dict `:` "
+      "type($vectorLength) `->` qualified(type($row))";
 }
 
 def CreateAllOneSliceOp : Bits_Op<"create_all_one_slice", [Pure]> {

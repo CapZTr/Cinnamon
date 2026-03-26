@@ -1,6 +1,7 @@
 add_mlir_dialect_library(BitsTransforms
   CubeToSlice.cpp
   OptimiseMapping.cpp
+  PatternApply.cpp
 
 DEPENDS
   BitsIncGen

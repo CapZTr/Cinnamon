@@ -21,4 +21,8 @@ def BitsCubeToSlicePass : Pass<"bits-cube-to-slice", "func::FuncOp"> {
   let dependentDialects = [];
 }
 
+def BitsPatternApplyPass : Pass<"bits-pattern-apply", "func::FuncOp"> {
+
+}
+
 #endif // BITS_TRANSFORM_PASSES
