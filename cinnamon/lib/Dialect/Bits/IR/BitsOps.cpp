@@ -3,17 +3,18 @@
 /// @file
 
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
+
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 
 #include <cstdint>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/LogicalResult.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinAttributes.h>
 #include <mlir/IR/BuiltinTypes.h>
-#include <mlir/IR/Builders.h>
-#include <mlir/Dialect/Arith/IR/Arith.h>
-#include <mlir/IR/Operation.h>
 #include <mlir/IR/OpImplementation.h>
+#include <mlir/IR/Operation.h>
 #include <mlir/Support/LogicalResult.h>
 
 #define DEBUG_TYPE "bits-ops"
@@ -113,8 +114,10 @@ LogicalResult AssembleOp::verify() {
 
 LogicalResult ExtractSliceOp::verify() {
   if (getCube().getType().getBitWidth() != getSlice().getType().getBitWidth() ||
-      getCube().getType().getVectorLength() != getSlice().getType().getVectorLength()) {
-    return emitOpError("bitwidth and vectorlength of cube and slice must match");
+      getCube().getType().getVectorLength() !=
+          getSlice().getType().getVectorLength()) {
+    return emitOpError(
+        "bitwidth and vectorlength of cube and slice must match");
   }
 
   return success();
@@ -122,17 +125,20 @@ LogicalResult ExtractSliceOp::verify() {
 
 LogicalResult InsertSliceOp::verify() {
   if (getCube().getType().getBitWidth() != getSlice().getType().getBitWidth() ||
-      getCube().getType().getVectorLength() != getSlice().getType().getVectorLength()) {
-    return emitOpError("bitwidth and vectorlength of cube and slice must match");
+      getCube().getType().getVectorLength() !=
+          getSlice().getType().getVectorLength()) {
+    return emitOpError(
+        "bitwidth and vectorlength of cube and slice must match");
   }
-  
+
   return success();
 }
 
 LogicalResult ExtensionIOp::verify() {
   // auto operandBitWidth = getSlice().getType().getBitWidth();
   // auto resultBitWidth = getResult().getType().getBitWidth();
-  // if (auto constantOp = dyn_cast<arith::ConstantOp>(getRowNumToExt().getDefiningOp())) {
+  // if (auto constantOp =
+  // dyn_cast<arith::ConstantOp>(getRowNumToExt().getDefiningOp())) {
   //   if (auto intAttr = dyn_cast<IntegerAttr>(constantOp.getValue())) {
   //     auto rowNum = intAttr.getInt();
   //     if (rowNum + operandBitWidth != resultBitWidth) {
@@ -150,8 +156,8 @@ LogicalResult ExtensionIOp::verify() {
 
 LogicalResult SplitSliceVerticallyOp::verify() {
   auto vecLen = getSlice().getType().getVectorLength();
-  if (auto constantOp = dyn_cast<arith::ConstantOp>(
-      getColumnNum().getDefiningOp())) {
+  if (auto constantOp =
+          dyn_cast<arith::ConstantOp>(getColumnNum().getDefiningOp())) {
     if (auto intAttr = dyn_cast<IntegerAttr>(constantOp.getValue())) {
       auto rowNum = intAttr.getInt();
       if (vecLen <= rowNum)
@@ -169,7 +175,7 @@ LogicalResult SplitSliceVerticallyOp::verify() {
   if (firstColNum + secondColNum != vecLen)
     return emitOpError(
         "column's sum of two result slices must be equal to the original one");
-  
+
   auto firstBitwidth = getFirst().getType().getBitWidth();
   auto secondBitwidth = getSecond().getType().getBitWidth();
   auto bitwidth = getSlice().getType().getBitWidth();
@@ -210,10 +216,10 @@ LogicalResult AddIOp::verify() {
       lhsType.getBitWidth() != resType.getBitWidth())
     return emitOpError("bit widths of operands and result must match");
 
-  if (lhsType.getVectorLength() != resType.getVectorLength()
-      || rhsType.getVectorLength() != resType.getVectorLength())
+  if (lhsType.getVectorLength() != resType.getVectorLength() ||
+      rhsType.getVectorLength() != resType.getVectorLength())
     return emitOpError("vector lengths of operands and result must match");
-  
+
   return success();
 }
 
@@ -228,10 +234,10 @@ LogicalResult MulIOp::verify() {
   if (lhsType.getBitWidth() + rhsType.getBitWidth() != resType.getBitWidth())
     return emitOpError("sum of bit widths of operands and result must match");
 
-  if (lhsType.getVectorLength() != resType.getVectorLength()
-      || rhsType.getVectorLength() != resType.getVectorLength())
+  if (lhsType.getVectorLength() != resType.getVectorLength() ||
+      rhsType.getVectorLength() != resType.getVectorLength())
     return emitOpError("vector lengths of operands and result must match");
-  
+
   return success();
 }
 
@@ -247,10 +253,10 @@ LogicalResult MulFOp::verify() {
       lhsType.getBitWidth() != resType.getBitWidth())
     return emitOpError("bit widths of operands and result must match");
 
-  if (lhsType.getVectorLength() != resType.getVectorLength()
-      || rhsType.getVectorLength() != resType.getVectorLength())
+  if (lhsType.getVectorLength() != resType.getVectorLength() ||
+      rhsType.getVectorLength() != resType.getVectorLength())
     return emitOpError("vector lengths of operands and result must match");
-  
+
   return success();
 }
 
@@ -266,10 +272,10 @@ LogicalResult AndOp::verify() {
       lhsType.getBitWidth() != resType.getBitWidth())
     return emitOpError("bit widths of operands and result must match");
 
-  if (lhsType.getVectorLength() != resType.getVectorLength()
-      || rhsType.getVectorLength() != resType.getVectorLength())
+  if (lhsType.getVectorLength() != resType.getVectorLength() ||
+      rhsType.getVectorLength() != resType.getVectorLength())
     return emitOpError("vector lengths of operands and result must match");
-  
+
   return success();
 }
 
@@ -285,10 +291,10 @@ LogicalResult OrOp::verify() {
       lhsType.getBitWidth() != resType.getBitWidth())
     return emitOpError("bit widths of operands and result must match");
 
-  if (lhsType.getVectorLength() != resType.getVectorLength()
-      || rhsType.getVectorLength() != resType.getVectorLength())
+  if (lhsType.getVectorLength() != resType.getVectorLength() ||
+      rhsType.getVectorLength() != resType.getVectorLength())
     return emitOpError("vector lengths of operands and result must match");
-  
+
   return success();
 }
 
@@ -304,10 +310,10 @@ LogicalResult XOrOp::verify() {
       lhsType.getBitWidth() != resType.getBitWidth())
     return emitOpError("bit widths of operands and result must match");
 
-  if (lhsType.getVectorLength() != resType.getVectorLength()
-      || rhsType.getVectorLength() != resType.getVectorLength())
+  if (lhsType.getVectorLength() != resType.getVectorLength() ||
+      rhsType.getVectorLength() != resType.getVectorLength())
     return emitOpError("vector lengths of operands and result must match");
-  
+
   return success();
 }
 
@@ -353,10 +359,10 @@ LogicalResult MaxOp::verify() {
       lhsType.getBitWidth() != resType.getBitWidth())
     return emitOpError("bit widths of operands and result must match");
 
-  if (lhsType.getVectorLength() != resType.getVectorLength()
-      || rhsType.getVectorLength() != resType.getVectorLength())
+  if (lhsType.getVectorLength() != resType.getVectorLength() ||
+      rhsType.getVectorLength() != resType.getVectorLength())
     return emitOpError("vector lengths of operands and result must match");
-  
+
   return success();
 }
 
@@ -372,14 +378,14 @@ LogicalResult MinOp::verify() {
       lhsType.getBitWidth() != resType.getBitWidth())
     return emitOpError("bit widths of operands and result must match");
 
-  if (lhsType.getVectorLength() != resType.getVectorLength()
-      || rhsType.getVectorLength() != resType.getVectorLength())
+  if (lhsType.getVectorLength() != resType.getVectorLength() ||
+      rhsType.getVectorLength() != resType.getVectorLength())
     return emitOpError("vector lengths of operands and result must match");
-  
+
   return success();
 }
 
-LogicalResult MatmulIOp::verify() {
+LogicalResult MatMulOp::verify() {
   auto lhsType = cast<CubeType>(getLhs().getType());
   auto rhsType = cast<CubeType>(getRhs().getType());
   auto resType = cast<CubeType>(getResult().getType());
@@ -388,9 +394,9 @@ LogicalResult MatmulIOp::verify() {
     return emitOpError("operands and result must all be of CubeType");
 
   if (lhsType.getBitWidth() != rhsType.getBitWidth() ||
-      lhsType.getBitWidth() * 2 != resType.getBitWidth())
+      lhsType.getBitWidth() * 4 != resType.getBitWidth())
     return emitOpError("bit widths of operands and result must match");
-  
+
   if (lhsType.getVectorLength() != resType.getVectorLength() ||
       rhsType.getHeight() != resType.getHeight() ||
       lhsType.getHeight() != rhsType.getVectorLength())
@@ -399,7 +405,7 @@ LogicalResult MatmulIOp::verify() {
   return success();
 }
 
-LogicalResult MatvecIOp::verify() {
+LogicalResult MatvecMulOp::verify() {
   auto lhsType = cast<CubeType>(getLhs().getType());
   auto rhsType = cast<SliceType>(getRhs().getType());
   auto resType = cast<SliceType>(getResult().getType());
@@ -408,9 +414,9 @@ LogicalResult MatvecIOp::verify() {
     return emitOpError("wrong type");
 
   if (lhsType.getBitWidth() != rhsType.getBitWidth() ||
-      lhsType.getBitWidth() * 2 != resType.getBitWidth())
+      lhsType.getBitWidth() * 4 != resType.getBitWidth())
     return emitOpError("bit widths of operands and result must match");
-  
+
   if (lhsType.getVectorLength() != resType.getVectorLength() ||
       lhsType.getHeight() != rhsType.getVectorLength())
     return emitOpError("wrong size");

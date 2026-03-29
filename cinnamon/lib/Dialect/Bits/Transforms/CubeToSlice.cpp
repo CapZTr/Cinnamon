@@ -24,10 +24,10 @@ namespace mlir::bits {
 
 //===----------------------------------------------------------------------===//
 
-struct LowerMatvecIPattern : public OpRewritePattern<MatvecIOp> {
-  using OpRewritePattern<MatvecIOp>::OpRewritePattern;
+struct LowerMatvecIPattern : public OpRewritePattern<MatvecMulOp> {
+  using OpRewritePattern<MatvecMulOp>::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(MatvecIOp op,
+  LogicalResult matchAndRewrite(MatvecMulOp op,
                                 PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     auto ctx = rewriter.getContext();
@@ -84,10 +84,10 @@ struct LowerMatvecIPattern : public OpRewritePattern<MatvecIOp> {
   }
 };
 
-struct LowerMatmulIPattern : public OpRewritePattern<MatmulIOp> {
-  using OpRewritePattern<MatmulIOp>::OpRewritePattern;
+struct LowerMatmulIPattern : public OpRewritePattern<MatMulOp> {
+  using OpRewritePattern<MatMulOp>::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(MatmulIOp op,
+  LogicalResult matchAndRewrite(MatMulOp op,
                                 PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     auto ctx = rewriter.getContext();
@@ -178,7 +178,8 @@ struct LowerMatmulIPattern : public OpRewritePattern<MatmulIOp> {
 
 //     auto lhsType = cast<SliceType>(lhsSlice.getType());
 //     auto rhsType = cast<SliceType>(rhsSlice.getType());
-//     if (!lhsType || !rhsType || lhsType.getBitWidth() != rhsType.getBitWidth())
+//     if (!lhsType || !rhsType || lhsType.getBitWidth() !=
+//     rhsType.getBitWidth())
 //       return failure();
 
 //     Value cstint1 = rewriter.create<arith::ConstantIntOp>(loc, 1, 64);
@@ -221,8 +222,10 @@ struct LowerMatmulIPattern : public OpRewritePattern<MatmulIOp> {
 //               builder.create<AndOp>(bodyLoc, rowSliceType, curRow, all1Row);
 //           Value selected = builder.create<MuxOp>(bodyLoc, lhsType, lhsSlice,
 //                                                  all0Slice, maskRow);
-//           Value extended = builder.create<ExtensionIOp>(bodyLoc, resSliceType,
-//                                                         selected, bitwidthVal);
+//           Value extended = builder.create<ExtensionIOp>(bodyLoc,
+//           resSliceType,
+//                                                         selected,
+//                                                         bitwidthVal);
 //           Value shifted = builder.create<ShiftUpOp>(bodyLoc, resSliceType,
 //                                                     extended, numToShift);
 

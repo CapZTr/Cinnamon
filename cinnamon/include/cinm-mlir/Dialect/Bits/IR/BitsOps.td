@@ -182,6 +182,23 @@ def AddIOp : Bits_Op<"add_i", [Pure]> {
   let hasVerifier = 1;
 }
 
+def AddIFullOp : Bits_Op<"add_i_full", [Pure]> {
+  let summary = "";
+  let description = [{}];
+
+  let arguments = (ins
+    SliceType:$lhs,
+    SliceType:$rhs
+  );
+  let results = (outs
+    SliceType:$result
+  );
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:`"
+      "qualified(type($lhs)) `,` qualified(type($rhs))"
+      "`->` qualified(type($result))";
+}
+
 def RowAddOp : Bits_Op<"row_add", [Pure]> {
   let arguments = (ins
     BitRowType:$lhs,
@@ -433,7 +450,7 @@ def MuxOp : Bits_Op<"mux", [Pure]> {
       "`->` qualified(type($result))";
 }
 
-def MatmulIOp : Bits_Op<"matmul_i",  [Pure]> {
+def MatMulOp : Bits_Op<"matmul",  [Pure]> {
   let summary = "";
   let description = [{}];
 
@@ -449,7 +466,7 @@ def MatmulIOp : Bits_Op<"matmul_i",  [Pure]> {
   let hasVerifier = 1;
 }
 
-def MatvecIOp : Bits_Op<"matvec_i",  [Pure]> {
+def MatvecMulOp : Bits_Op<"matvecmul",  [Pure]> {
   let summary = "";
   let description = [{}];
 

@@ -1,4 +1,5 @@
 #include "cinm-mlir/Conversion/LinalgToBits/LinalgToBits.h"
+
 #include "cinm-mlir/Dialect/Bits/IR/BitsBase.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
@@ -8,18 +9,17 @@
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <memory>
-#include <mlir/IR/Builders.h>
-#include <mlir/IR/BuiltinOps.h>
-#include <mlir/IR/BuiltinTypes.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/Linalg/IR/Linalg.h>
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
+#include <mlir/IR/Builders.h>
+#include <mlir/IR/BuiltinOps.h>
+#include <mlir/IR/BuiltinTypes.h>
 #include <mlir/IR/PatternMatch.h>
 #include <mlir/IR/Value.h>
 #include <mlir/Transforms/DialectConversion.h>
 #include <tuple>
-
 
 using namespace mlir;
 using namespace mlir::bits;
@@ -44,7 +44,8 @@ struct SliceCache {
 };
 
 static bool isExtSIGeneric(linalg::GenericOp generic) {
-  if (!generic || generic.getInputs().size() != 1 || generic.getOutputs().size() != 1)
+  if (!generic || generic.getInputs().size() != 1 ||
+      generic.getOutputs().size() != 1)
     return false;
 
   auto &gBlock = generic.getRegion().front();
@@ -52,7 +53,8 @@ static bool isExtSIGeneric(linalg::GenericOp generic) {
   if (!yield || yield.getValues().size() != 1)
     return false;
 
-  auto ext = dyn_cast_or_null<arith::ExtSIOp>(yield.getValues().front().getDefiningOp());
+  auto ext = dyn_cast_or_null<arith::ExtSIOp>(
+      yield.getValues().front().getDefiningOp());
   if (!ext)
     return false;
 
@@ -61,7 +63,8 @@ static bool isExtSIGeneric(linalg::GenericOp generic) {
 }
 
 static bool isTruncIGeneric(linalg::GenericOp generic) {
-  if (!generic || generic.getInputs().size() != 1 || generic.getOutputs().size() != 1)
+  if (!generic || generic.getInputs().size() != 1 ||
+      generic.getOutputs().size() != 1)
     return false;
 
   auto &gBlock = generic.getRegion().front();
@@ -69,7 +72,8 @@ static bool isTruncIGeneric(linalg::GenericOp generic) {
   if (!yield || yield.getValues().size() != 1)
     return false;
 
-  auto trunc = dyn_cast_or_null<arith::TruncIOp>(yield.getValues().front().getDefiningOp());
+  auto trunc = dyn_cast_or_null<arith::TruncIOp>(
+      yield.getValues().front().getDefiningOp());
   if (!trunc)
     return false;
 
@@ -78,8 +82,10 @@ static bool isTruncIGeneric(linalg::GenericOp generic) {
 }
 
 static Value stripExtSIGeneric(Value tensorValue) {
-  auto generic = dyn_cast_or_null<linalg::GenericOp>(tensorValue.getDefiningOp());
-  if (!generic || generic.getInputs().size() != 1 || generic.getOutputs().size() != 1)
+  auto generic =
+      dyn_cast_or_null<linalg::GenericOp>(tensorValue.getDefiningOp());
+  if (!generic || generic.getInputs().size() != 1 ||
+      generic.getOutputs().size() != 1)
     return {};
 
   auto &gBlock = generic.getRegion().front();
@@ -87,7 +93,8 @@ static Value stripExtSIGeneric(Value tensorValue) {
   if (!yield || yield.getValues().size() != 1)
     return {};
 
-  auto ext = dyn_cast_or_null<arith::ExtSIOp>(yield.getValues().front().getDefiningOp());
+  auto ext = dyn_cast_or_null<arith::ExtSIOp>(
+      yield.getValues().front().getDefiningOp());
   if (!ext)
     return {};
 
@@ -105,8 +112,9 @@ static Value getSourceTensorBeforeExt(Value tensorValue) {
 }
 
 static void eraseExtSIGenericIfDead(Value tensorValue,
-                                   ConversionPatternRewriter &rewriter) {
-  auto generic = dyn_cast_or_null<linalg::GenericOp>(tensorValue.getDefiningOp());
+                                    ConversionPatternRewriter &rewriter) {
+  auto generic =
+      dyn_cast_or_null<linalg::GenericOp>(tensorValue.getDefiningOp());
   if (!generic || !isExtSIGeneric(generic) || !generic->use_empty())
     return;
   rewriter.eraseOp(generic);
@@ -114,8 +122,7 @@ static void eraseExtSIGenericIfDead(Value tensorValue,
 
 static Value createTransposeFromTensor(Value tensor,
                                        ConversionPatternRewriter &rewriter,
-                                       Location loc,
-                                       MLIRContext *ctx) {
+                                       Location loc, MLIRContext *ctx) {
   auto tensorType = dyn_cast<RankedTensorType>(tensor.getType());
   if (!tensorType)
     return {};
@@ -125,13 +132,15 @@ static Value createTransposeFromTensor(Value tensor,
     return {};
 
   if (tensorType.getRank() == 1) {
-    auto outputType = SliceType::get(ctx, elementType.getWidth(), tensorType.getShape()[0]);
+    auto outputType =
+        SliceType::get(ctx, elementType.getWidth(), tensorType.getShape()[0]);
     return rewriter.create<TransposeOp>(loc, outputType, tensor);
   }
 
   if (tensorType.getRank() == 2) {
-    auto outputType = CubeType::get(
-        ctx, elementType.getWidth(), tensorType.getShape()[0], tensorType.getShape()[1]);
+    auto outputType =
+        CubeType::get(ctx, elementType.getWidth(), tensorType.getShape()[0],
+                      tensorType.getShape()[1]);
     return rewriter.create<TransposeOp>(loc, outputType, tensor);
   }
 
@@ -139,7 +148,7 @@ static Value createTransposeFromTensor(Value tensor,
 }
 
 static RankedTensorType inferTensorTypeFromBitsValue(Value bitsValue,
-                                                   MLIRContext *ctx) {
+                                                     MLIRContext *ctx) {
   if (auto sliceType = dyn_cast<SliceType>(bitsValue.getType())) {
     auto elemType = IntegerType::get(ctx, sliceType.getBitWidth());
     return RankedTensorType::get({sliceType.getVectorLength()}, elemType);
@@ -158,10 +167,9 @@ struct ConvertLinalgGenericToBits
     : public OpConversionPattern<linalg::GenericOp> {
   using OpConversionPattern<linalg::GenericOp>::OpConversionPattern;
 
-  LogicalResult matchAndRewrite(
-      linalg::GenericOp op,
-      linalg::GenericOp::Adaptor,
-      ConversionPatternRewriter &rewriter) const override {
+  LogicalResult
+  matchAndRewrite(linalg::GenericOp op, linalg::GenericOp::Adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
     if (op.getNumLoops() != 1)
       return failure();
 
@@ -229,10 +237,10 @@ struct ConvertLinalgGenericToBits
         return getOrCreateSlice(source);
       }
 
-      if (auto assemble =
-              dyn_cast_or_null<bits::AssembleOp>(tensorOperand.getDefiningOp())) {
-        if (auto ext =
-                dyn_cast_or_null<bits::ExtensionIOp>(assemble.getInput().getDefiningOp())) {
+      if (auto assemble = dyn_cast_or_null<bits::AssembleOp>(
+              tensorOperand.getDefiningOp())) {
+        if (auto ext = dyn_cast_or_null<bits::ExtensionIOp>(
+                assemble.getInput().getDefiningOp())) {
           return ext.getSlice();
         }
       }
@@ -262,7 +270,8 @@ struct ConvertLinalgGenericToBits
       if (!arg || arg.getOwner() != &block || arg.getArgNumber() != 0)
         return failure();
 
-      auto inputType = dyn_cast<RankedTensorType>(op.getInputs().front().getType());
+      auto inputType =
+          dyn_cast<RankedTensorType>(op.getInputs().front().getType());
       if (!inputType || inputType.getRank() != 1)
         return failure();
 
@@ -282,10 +291,8 @@ struct ConvertLinalgGenericToBits
       auto extResultType = SliceType::get(ctx, outputBitWidth, vectorLen);
       auto rowNumToExt = rewriter.create<arith::ConstantIntOp>(
           loc, outputBitWidth - inputBitWidth, 64);
-      Value newResult = rewriter.create<ExtensionIOp>(loc,
-                                                      extResultType,
-                                                      inputSlice,
-                                                      rowNumToExt);
+      Value newResult = rewriter.create<ExtensionIOp>(loc, extResultType,
+                                                      inputSlice, rowNumToExt);
 
       sliceCache[op] = newResult;
       auto assembledType = inferTensorTypeFromBitsValue(newResult, ctx);
@@ -299,7 +306,8 @@ struct ConvertLinalgGenericToBits
     if (op.getInputs().size() != 2 || yieldedOp->getNumOperands() != 2)
       return failure();
 
-    auto inputType = dyn_cast<RankedTensorType>(op.getInputs().front().getType());
+    auto inputType =
+        dyn_cast<RankedTensorType>(op.getInputs().front().getType());
     if (!inputType || inputType.getRank() != 1)
       return failure();
     auto elemType = inputType.getElementType();
@@ -339,12 +347,11 @@ struct ConvertLinalgGenericToBits
     } else if (isa<arith::MulIOp>(yieldedOp)) {
       auto lhsSliceType = cast<SliceType>(lhsSlice.getType());
       auto rhsSliceType = cast<SliceType>(rhsSlice.getType());
-      auto mulResultSliceType =
-          SliceType::get(ctx,
-                         lhsSliceType.getBitWidth() + rhsSliceType.getBitWidth(),
-                         vectorLen);
-      newResult = rewriter.create<MulIOp>(loc, mulResultSliceType, lhsSlice,
-                                          rhsSlice);
+      auto mulResultSliceType = SliceType::get(
+          ctx, lhsSliceType.getBitWidth() + rhsSliceType.getBitWidth(),
+          vectorLen);
+      newResult =
+          rewriter.create<MulIOp>(loc, mulResultSliceType, lhsSlice, rhsSlice);
     } else if (isa<arith::MulFOp>(yieldedOp)) {
       newResult = rewriter.create<MulFOp>(loc, sliceType, lhsSlice, rhsSlice);
     } else if (isa<arith::AndIOp>(yieldedOp)) {
@@ -380,10 +387,9 @@ struct ConvertLinalgGenericToBits
 struct ConvertLinalgFillToBits : public OpConversionPattern<linalg::FillOp> {
   using OpConversionPattern<linalg::FillOp>::OpConversionPattern;
 
-  LogicalResult matchAndRewrite(
-      linalg::FillOp op,
-      linalg::FillOp::Adaptor,
-      ConversionPatternRewriter &rewriter) const override {
+  LogicalResult
+  matchAndRewrite(linalg::FillOp op, linalg::FillOp::Adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
     if (op.getOutputs().size() != 1)
       return failure();
     rewriter.replaceOp(op, op.getOutputs().front());
@@ -391,13 +397,13 @@ struct ConvertLinalgFillToBits : public OpConversionPattern<linalg::FillOp> {
   }
 };
 
-struct ConvertLinalgMatvecToBits : public OpConversionPattern<linalg::MatvecOp> {
+struct ConvertLinalgMatvecToBits
+    : public OpConversionPattern<linalg::MatvecOp> {
   using OpConversionPattern<linalg::MatvecOp>::OpConversionPattern;
 
-  LogicalResult matchAndRewrite(
-      linalg::MatvecOp op,
-      linalg::MatvecOp::Adaptor,
-      ConversionPatternRewriter &rewriter) const override {
+  LogicalResult
+  matchAndRewrite(linalg::MatvecOp op, linalg::MatvecOp::Adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
     if (op.getInputs().size() != 2 || op.getOutputs().size() != 1)
       return failure();
 
@@ -407,25 +413,31 @@ struct ConvertLinalgMatvecToBits : public OpConversionPattern<linalg::MatvecOp> 
     auto lhsType = dyn_cast<RankedTensorType>(lhsTensor.getType());
     auto rhsType = dyn_cast<RankedTensorType>(rhsTensor.getType());
     auto resultType = dyn_cast<RankedTensorType>(op.getResult(0).getType());
-    if (!lhsType || !rhsType || !resultType || lhsType.getRank() != 2 || rhsType.getRank() != 1 ||
-        resultType.getRank() != 1)
+    if (!lhsType || !rhsType || !resultType || lhsType.getRank() != 2 ||
+        rhsType.getRank() != 1 || resultType.getRank() != 1)
       return failure();
 
     auto lhsElem = dyn_cast<IntegerType>(lhsType.getElementType());
     if (!lhsElem)
       return failure();
 
-    Value lhsCube = createTransposeFromTensor(lhsTensor, rewriter, op.getLoc(), rewriter.getContext());
-    Value rhsSlice = createTransposeFromTensor(rhsTensor, rewriter, op.getLoc(), rewriter.getContext());
+    Value lhsCube = createTransposeFromTensor(lhsTensor, rewriter, op.getLoc(),
+                                              rewriter.getContext());
+    Value rhsSlice = createTransposeFromTensor(rhsTensor, rewriter, op.getLoc(),
+                                               rewriter.getContext());
     if (!lhsCube || !rhsSlice)
       return failure();
 
-    auto matvecResultType = SliceType::get(rewriter.getContext(), lhsElem.getWidth() * 2, lhsType.getShape()[0]);
-    Value matvec = rewriter.create<MatvecIOp>(op.getLoc(), matvecResultType, lhsCube, rhsSlice);
-    auto assembledType = inferTensorTypeFromBitsValue(matvec, rewriter.getContext());
+    auto matvecResultType = SliceType::get(
+        rewriter.getContext(), lhsElem.getWidth() * 4, lhsType.getShape()[0]);
+    Value matvec = rewriter.create<MatvecMulOp>(op.getLoc(), matvecResultType,
+                                                lhsCube, rhsSlice);
+    auto assembledType =
+        inferTensorTypeFromBitsValue(matvec, rewriter.getContext());
     if (!assembledType)
       return failure();
-    Value assembled = rewriter.create<AssembleOp>(op.getLoc(), assembledType, matvec);
+    Value assembled =
+        rewriter.create<AssembleOp>(op.getLoc(), assembledType, matvec);
     rewriter.replaceOp(op, assembled);
     eraseExtSIGenericIfDead(op.getInputs()[0], rewriter);
     eraseExtSIGenericIfDead(op.getInputs()[1], rewriter);
@@ -433,13 +445,13 @@ struct ConvertLinalgMatvecToBits : public OpConversionPattern<linalg::MatvecOp> 
   }
 };
 
-struct ConvertLinalgMatmulToBits : public OpConversionPattern<linalg::MatmulOp> {
+struct ConvertLinalgMatmulToBits
+    : public OpConversionPattern<linalg::MatmulOp> {
   using OpConversionPattern<linalg::MatmulOp>::OpConversionPattern;
 
-  LogicalResult matchAndRewrite(
-      linalg::MatmulOp op,
-      linalg::MatmulOp::Adaptor,
-      ConversionPatternRewriter &rewriter) const override {
+  LogicalResult
+  matchAndRewrite(linalg::MatmulOp op, linalg::MatmulOp::Adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
     if (op.getInputs().size() != 2 || op.getOutputs().size() != 1)
       return failure();
 
@@ -448,26 +460,32 @@ struct ConvertLinalgMatmulToBits : public OpConversionPattern<linalg::MatmulOp> 
     auto lhsType = dyn_cast<RankedTensorType>(lhsTensor.getType());
     auto rhsType = dyn_cast<RankedTensorType>(rhsTensor.getType());
     auto resultType = dyn_cast<RankedTensorType>(op.getResult(0).getType());
-    if (!lhsType || !rhsType || !resultType || lhsType.getRank() != 2 || rhsType.getRank() != 2 ||
-        resultType.getRank() != 2)
+    if (!lhsType || !rhsType || !resultType || lhsType.getRank() != 2 ||
+        rhsType.getRank() != 2 || resultType.getRank() != 2)
       return failure();
 
     auto lhsElem = dyn_cast<IntegerType>(lhsType.getElementType());
     if (!lhsElem)
       return failure();
 
-    Value lhsCube = createTransposeFromTensor(lhsTensor, rewriter, op.getLoc(), rewriter.getContext());
-    Value rhsCube = createTransposeFromTensor(rhsTensor, rewriter, op.getLoc(), rewriter.getContext());
+    Value lhsCube = createTransposeFromTensor(lhsTensor, rewriter, op.getLoc(),
+                                              rewriter.getContext());
+    Value rhsCube = createTransposeFromTensor(rhsTensor, rewriter, op.getLoc(),
+                                              rewriter.getContext());
     if (!lhsCube || !rhsCube)
       return failure();
 
-    auto matmulResultType = CubeType::get(
-        rewriter.getContext(), lhsElem.getWidth() * 2, lhsType.getShape()[0], rhsType.getShape()[1]);
-    Value matmul = rewriter.create<MatmulIOp>(op.getLoc(), matmulResultType, lhsCube, rhsCube);
-    auto assembledType = inferTensorTypeFromBitsValue(matmul, rewriter.getContext());
+    auto matmulResultType =
+        CubeType::get(rewriter.getContext(), lhsElem.getWidth() * 4,
+                      lhsType.getShape()[0], rhsType.getShape()[1]);
+    Value matmul = rewriter.create<MatMulOp>(op.getLoc(), matmulResultType,
+                                             lhsCube, rhsCube);
+    auto assembledType =
+        inferTensorTypeFromBitsValue(matmul, rewriter.getContext());
     if (!assembledType)
       return failure();
-    Value assembled = rewriter.create<AssembleOp>(op.getLoc(), assembledType, matmul);
+    Value assembled =
+        rewriter.create<AssembleOp>(op.getLoc(), assembledType, matmul);
 
     auto canBypassTruncUsers = [&]() {
       if (assembledType == resultType)
@@ -515,10 +533,9 @@ struct ConvertLinalgGenericTruncToBits
     : public OpConversionPattern<linalg::GenericOp> {
   using OpConversionPattern<linalg::GenericOp>::OpConversionPattern;
 
-  LogicalResult matchAndRewrite(
-      linalg::GenericOp op,
-      linalg::GenericOp::Adaptor,
-      ConversionPatternRewriter &rewriter) const override {
+  LogicalResult
+  matchAndRewrite(linalg::GenericOp op, linalg::GenericOp::Adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
     if (op.getInputs().size() != 1 || op.getOutputs().size() != 1)
       return failure();
 
@@ -526,27 +543,32 @@ struct ConvertLinalgGenericTruncToBits
     if (!outputType || (outputType.getRank() != 1 && outputType.getRank() != 2))
       return failure();
 
-    auto yield = dyn_cast<linalg::YieldOp>(op.getRegion().front().getTerminator());
+    auto yield =
+        dyn_cast<linalg::YieldOp>(op.getRegion().front().getTerminator());
     if (!yield || yield.getValues().size() != 1)
       return failure();
 
-    auto trunc = dyn_cast_or_null<arith::TruncIOp>(yield.getValues().front().getDefiningOp());
+    auto trunc = dyn_cast_or_null<arith::TruncIOp>(
+        yield.getValues().front().getDefiningOp());
     if (!trunc)
       return failure();
 
     auto arg = dyn_cast<BlockArgument>(trunc.getIn());
-    if (!arg || arg.getOwner() != &op.getRegion().front() || arg.getArgNumber() != 0)
+    if (!arg || arg.getOwner() != &op.getRegion().front() ||
+        arg.getArgNumber() != 0)
       return failure();
 
-    auto inputAssemble = dyn_cast_or_null<bits::AssembleOp>(op.getInputs()[0].getDefiningOp());
+    auto inputAssemble =
+        dyn_cast_or_null<bits::AssembleOp>(op.getInputs()[0].getDefiningOp());
     if (!inputAssemble)
       return failure();
 
-    auto assembledType =
-        inferTensorTypeFromBitsValue(inputAssemble.getInput(), rewriter.getContext());
+    auto assembledType = inferTensorTypeFromBitsValue(inputAssemble.getInput(),
+                                                      rewriter.getContext());
     if (!assembledType)
       return failure();
-    Value result = rewriter.create<AssembleOp>(op.getLoc(), assembledType, inputAssemble.getInput());
+    Value result = rewriter.create<AssembleOp>(op.getLoc(), assembledType,
+                                               inputAssemble.getInput());
     rewriter.replaceOp(op, result);
     return success();
   }
@@ -555,10 +577,9 @@ struct ConvertLinalgGenericTruncToBits
 struct EraseDeadLinalgGeneric : public OpConversionPattern<linalg::GenericOp> {
   using OpConversionPattern<linalg::GenericOp>::OpConversionPattern;
 
-  LogicalResult matchAndRewrite(
-      linalg::GenericOp op,
-      linalg::GenericOp::Adaptor,
-      ConversionPatternRewriter &rewriter) const override {
+  LogicalResult
+  matchAndRewrite(linalg::GenericOp op, linalg::GenericOp::Adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
     if (!op->use_empty())
       return failure();
     rewriter.eraseOp(op);
@@ -577,16 +598,15 @@ struct ConvertLinalgToBits
     patterns.add<ConvertLinalgMatmulToBits, ConvertLinalgMatvecToBits,
                  ConvertLinalgFillToBits, ConvertLinalgGenericTruncToBits,
                  ConvertLinalgGenericToBits, EraseDeadLinalgGeneric>(&ctx);
-    
+
     ConversionTarget target(ctx);
     target.markUnknownOpDynamicallyLegal([](...) { return true; });
     target.addLegalDialect<BitsDialect>();
     target.addDynamicallyLegalOp<linalg::GenericOp>([](linalg::GenericOp op) {
       return isExtSIGeneric(op) || isTruncIGeneric(op);
     });
-    target.addDynamicallyLegalOp<linalg::YieldOp>([](linalg::YieldOp) {
-      return true;
-    });
+    target.addDynamicallyLegalOp<linalg::YieldOp>(
+        [](linalg::YieldOp) { return true; });
     // target.addIllegalOp<linalg::GenericOp>();
     target.addIllegalDialect<linalg::LinalgDialect>();
 
@@ -611,12 +631,13 @@ struct ConvertLinalgToBits
 
     OpBuilder builder(func.getContext());
     for (linalg::GenericOp genericOp : truncGenerics) {
-      auto inputAssemble =
-          dyn_cast_or_null<bits::AssembleOp>(genericOp.getInputs()[0].getDefiningOp());
+      auto inputAssemble = dyn_cast_or_null<bits::AssembleOp>(
+          genericOp.getInputs()[0].getDefiningOp());
       if (!inputAssemble)
         continue;
 
-      auto outputType = inferTensorTypeFromBitsValue(inputAssemble.getInput(), func.getContext());
+      auto outputType = inferTensorTypeFromBitsValue(inputAssemble.getInput(),
+                                                     func.getContext());
       if (!outputType)
         continue;
 
@@ -667,7 +688,7 @@ struct ConvertLinalgToBits
       }
     });
 
-    for (Operation* op : toErase)
+    for (Operation *op : toErase)
       op->erase();
   }
 
