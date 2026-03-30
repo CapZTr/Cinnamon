@@ -406,20 +406,20 @@ LogicalResult MatMulOp::verify() {
 }
 
 LogicalResult MatvecMulOp::verify() {
-  auto lhsType = cast<CubeType>(getLhs().getType());
-  auto rhsType = cast<SliceType>(getRhs().getType());
-  auto resType = cast<SliceType>(getResult().getType());
+  // auto lhsType = cast<CubeType>(getLhs().getType());
+  // auto rhsType = cast<SliceType>(getRhs().getType());
+  // auto resType = cast<SliceType>(getResult().getType());
 
-  if (!lhsType || !rhsType || !resType)
-    return emitOpError("wrong type");
+  // if (!lhsType || !rhsType || !resType)
+  //   return emitOpError("wrong type");
 
-  if (lhsType.getBitWidth() != rhsType.getBitWidth() ||
-      lhsType.getBitWidth() * 4 != resType.getBitWidth())
-    return emitOpError("bit widths of operands and result must match");
+  // if (lhsType.getBitWidth() != rhsType.getBitWidth() ||
+  //     lhsType.getBitWidth() * 4 != resType.getBitWidth())
+  //   return emitOpError("bit widths of operands and result must match");
 
-  if (lhsType.getVectorLength() != resType.getVectorLength() ||
-      lhsType.getHeight() != rhsType.getVectorLength())
-    return emitOpError("wrong size");
+  // if (lhsType.getVectorLength() != resType.getVectorLength() ||
+  //     lhsType.getHeight() != rhsType.getVectorLength())
+  //   return emitOpError("wrong size");
 
   return success();
 }

@@ -417,8 +417,8 @@ struct ConvertLinalgMatvecToBits
         rhsType.getRank() != 1 || resultType.getRank() != 1)
       return failure();
 
-    auto lhsElem = dyn_cast<IntegerType>(lhsType.getElementType());
-    if (!lhsElem)
+    auto resultElem = dyn_cast<IntegerType>(resultType.getElementType());
+    if (!resultElem)
       return failure();
 
     Value lhsCube = createTransposeFromTensor(lhsTensor, rewriter, op.getLoc(),
@@ -429,7 +429,7 @@ struct ConvertLinalgMatvecToBits
       return failure();
 
     auto matvecResultType = SliceType::get(
-        rewriter.getContext(), lhsElem.getWidth() * 4, lhsType.getShape()[0]);
+        rewriter.getContext(), resultElem.getWidth(), lhsType.getShape()[0]);
     Value matvec = rewriter.create<MatvecMulOp>(op.getLoc(), matvecResultType,
                                                 lhsCube, rhsSlice);
     auto assembledType =
