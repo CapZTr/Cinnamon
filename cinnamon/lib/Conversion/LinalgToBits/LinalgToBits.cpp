@@ -12,6 +12,7 @@
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/Linalg/IR/Linalg.h>
+#include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
@@ -161,6 +162,27 @@ static RankedTensorType inferTensorTypeFromBitsValue(Value bitsValue,
   }
 
   return {};
+}
+
+static Value getOrCreateIndexConstant(ConversionPatternRewriter &rewriter,
+                                      Location loc, int64_t value) {
+  auto parentFunc = rewriter.getInsertionBlock()
+                        ->getParentOp()
+                        ->getParentOfType<func::FuncOp>();
+  if (parentFunc) {
+    Block &entry = parentFunc.front();
+    for (Operation &entryOp : entry) {
+      auto cst = dyn_cast<arith::ConstantIndexOp>(entryOp);
+      if (cst && cst.value() == value)
+        return cst.getResult();
+    }
+
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(&entry);
+    return rewriter.create<arith::ConstantIndexOp>(loc, value);
+  }
+
+  return rewriter.create<arith::ConstantIndexOp>(loc, value);
 }
 
 struct ConvertLinalgGenericToBits
@@ -418,26 +440,82 @@ struct ConvertLinalgMatvecToBits
       return failure();
 
     auto resultElem = dyn_cast<IntegerType>(resultType.getElementType());
-    if (!resultElem)
+    auto lhsElem = dyn_cast<IntegerType>(lhsType.getElementType());
+    auto rhsElem = dyn_cast<IntegerType>(rhsType.getElementType());
+    if (!resultElem || !lhsElem || !rhsElem)
       return failure();
 
-    Value lhsCube = createTransposeFromTensor(lhsTensor, rewriter, op.getLoc(),
-                                              rewriter.getContext());
-    Value rhsSlice = createTransposeFromTensor(rhsTensor, rewriter, op.getLoc(),
-                                               rewriter.getContext());
-    if (!lhsCube || !rhsSlice)
+    const int64_t m = lhsType.getShape()[0];
+    const int64_t k = lhsType.getShape()[1];
+    if (rhsType.getShape()[0] != k || resultType.getShape()[0] != m)
       return failure();
 
-    auto matvecResultType = SliceType::get(
-        rewriter.getContext(), resultElem.getWidth(), lhsType.getShape()[0]);
-    Value matvec = rewriter.create<MatvecMulOp>(op.getLoc(), matvecResultType,
-                                                lhsCube, rhsSlice);
-    auto assembledType =
-        inferTensorTypeFromBitsValue(matvec, rewriter.getContext());
-    if (!assembledType)
+    const int64_t lhsBitWidth = lhsElem.getWidth();
+    const int64_t rhsBitWidth = rhsElem.getWidth();
+    const int64_t resultBitWidth = resultElem.getWidth();
+    if (lhsBitWidth + rhsBitWidth != resultBitWidth)
+      return failure();
+
+    Location loc = op.getLoc();
+    MLIRContext *ctx = rewriter.getContext();
+
+    auto emptyBroadcast = rewriter.create<tensor::EmptyOp>(
+        loc, ArrayRef<int64_t>{m, k}, rhsType.getElementType());
+    auto rhsBroadcastOp = rewriter.create<linalg::BroadcastOp>(
+        loc, rhsTensor, emptyBroadcast.getResult(),
+        rewriter.getDenseI64ArrayAttr({0}));
+    Value rhsBroadcast = rhsBroadcastOp->getResult(0);
+
+    auto resultSliceType = SliceType::get(ctx, resultBitWidth, m);
+    auto lhsRowSliceType = RankedTensorType::get({m}, lhsType.getElementType());
+    auto rhsRowSliceType = RankedTensorType::get({m}, rhsType.getElementType());
+    auto lhsBitsSliceType = SliceType::get(ctx, lhsBitWidth, m);
+    auto rhsBitsSliceType = SliceType::get(ctx, rhsBitWidth, m);
+
+    Value resultBitWidthConst = rewriter.create<arith::ConstantIntOp>(
+        loc, resultBitWidth, 64);
+    Value mConst = rewriter.create<arith::ConstantIntOp>(loc, m, 64);
+    Value initAcc = rewriter.create<CreateSliceOp>(loc, resultSliceType,
+                                                   resultBitWidthConst, mConst);
+
+    Value lb = getOrCreateIndexConstant(rewriter, loc, 0);
+    Value ub = getOrCreateIndexConstant(rewriter, loc, k);
+    Value step = getOrCreateIndexConstant(rewriter, loc, 1);
+    auto forOp = rewriter.create<scf::ForOp>(loc, lb, ub, step, initAcc);
+
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(forOp.getBody());
+
+      Value iv = forOp.getInductionVar();
+      SmallVector<OpFoldResult> offsets{rewriter.getIndexAttr(0), iv};
+      SmallVector<OpFoldResult> sizes{rewriter.getIndexAttr(m),
+                                      rewriter.getIndexAttr(1)};
+      SmallVector<OpFoldResult> strides{rewriter.getIndexAttr(1),
+                                        rewriter.getIndexAttr(1)};
+
+      Value lhsColumn = rewriter.create<tensor::ExtractSliceOp>(
+          loc, lhsRowSliceType, lhsTensor, offsets, sizes, strides);
+      Value rhsColumn = rewriter.create<tensor::ExtractSliceOp>(
+          loc, rhsRowSliceType, rhsBroadcast, offsets, sizes, strides);
+
+      Value lhsSlice =
+          rewriter.create<TransposeOp>(loc, lhsBitsSliceType, lhsColumn);
+      Value rhsSlice =
+          rewriter.create<TransposeOp>(loc, rhsBitsSliceType, rhsColumn);
+      Value mulResult =
+          rewriter.create<MulIOp>(loc, resultSliceType, lhsSlice, rhsSlice);
+      Value acc = forOp.getRegionIterArgs().front();
+      Value nextAcc =
+          rewriter.create<AddIOp>(loc, resultSliceType, acc, mulResult);
+      rewriter.create<scf::YieldOp>(loc, nextAcc);
+    }
+
+    auto assembledType = inferTensorTypeFromBitsValue(forOp.getResult(0), ctx);
+    if (!assembledType || assembledType != resultType)
       return failure();
     Value assembled =
-        rewriter.create<AssembleOp>(op.getLoc(), assembledType, matvec);
+        rewriter.create<AssembleOp>(loc, assembledType, forOp.getResult(0));
     rewriter.replaceOp(op, assembled);
     eraseExtSIGenericIfDead(op.getInputs()[0], rewriter);
     eraseExtSIGenericIfDead(op.getInputs()[1], rewriter);
@@ -465,63 +543,63 @@ struct ConvertLinalgMatmulToBits
       return failure();
 
     auto lhsElem = dyn_cast<IntegerType>(lhsType.getElementType());
-    if (!lhsElem)
+    auto rhsElem = dyn_cast<IntegerType>(rhsType.getElementType());
+    auto resultElem = dyn_cast<IntegerType>(resultType.getElementType());
+    if (!lhsElem || !rhsElem || !resultElem)
       return failure();
 
-    Value lhsCube = createTransposeFromTensor(lhsTensor, rewriter, op.getLoc(),
-                                              rewriter.getContext());
-    Value rhsCube = createTransposeFromTensor(rhsTensor, rewriter, op.getLoc(),
-                                              rewriter.getContext());
-    if (!lhsCube || !rhsCube)
+    const int64_t m = lhsType.getShape()[0];
+    const int64_t k = lhsType.getShape()[1];
+    const int64_t n = rhsType.getShape()[1];
+    if (rhsType.getShape()[0] != k || resultType.getShape()[0] != m ||
+        resultType.getShape()[1] != n)
       return failure();
 
-    auto matmulResultType =
-        CubeType::get(rewriter.getContext(), lhsElem.getWidth() * 4,
-                      lhsType.getShape()[0], rhsType.getShape()[1]);
-    Value matmul = rewriter.create<MatMulOp>(op.getLoc(), matmulResultType,
-                                             lhsCube, rhsCube);
-    auto assembledType =
-        inferTensorTypeFromBitsValue(matmul, rewriter.getContext());
-    if (!assembledType)
-      return failure();
-    Value assembled =
-        rewriter.create<AssembleOp>(op.getLoc(), assembledType, matmul);
-
-    auto canBypassTruncUsers = [&]() {
-      if (assembledType == resultType)
-        return true;
-      if (op->use_empty())
-        return true;
-
-      for (Operation *user : op->getUsers()) {
-        auto genericUser = dyn_cast<linalg::GenericOp>(user);
-        if (!genericUser || !isTruncIGeneric(genericUser))
-          return false;
-        auto genericResultType =
-            dyn_cast<RankedTensorType>(genericUser.getResult(0).getType());
-        if (!genericResultType || genericResultType != assembledType)
-          return false;
-      }
-      return true;
-    };
-
-    if (!canBypassTruncUsers())
+    if (lhsElem.getWidth() + rhsElem.getWidth() != resultElem.getWidth())
       return failure();
 
-    if (assembledType == resultType) {
-      rewriter.replaceOp(op, assembled);
-    } else {
-      SmallVector<Operation *, 4> truncUsers;
-      for (Operation *user : op->getUsers())
-        truncUsers.push_back(user);
+    Location loc = op.getLoc();
+    MLIRContext *ctx = rewriter.getContext();
+    auto colSliceType = SliceType::get(ctx, resultElem.getWidth(), m);
+    auto rhsColumnType = RankedTensorType::get({k}, rhsType.getElementType());
 
-      for (Operation *user : truncUsers) {
-        auto genericUser = cast<linalg::GenericOp>(user);
-        genericUser.getResult(0).replaceAllUsesWith(assembled);
-        rewriter.eraseOp(genericUser);
-      }
-      rewriter.eraseOp(op);
+    Value colsTensor = rewriter.create<tensor::EmptyOp>(
+        loc, ArrayRef<int64_t>{n}, colSliceType);
+
+    Value lb = getOrCreateIndexConstant(rewriter, loc, 0);
+    Value ub = getOrCreateIndexConstant(rewriter, loc, n);
+    Value step = getOrCreateIndexConstant(rewriter, loc, 1);
+    auto forOp = rewriter.create<scf::ForOp>(loc, lb, ub, step, colsTensor);
+
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(forOp.getBody());
+
+      Value iv = forOp.getInductionVar();
+      SmallVector<OpFoldResult> offsets{rewriter.getIndexAttr(0), iv};
+      SmallVector<OpFoldResult> sizes{rewriter.getIndexAttr(k),
+                                      rewriter.getIndexAttr(1)};
+      SmallVector<OpFoldResult> strides{rewriter.getIndexAttr(1),
+                                        rewriter.getIndexAttr(1)};
+      Value rhsColumn = rewriter.create<tensor::ExtractSliceOp>(
+          loc, rhsColumnType, rhsTensor, offsets, sizes, strides);
+
+      Value initVec = rewriter.create<tensor::EmptyOp>(
+          loc, ArrayRef<int64_t>{m}, resultType.getElementType());
+      auto matvec = rewriter.create<linalg::MatvecOp>(
+          loc, ValueRange{lhsTensor, rhsColumn}, ValueRange{initVec});
+      Value matvecSlice =
+          rewriter.create<TransposeOp>(loc, colSliceType, matvec->getResult(0));
+      Value accTensor = forOp.getRegionIterArgs().front();
+      Value updatedTensor =
+          rewriter.create<tensor::InsertOp>(loc, matvecSlice, accTensor,
+                                            ValueRange{iv});
+      rewriter.create<scf::YieldOp>(loc, updatedTensor);
     }
+
+    Value assembled =
+        rewriter.create<AssembleOp>(loc, resultType, forOp.getResult(0));
+    rewriter.replaceOp(op, assembled);
 
     eraseExtSIGenericIfDead(op.getInputs()[0], rewriter);
     eraseExtSIGenericIfDead(op.getInputs()[1], rewriter);
@@ -602,6 +680,7 @@ struct ConvertLinalgToBits
     ConversionTarget target(ctx);
     target.markUnknownOpDynamicallyLegal([](...) { return true; });
     target.addLegalDialect<BitsDialect>();
+    target.addLegalOp<linalg::BroadcastOp>();
     target.addDynamicallyLegalOp<linalg::GenericOp>([](linalg::GenericOp op) {
       return isExtSIGeneric(op) || isTruncIGeneric(op);
     });
@@ -673,6 +752,36 @@ struct ConvertLinalgToBits
   }
 
   static void removeUnnecessaryAssembles(func::FuncOp func) {
+    bool changed = true;
+    while (changed) {
+      changed = false;
+
+      SmallVector<bits::TransposeOp, 8> transposesToErase;
+      SmallVector<bits::AssembleOp, 8> assemblesToErase;
+
+      func.walk([&](bits::TransposeOp transposeOp) {
+        auto assembleOp =
+            dyn_cast_or_null<bits::AssembleOp>(transposeOp.getInput().getDefiningOp());
+        if (!assembleOp)
+          return;
+
+        if (transposeOp.getResult().getType() != assembleOp.getInput().getType())
+          return;
+
+        transposeOp.getResult().replaceAllUsesWith(assembleOp.getInput());
+        transposesToErase.push_back(transposeOp);
+        if (assembleOp.getResult().use_empty())
+          assemblesToErase.push_back(assembleOp);
+        changed = true;
+      });
+
+      for (bits::TransposeOp transposeOp : transposesToErase)
+        transposeOp.erase();
+      for (bits::AssembleOp assembleOp : assemblesToErase)
+        if (assembleOp->use_empty())
+          assembleOp.erase();
+    }
+
     llvm::SmallPtrSet<Value, 8> returnedValues;
     func.walk([&](func::ReturnOp returnOp) {
       for (Value operand : returnOp.getOperands())

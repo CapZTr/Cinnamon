@@ -81,16 +81,32 @@ LogicalResult AssembleOp::verify() {
     return emitOpError("output must be a 1D/2D ranked tensor");
 
   int64_t inputBitWidth = 0;
+  int64_t inputVectorLength = -1;
+  int64_t inputHeight = -1;
   if (outputType.getRank() == 1) {
     auto inputType = cast<SliceType>(getInput().getType());
     if (!inputType)
       return emitOpError("input must be of SliceType if output is 1D tensor");
     inputBitWidth = inputType.getBitWidth();
+    inputVectorLength = inputType.getVectorLength();
   } else {
-    auto inputType = cast<CubeType>(getInput().getType());
-    if (!inputType)
-      return emitOpError("input must be of CubeType if output is 2D tensor");
-    inputBitWidth = inputType.getBitWidth();
+    if (auto inputCubeType = dyn_cast<CubeType>(getInput().getType())) {
+      inputBitWidth = inputCubeType.getBitWidth();
+      inputVectorLength = inputCubeType.getVectorLength();
+      inputHeight = inputCubeType.getHeight();
+    } else if (auto inputTensorType =
+                   dyn_cast<RankedTensorType>(getInput().getType())) {
+      if (inputTensorType.getRank() != 1)
+        return emitOpError("input tensor must be rank-1 when output is 2D");
+      auto elemSliceType = dyn_cast<SliceType>(inputTensorType.getElementType());
+      if (!elemSliceType)
+        return emitOpError("input tensor element type must be !bits.slice");
+      inputBitWidth = elemSliceType.getBitWidth();
+      inputVectorLength = elemSliceType.getVectorLength();
+      inputHeight = inputTensorType.getShape()[0];
+    } else {
+      return emitOpError("input must be CubeType or tensor<?x!bits.slice> if output is 2D tensor");
+    }
   }
 
   Type elemType = outputType.getElementType();
@@ -108,6 +124,16 @@ LogicalResult AssembleOp::verify() {
   if (inputBitWidth != bitWidth)
     return emitOpError(
         "bit width mismatch between input slice and output tensor element");
+
+  if (outputType.getRank() == 1) {
+    if (inputVectorLength != outputType.getShape()[0])
+      return emitOpError("input vector length must match output dim 0");
+  } else {
+    if (inputVectorLength != outputType.getShape()[0])
+      return emitOpError("input vector length must match output dim 0");
+    if (inputHeight != outputType.getShape()[1])
+      return emitOpError("input height must match output dim 1");
+  }
 
   return success();
 }

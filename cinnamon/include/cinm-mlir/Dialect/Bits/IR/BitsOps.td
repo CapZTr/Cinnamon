@@ -31,7 +31,7 @@ def AssembleOp : Bits_Op<"assemble", [Pure]> {
   let summary = "Assemble a bit-slice to 1-D tensor, or a bit-cube to 2-D tensor";
   let description = [{}];
 
-  let arguments = (ins AnyTypeOf<[SliceType, CubeType]>:$input);
+  let arguments = (ins AnyTypeOf<[SliceType, CubeType, TensorOf<[SliceType]>]>:$input);
   let results = (outs TensorOf<[AnyInteger, AnyFloat]>:$output);
 
   let assemblyFormat = "$input attr-dict `:` qualified(type($input)) `->` "
