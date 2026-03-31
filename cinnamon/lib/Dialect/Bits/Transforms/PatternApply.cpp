@@ -309,12 +309,123 @@ struct MulIPattern : public OpRewritePattern<MulIOp> {
   }
 };
 
+struct MulIReadablePattern : public OpRewritePattern<MulIOp> {
+  using OpRewritePattern<MulIOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(MulIOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto *ctx = rewriter.getContext();
+    Value mdSlice = op.getLhs();
+    Value mrSlice = op.getRhs();
+
+    auto mdSliceType = dyn_cast<SliceType>(mdSlice.getType());
+    auto mrSliceType = dyn_cast<SliceType>(mrSlice.getType());
+    auto resSliceType = dyn_cast<SliceType>(op.getResult().getType());
+    if (!mdSliceType || !mrSliceType || !resSliceType)
+      return failure();
+
+    auto vecLen = mdSliceType.getVectorLength();
+    auto mdBitwidth = mdSliceType.getBitWidth();
+    auto mrBitwidth = mrSliceType.getBitWidth();
+    auto resBitwidth = resSliceType.getBitWidth();
+
+    auto rowType = BitRowType::get(ctx, vecLen);
+    Value vecLenVal = rewriter.create<arith::ConstantIntOp>(loc, vecLen, 64);
+    Value resBitwidthVal =
+        rewriter.create<arith::ConstantIntOp>(loc, resBitwidth, 64);
+    Value zeroRow =
+        rewriter.create<CreateAllZeroRowOp>(loc, rowType, vecLenVal);
+    Value initRes = rewriter.create<CreateSliceOp>(loc, resSliceType,
+                                                   resBitwidthVal, vecLenVal);
+
+    Value c0Index = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value c1Index = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value mdBitwidthIndex =
+        rewriter.create<arith::ConstantIndexOp>(loc, mdBitwidth);
+    Value mrBitwidthIndex =
+        rewriter.create<arith::ConstantIndexOp>(loc, mrBitwidth);
+    Value resBitwidthIndex =
+        rewriter.create<arith::ConstantIndexOp>(loc, resBitwidth);
+
+    auto outerLoop = rewriter.create<scf::ForOp>(
+        loc, c0Index, mrBitwidthIndex, c1Index, ValueRange{initRes},
+        [&](OpBuilder &builder, Location bodyLoc, Value mrIdx,
+            ValueRange outerIterArgs) {
+          Value curRes = outerIterArgs[0];
+          Value mrIdxI64 = builder.create<arith::IndexCastOp>(
+              bodyLoc, builder.getI64Type(), mrIdx);
+          Value mrRow =
+              builder.create<ExtractRowOp>(bodyLoc, rowType, mrSlice, mrIdxI64);
+
+          auto mulAccLoop = builder.create<scf::ForOp>(
+              bodyLoc, c0Index, mdBitwidthIndex, c1Index,
+              ValueRange{curRes, zeroRow},
+              [&](OpBuilder &innerBuilder, Location innerBodyLoc, Value mdIdx,
+                  ValueRange mulAccIterArgs) {
+                Value mulAccRes = mulAccIterArgs[0];
+                Value carry = mulAccIterArgs[1];
+                Value mdIdxI64 = innerBuilder.create<arith::IndexCastOp>(
+                    innerBodyLoc, innerBuilder.getI64Type(), mdIdx);
+                Value resIdxI64 = innerBuilder.create<arith::AddIOp>(
+                    innerBodyLoc, mdIdxI64, mrIdxI64);
+
+                Value mdRow = innerBuilder.create<ExtractRowOp>(
+                    innerBodyLoc, rowType, mdSlice, mdIdxI64);
+                Value andRow = innerBuilder.create<RowAndOp>(
+                    innerBodyLoc, rowType, mdRow, mrRow);
+                Value resRow = innerBuilder.create<ExtractRowOp>(
+                    innerBodyLoc, rowType, mulAccRes, resIdxI64);
+                auto rowAdd = innerBuilder.create<RowAddOp>(
+                    innerBodyLoc, rowType, rowType, andRow, resRow, carry);
+                Value updatedRes = innerBuilder.create<InsertRowOp>(
+                    innerBodyLoc, resSliceType, mulAccRes, rowAdd.getSum(),
+                    resIdxI64);
+                innerBuilder.create<scf::YieldOp>(
+                    innerBodyLoc, ValueRange{updatedRes, rowAdd.getCout()});
+              });
+
+          Value carryStartIndex =
+              builder.create<arith::AddIOp>(bodyLoc, mrIdx, mdBitwidthIndex);
+          auto carryPropLoop = builder.create<scf::ForOp>(
+              bodyLoc, carryStartIndex, resBitwidthIndex, c1Index,
+              ValueRange{mulAccLoop.getResult(0), mulAccLoop.getResult(1)},
+              [&](OpBuilder &carryBuilder, Location carryBodyLoc, Value resIdx,
+                  ValueRange carryIterArgs) {
+                Value carryRes = carryIterArgs[0];
+                Value carry = carryIterArgs[1];
+                Value resIdxI64 = carryBuilder.create<arith::IndexCastOp>(
+                    carryBodyLoc, carryBuilder.getI64Type(), resIdx);
+                Value resRow = carryBuilder.create<ExtractRowOp>(
+                    carryBodyLoc, rowType, carryRes, resIdxI64);
+                auto rowAdd = carryBuilder.create<RowAddOp>(
+                    carryBodyLoc, rowType, rowType, zeroRow, resRow, carry);
+                Value updatedRes = carryBuilder.create<InsertRowOp>(
+                    carryBodyLoc, resSliceType, carryRes, rowAdd.getSum(),
+                    resIdxI64);
+                carryBuilder.create<scf::YieldOp>(
+                    carryBodyLoc, ValueRange{updatedRes, rowAdd.getCout()});
+              });
+
+          builder.create<scf::YieldOp>(bodyLoc, carryPropLoop.getResult(0));
+        });
+
+    rewriter.replaceOp(op, outerLoop.getResult(0));
+    return success();
+  }
+};
+
 struct BitsPatternApplyPass
     : public impl::BitsPatternApplyPassBase<BitsPatternApplyPass> {
   void runOnOperation() final {
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
-    patterns.add<AddIPattern, MulIPattern>(ctx);
+    constexpr bool useReadableMulIPattern = true;
+    if (useReadableMulIPattern) {
+      patterns.add<AddIPattern, MulIReadablePattern>(ctx);
+    } else {
+      patterns.add<AddIPattern, MulIPattern>(ctx);
+    }
     if (failed(applyPatternsAndFoldGreedily(getOperation(),
                                             std::move(patterns)))) {
       signalPassFailure();
