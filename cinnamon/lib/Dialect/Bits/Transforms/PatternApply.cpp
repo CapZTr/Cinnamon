@@ -24,6 +24,63 @@ namespace mlir::bits {
 
 //===----------------------------------------------------------------------===//
 
+template <typename SliceOp, typename RowOp>
+struct RowWiseLogicPattern : public OpRewritePattern<SliceOp> {
+  using OpRewritePattern<SliceOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(SliceOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto *ctx = rewriter.getContext();
+    Value lhsSlice = op.getLhs();
+    Value rhsSlice = op.getRhs();
+
+    auto lhsSliceType = dyn_cast<SliceType>(lhsSlice.getType());
+    auto rhsSliceType = dyn_cast<SliceType>(rhsSlice.getType());
+    auto resSliceType = dyn_cast<SliceType>(op.getResult().getType());
+    if (!lhsSliceType || !rhsSliceType || !resSliceType)
+      return failure();
+
+    Value c0Index = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value c1Index = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value bitwidthIndex =
+        rewriter.create<arith::ConstantIndexOp>(loc, resSliceType.getBitWidth());
+
+    Value bitwidthVal =
+        rewriter.create<arith::ConstantIntOp>(loc, resSliceType.getBitWidth(), 64);
+    Value vecLenVal =
+        rewriter.create<arith::ConstantIntOp>(loc, resSliceType.getVectorLength(), 64);
+
+    auto rowType = BitRowType::get(ctx, resSliceType.getVectorLength());
+    Value initResSlice = rewriter.create<CreateSliceOp>(
+        loc, resSliceType, bitwidthVal, vecLenVal);
+
+    auto loop = rewriter.create<scf::ForOp>(
+        loc, c0Index, bitwidthIndex, c1Index, ValueRange{initResSlice},
+        [&](OpBuilder &builder, Location bodyLoc, Value iv,
+            ValueRange iterArgs) {
+          Value curResSlice = iterArgs[0];
+          Value ivI64 = builder.create<arith::IndexCastOp>(
+              bodyLoc, builder.getI64Type(), iv);
+
+          Value lhsRow =
+              builder.create<ExtractRowOp>(bodyLoc, rowType, lhsSlice, ivI64);
+          Value rhsRow =
+              builder.create<ExtractRowOp>(bodyLoc, rowType, rhsSlice, ivI64);
+          Value logicRow =
+              builder.create<RowOp>(bodyLoc, rowType, lhsRow, rhsRow);
+
+          Value updatedResSlice = builder.create<InsertRowOp>(
+              bodyLoc, resSliceType, curResSlice, logicRow, ivI64);
+
+          builder.create<scf::YieldOp>(bodyLoc, updatedResSlice);
+        });
+
+    rewriter.replaceOp(op, loop.getResult(0));
+    return success();
+  }
+};
+
 struct AddIPattern : public OpRewritePattern<AddIOp> {
   using OpRewritePattern<AddIOp>::OpRewritePattern;
 
@@ -422,9 +479,15 @@ struct BitsPatternApplyPass
     RewritePatternSet patterns(ctx);
     constexpr bool useReadableMulIPattern = true;
     if (useReadableMulIPattern) {
-      patterns.add<AddIPattern, MulIReadablePattern>(ctx);
+      patterns
+          .add<AddIPattern, MulIReadablePattern, RowWiseLogicPattern<AndOp, RowAndOp>,
+               RowWiseLogicPattern<OrOp, RowOrOp>,
+               RowWiseLogicPattern<XOrOp, RowXOrOp>>(ctx);
     } else {
-      patterns.add<AddIPattern, MulIPattern>(ctx);
+      patterns.add<AddIPattern, MulIPattern,
+                   RowWiseLogicPattern<AndOp, RowAndOp>,
+                   RowWiseLogicPattern<OrOp, RowOrOp>,
+                   RowWiseLogicPattern<XOrOp, RowXOrOp>>(ctx);
     }
     if (failed(applyPatternsAndFoldGreedily(getOperation(),
                                             std::move(patterns)))) {

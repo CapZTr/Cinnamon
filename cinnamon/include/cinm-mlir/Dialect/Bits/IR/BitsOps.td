@@ -304,6 +304,20 @@ def OrOp : Bits_Op<"or", [Pure]> {
   let hasVerifier = 1;
 }
 
+def RowOrOp : Bits_Op<"row_or", [Pure]> {
+  let arguments = (ins
+    BitRowType:$lhs,
+    BitRowType:$rhs
+  );
+  let results = (outs
+    BitRowType:$result
+  );
+
+  let assemblyFormat = "$lhs `,` $rhs `,` attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) `,` "
+      "`->` qualified(type($result))";
+}
+
 def XOrOp : Bits_Op<"xor", [Pure]> {
   let summary = "Bit-serial XOR of two slice operands";
   let description = [{}];
@@ -320,6 +334,20 @@ def XOrOp : Bits_Op<"xor", [Pure]> {
       "qualified(type($lhs)) `,` qualified(type($rhs)) "
       "`->` qualified(type($result))";
   let hasVerifier = 1;
+}
+
+def RowXOrOp : Bits_Op<"row_xor", [Pure]> {
+  let arguments = (ins
+    BitRowType:$lhs,
+    BitRowType:$rhs
+  );
+  let results = (outs
+    BitRowType:$result
+  );
+
+  let assemblyFormat = "$lhs `,` $rhs `,` attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) `,` "
+      "`->` qualified(type($result))";
 }
 
 def MajOp : Bits_Op<"maj", [Pure]> {
