@@ -38,11 +38,12 @@ namespace mlir::bits {
 
 constexpr int64_t kNumBanks = 64;
 constexpr int64_t kCloneCostPerBit = 3;
-constexpr bool kEnableVerboseMappingLog = true;
+constexpr bool kEnableVerboseMappingLog = false;
 
 struct Node {
   Operation *op = nullptr;
   int64_t duration = 0;
+  bool isContainer = false;
   int parentForNode = -1;
   int64_t loopDepth = 0;
   llvm::SmallVector<int, 2> preds;
@@ -153,14 +154,21 @@ static bool isSliceReductionFor(scf::ForOp forOp) {
   return isSliceType(forOp.getRegionIterArgs().front().getType());
 }
 
+static bool hasNestedForOp(scf::ForOp forOp) {
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (isa<scf::ForOp>(op))
+      return true;
+  }
+  return false;
+}
+
+static int64_t estimateForLatency(scf::ForOp forOp);
+
 static int64_t estimateLoopBodyLatency(scf::ForOp forOp) {
   int64_t bodyLatency = 0;
   for (Operation &op : forOp.getBody()->without_terminator()) {
     if (auto innerFor = dyn_cast<scf::ForOp>(&op)) {
-      auto innerTripCount = getConstTripCount(innerFor);
-      if (failed(innerTripCount))
-        continue;
-      bodyLatency += *innerTripCount * estimateLoopBodyLatency(innerFor);
+      bodyLatency += estimateForLatency(innerFor);
       continue;
     }
     if (isSupportedBitsSliceComputeOp(&op))
@@ -181,8 +189,11 @@ static int64_t estimateForLatency(scf::ForOp forOp) {
   if (bodyLatency == 0)
     return 0;
 
-  if (!isSliceReductionFor(forOp))
+  if (!isSliceReductionFor(forOp)) {
+    if (hasNestedForOp(forOp))
+      return bodyLatency * tripCount;
     return bodyLatency * ((tripCount + kNumBanks - 1) / kNumBanks);
+  }
 
   auto yield = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
   if (!yield || yield.getNumOperands() != 1)
@@ -355,7 +366,7 @@ static RegionPlan planLeafForRegions(scf::ForOp forOp, int64_t baseBank,
       best.regionCount = regions;
       best.banksPerRegion = banksPerRegion;
       best.iterPerRegion = iterPerRegion;
-      best.unrollFactor = iterPerRegion;
+      best.unrollFactor = isSliceReductionFor(forOp) ? iterPerRegion : regions;
       best.computeOpsPerRegion = iterPerRegion * opCountPerIter;
     }
   }
@@ -575,7 +586,8 @@ MappingSolution modelAndSolveILP(const DAG &dag) {
 
   for (int i = 0; i < N; ++i) {
     for (int j = i + 1; j < N; ++j) {
-      if (!dep[i][j] && !dep[j][i]) {
+      if (!dep[i][j] && !dep[j][i] && !dag.nodes[i].isContainer &&
+          !dag.nodes[j].isContainer) {
         GRBVar orderVar = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
                                        "order_" + std::to_string(i) + "_" +
                                            std::to_string(j));
@@ -608,6 +620,8 @@ MappingSolution modelAndSolveILP(const DAG &dag) {
   GRBVar makespan =
       model.addVar(0.0, GRB_INFINITY, 0.0, GRB_INTEGER, "makespan");
   for (int i = 0; i < N; ++i) {
+    if (dag.nodes[i].isContainer)
+      continue;
     model.addConstr(makespan >= end[i], "mkspan_ge_end_" + std::to_string(i));
   }
 
@@ -624,7 +638,7 @@ MappingSolution modelAndSolveILP(const DAG &dag) {
     for (int i = 0; i < N; ++i) {
       int bank = i % kNumBanks;
       int64_t start = bankCursor[bank];
-      int64_t end = start + std::max<int64_t>(1, dag.nodes[i].duration);
+      int64_t end = start + dag.nodes[i].duration;
       fallbackChosen[i] = bank;
       fallbackStart[i] = start;
       fallbackEnd[i] = end;
@@ -664,8 +678,6 @@ struct BitsOptimiseMappingPass
     DAG dag;
     DenseMap<Operation *, int64_t> loopTripCount;
     DenseMap<Operation *, int64_t> loopBestBanks;
-    DenseMap<Operation *, bool> loopHasSliceReduction;
-    DenseMap<Operation *, int> loopReduceProducerNode;
 
     auto collectNodes = [&](auto &&self, Region &region, int parentForNode,
                             int64_t loopDepth) -> LogicalResult {
@@ -673,7 +685,8 @@ struct BitsOptimiseMappingPass
         if (isSupportedBitsSliceComputeOp(&op)) {
           int id = dag.nodes.size();
           dag.nodes.push_back(
-              Node{&op, getComputeLatency(&op), parentForNode, loopDepth, {}, {}});
+              Node{&op, getComputeLatency(&op), false, parentForNode, loopDepth,
+                   {}, {}});
           dag.opToNodeID[&op] = id;
           continue;
         }
@@ -684,26 +697,21 @@ struct BitsOptimiseMappingPass
             forOp.emitOpError("requires constant power-of-two trip count");
             return failure();
           }
-          int64_t estLatency = estimateForLatency(forOp);
+          bool hasSliceReduction = isSliceReductionFor(forOp);
+          bool nestedFor = hasNestedForOp(forOp);
+          bool spansMultipleBankWaves = *tripCount > kNumBanks;
+          bool aggregateLoopWork =
+              hasSliceReduction || nestedFor || spansMultipleBankWaves;
+          int64_t estLatency = aggregateLoopWork ? estimateForLatency(forOp) : 0;
           int id = dag.nodes.size();
-          dag.nodes.push_back(Node{forOp.getOperation(), estLatency, parentForNode,
-                                   loopDepth, {}, {}});
+          dag.nodes.push_back(Node{forOp.getOperation(), estLatency,
+                                   !aggregateLoopWork, parentForNode, loopDepth,
+                                   {}, {}});
           dag.opToNodeID[&op] = id;
           loopTripCount[&op] = *tripCount;
           loopBestBanks[&op] = estimateBestParallelBanksForLoop(forOp);
-          loopHasSliceReduction[&op] = isSliceReductionFor(forOp);
-          loopReduceProducerNode[&op] = -1;
           if (failed(self(self, forOp.getRegion(), id, loopDepth + 1)))
             return failure();
-          if (auto yield =
-                  dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator())) {
-            if (yield.getNumOperands() == 1) {
-              if (Operation *producer = yield.getOperand(0).getDefiningOp()) {
-                if (dag.opToNodeID.contains(producer))
-                  loopReduceProducerNode[&op] = dag.opToNodeID.lookup(producer);
-              }
-            }
-          }
         }
       }
       return success();
@@ -751,151 +759,10 @@ struct BitsOptimiseMappingPass
         op->setAttr("bits.bank_id",
                     IntegerAttr::get(IntegerType::get(func.getContext(), 64),
                                      chosen[i]));
-        op->setAttr(
-            "bits.node_id",
-            IntegerAttr::get(IntegerType::get(func.getContext(), 64), i));
-        op->setAttr(
-            "bits.schedule_start",
-            IntegerAttr::get(IntegerType::get(func.getContext(), 64),
-                             solution.startTime[i]));
-        op->setAttr("bits.schedule_end",
-                    IntegerAttr::get(IntegerType::get(func.getContext(), 64),
-                                     solution.endTime[i]));
-        op->setAttr(
-            "bits.loop_depth",
-            IntegerAttr::get(IntegerType::get(func.getContext(), 64),
-                             dag.nodes[i].loopDepth));
-        if (dag.nodes[i].parentForNode >= 0) {
-          op->setAttr("bits.parent_for_node_id",
-                      IntegerAttr::get(IntegerType::get(func.getContext(), 64),
-                                       dag.nodes[i].parentForNode));
-        }
         banksInUse.insert(chosen[i]);
       }
 
       Builder attrBuilder(func.getContext());
-      func.walk([&](scf::ForOp forOp) {
-        Operation &op = *forOp.getOperation();
-        if (loopTripCount.contains(&op)) {
-          op.setAttr("bits.trip_count",
-                     IntegerAttr::get(IntegerType::get(func.getContext(), 64),
-                                      loopTripCount.lookup(&op)));
-          op.setAttr("bits.best_parallel_banks",
-                     IntegerAttr::get(IntegerType::get(func.getContext(), 64),
-                                      loopBestBanks.lookup(&op)));
-          op.setAttr("bits.has_slice_reduction",
-                     BoolAttr::get(func.getContext(),
-                                   loopHasSliceReduction.lookup(&op)));
-          int64_t reduceNode = loopReduceProducerNode.lookup(&op);
-          if (reduceNode >= 0) {
-            op.setAttr("bits.reduce_op_node_id",
-                       IntegerAttr::get(IntegerType::get(func.getContext(), 64),
-                                        reduceNode));
-          }
-
-          auto forNodeIt = dag.opToNodeID.find(&op);
-          int forNodeId =
-              (forNodeIt != dag.opToNodeID.end()) ? forNodeIt->second : -1;
-          if (forNodeId >= 0) {
-            DenseSet<int64_t> descendantNodes;
-            DenseSet<int64_t> descendantBanks;
-            for (int i = 0; i < static_cast<int>(dag.nodes.size()); ++i) {
-              int parent = dag.nodes[i].parentForNode;
-              while (parent >= 0) {
-                if (parent == forNodeId) {
-                  descendantNodes.insert(i);
-                  if (chosen[i] >= 0)
-                    descendantBanks.insert(chosen[i]);
-                  break;
-                }
-                parent = dag.nodes[parent].parentForNode;
-              }
-            }
-            SmallVector<int64_t> nodes(descendantNodes.begin(),
-                                       descendantNodes.end());
-            llvm::sort(nodes);
-            SmallVector<Attribute> nodeAttrs;
-            for (int64_t node : nodes)
-              nodeAttrs.push_back(attrBuilder.getI64IntegerAttr(node));
-            op.setAttr("bits.descendant_nodes",
-                       ArrayAttr::get(func.getContext(), nodeAttrs));
-
-            SmallVector<int64_t> banks(descendantBanks.begin(),
-                                       descendantBanks.end());
-            llvm::sort(banks);
-            SmallVector<Attribute> bankAttrs;
-            for (int64_t b : banks)
-              bankAttrs.push_back(attrBuilder.getI64IntegerAttr(b));
-            op.setAttr("bits.descendant_banks",
-                       ArrayAttr::get(func.getContext(), bankAttrs));
-          }
-
-          int64_t baseBank =
-              (forNodeId >= 0 &&
-               forNodeId < static_cast<int64_t>(chosen.size()))
-                  ? chosen[forNodeId]
-                  : -1;
-          if (baseBank >= 0) {
-            int64_t groupSize = std::max<int64_t>(1, loopBestBanks.lookup(&op));
-            if (!loopHasSliceReduction.lookup(&op)) {
-              groupSize = kNumBanks;
-            }
-            groupSize = std::min<int64_t>(groupSize, kNumBanks);
-            SmallVector<int64_t> bankGroup = buildBankGroup(baseBank, groupSize);
-            SmallVector<Attribute> groupAttrs;
-            for (int64_t b : bankGroup)
-              groupAttrs.push_back(attrBuilder.getI64IntegerAttr(b));
-            op.setAttr("bits.bank_group",
-                       ArrayAttr::get(func.getContext(), groupAttrs));
-
-            for (int i = 0; i < static_cast<int>(dag.nodes.size()); ++i) {
-              int parent = dag.nodes[i].parentForNode;
-              while (parent >= 0) {
-                if (parent == forNodeId) {
-                  if (!dag.nodes[i].op->hasAttr("bits.bank_group")) {
-                    dag.nodes[i].op->setAttr("bits.bank_group",
-                                             ArrayAttr::get(func.getContext(),
-                                                            groupAttrs));
-                  } else {
-                    dag.nodes[i].op->setAttr("bits.owner_bank_group",
-                                             ArrayAttr::get(func.getContext(),
-                                                            groupAttrs));
-                  }
-                  break;
-                }
-                parent = dag.nodes[parent].parentForNode;
-              }
-            }
-
-            int64_t reduceNode = loopReduceProducerNode.lookup(&op);
-            if (reduceNode >= 0 &&
-                reduceNode < static_cast<int64_t>(dag.nodes.size())) {
-              DenseMap<int64_t, int64_t> counts =
-                  buildTreeReduceCountPerBank(baseBank, groupSize);
-              SmallVector<Attribute> countAttrs;
-              SmallVector<int64_t> banks;
-              for (auto &it : counts)
-                banks.push_back(it.first);
-              llvm::sort(banks);
-              for (int64_t bankId : banks) {
-                NamedAttrList entry;
-                entry.set("bank_id", attrBuilder.getI64IntegerAttr(bankId));
-                entry.set("reduce_count",
-                          attrBuilder.getI64IntegerAttr(counts.lookup(bankId)));
-                countAttrs.push_back(
-                    DictionaryAttr::get(func.getContext(), entry));
-              }
-              dag.nodes[reduceNode].op->setAttr(
-                  "bits.tree_reduce_bank_counts",
-                  ArrayAttr::get(func.getContext(), countAttrs));
-              dag.nodes[reduceNode].op->setAttr(
-                  "bits.reduce_output_bank",
-                  attrBuilder.getI64IntegerAttr(
-                      bankGroup.empty() ? baseBank : bankGroup.front()));
-            }
-          }
-        }
-      });
 
       if (kEnableVerboseMappingLog) {
         std::cout << "Bank assignments (operator -> banks):\n";
@@ -943,22 +810,7 @@ struct BitsOptimiseMappingPass
                 forOp->getAttr("bits.bank_id"))) {
           baseBank = b.getInt();
         }
-        auto groupAttr =
-            dyn_cast_or_null<ArrayAttr>(forOp->getAttr("bits.bank_group"));
-        int64_t availBanks = groupAttr ? groupAttr.size() : 1;
-        if (auto parentNodeAttr =
-                dyn_cast_or_null<IntegerAttr>(forOp->getAttr("bits.parent_for_node_id"))) {
-          int64_t parentNodeId = parentNodeAttr.getInt();
-          if (parentNodeId >= 0 &&
-              parentNodeId < static_cast<int64_t>(dag.nodes.size())) {
-            Operation *parentForOp = dag.nodes[parentNodeId].op;
-            if (auto parentRegionCountAttr = dyn_cast_or_null<IntegerAttr>(
-                    parentForOp->getAttr("bits.region_count"))) {
-              int64_t parentRegions = std::max<int64_t>(1, parentRegionCountAttr.getInt());
-              availBanks = std::max<int64_t>(1, availBanks / parentRegions);
-            }
-          }
-        }
+        int64_t availBanks = kNumBanks;
         if (baseBank < 0)
           baseBank = 0;
 
@@ -1002,29 +854,94 @@ struct BitsOptimiseMappingPass
               }
             }
           }
-          forOp->setAttr(
-              "bits.inner_for_unroll_factor",
-              attrBuilder.getI64IntegerAttr(chosenPlan.unrollFactor));
-          forOp->setAttr(
-              "bits.inner_for_compute_ops_per_region",
-              attrBuilder.getI64IntegerAttr(chosenPlan.computeOpsPerRegion));
         } else {
           chosenPlan = planLeafForRegions(forOp, baseBank, availBanks);
         }
 
-        SmallVector<Attribute> regionAttrs;
-        for (const auto &banks : chosenPlan.regionBanks) {
-          SmallVector<Attribute> bankAttrs;
-          for (int64_t b : banks)
-            bankAttrs.push_back(attrBuilder.getI64IntegerAttr(b));
-          regionAttrs.push_back(ArrayAttr::get(func.getContext(), bankAttrs));
-        }
+        forOp->setAttr("bits.unroll_required",
+                       attrBuilder.getBoolAttr(chosenPlan.unrollFactor > 1));
+        forOp->setAttr("bits.unroll_factor",
+                       attrBuilder.getI64IntegerAttr(chosenPlan.unrollFactor));
         forOp->setAttr("bits.region_count",
                        attrBuilder.getI64IntegerAttr(chosenPlan.regionCount));
-        forOp->setAttr("bits.region_available_banks",
-                       attrBuilder.getI64IntegerAttr(availBanks));
-        forOp->setAttr("bits.region_banks",
-                       ArrayAttr::get(func.getContext(), regionAttrs));
+        forOp->setAttr("bits.region_iter_count",
+                       attrBuilder.getI64IntegerAttr(chosenPlan.iterPerRegion));
+        SmallVector<Attribute> unrollLaneBanks;
+        if (chosenPlan.unrollFactor > 0 && !chosenPlan.regionBanks.empty()) {
+          unrollLaneBanks.reserve(chosenPlan.unrollFactor);
+          for (int64_t lane = 0; lane < chosenPlan.unrollFactor; ++lane) {
+            const auto &laneRegion =
+                chosenPlan.regionBanks[lane % chosenPlan.regionBanks.size()];
+            int64_t laneBank = laneRegion.empty() ? baseBank : laneRegion.front();
+            unrollLaneBanks.push_back(attrBuilder.getI64IntegerAttr(laneBank));
+          }
+        }
+        forOp->setAttr("bits.unroll_lane_banks",
+                       ArrayAttr::get(func.getContext(), unrollLaneBanks));
+        DenseMap<int64_t, int64_t> bankWorkload;
+        SmallVector<int64_t> bodyOpBanks;
+        for (Operation &bodyOp : forOp.getBody()->without_terminator()) {
+          if (!isSupportedBitsSliceComputeOp(&bodyOp))
+            continue;
+          if (auto bankAttr = dyn_cast_or_null<IntegerAttr>(
+                  bodyOp.getAttr("bits.bank_id"))) {
+            bodyOpBanks.push_back(bankAttr.getInt());
+          }
+        }
+        if (isSliceReductionFor(forOp)) {
+          for (const auto &regionBanks : chosenPlan.regionBanks) {
+            if (regionBanks.empty())
+              continue;
+            int64_t regionAnchorBank = regionBanks.front();
+            if (bodyOpBanks.empty()) {
+              bankWorkload[regionAnchorBank] += chosenPlan.iterPerRegion;
+              continue;
+            }
+            for (int64_t opBank : bodyOpBanks) {
+              int64_t issueBank =
+                  (opBank - baseBank + regionAnchorBank + kNumBanks) % kNumBanks;
+              bankWorkload[issueBank] += chosenPlan.iterPerRegion;
+            }
+          }
+        } else if (!unrollLaneBanks.empty()) {
+          int64_t laneCount = static_cast<int64_t>(unrollLaneBanks.size());
+          int64_t baseIters = tripCount / laneCount;
+          int64_t remainder = tripCount % laneCount;
+          for (int64_t lane = 0; lane < laneCount; ++lane) {
+            int64_t bankId =
+                cast<IntegerAttr>(unrollLaneBanks[lane]).getInt();
+            int64_t laneIters = baseIters + (lane < remainder ? 1 : 0);
+            if (laneIters <= 0)
+              continue;
+            if (bodyOpBanks.empty()) {
+              bankWorkload[bankId] += laneIters;
+              continue;
+            }
+            for (int64_t opBank : bodyOpBanks) {
+              int64_t issueBank =
+                  (opBank - baseBank + bankId + kNumBanks) % kNumBanks;
+              bankWorkload[issueBank] += laneIters;
+            }
+          }
+        } else {
+          bankWorkload[baseBank] = tripCount;
+        }
+        SmallVector<int64_t> workloadBanks;
+        workloadBanks.reserve(bankWorkload.size());
+        for (auto &it : bankWorkload)
+          workloadBanks.push_back(it.first);
+        llvm::sort(workloadBanks);
+        SmallVector<Attribute> workloadAttrs;
+        for (int64_t bankId : workloadBanks) {
+          NamedAttrList entry;
+          entry.set("bank_id", attrBuilder.getI64IntegerAttr(bankId));
+          entry.set("iter_count",
+                    attrBuilder.getI64IntegerAttr(bankWorkload.lookup(bankId)));
+          workloadAttrs.push_back(
+              DictionaryAttr::get(func.getContext(), entry));
+        }
+        forOp->setAttr("bits.bank_workload",
+                       ArrayAttr::get(func.getContext(), workloadAttrs));
 
         if (kEnableVerboseMappingLog) {
           int64_t nodeId = -1;
@@ -1039,6 +956,8 @@ struct BitsOptimiseMappingPass
                     << chosenPlan.computeOpsPerRegion << "\n";
         }
       }
+
+      return;
 
       DenseMap<Value, int64_t> valueIds;
       int64_t nextValueId = 0;
