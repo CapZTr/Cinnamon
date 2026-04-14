@@ -212,7 +212,12 @@ static int64_t estimateForLatency(scf::ForOp forOp) {
   for (int64_t banks = 1; banks <= std::min<int64_t>(tripCount, kNumBanks);
        banks <<= 1) {
     int64_t iterPerBank = (tripCount + banks - 1) / banks;
-    int64_t local = iterPerBank * bodyLatency;
+    // Each bank: n iterations of pre-reduce work (body minus the reduce op),
+    // then (n-1) intra-bank reductions to fold n partial results into one.
+    // Only after that does inter-bank tree reduction begin.
+    int64_t preReduceLatency = bodyLatency - reduceLatency;
+    int64_t local = iterPerBank * preReduceLatency
+                  + std::max<int64_t>(0, iterPerBank - 1) * reduceLatency;
     int64_t reduceTreeLevels = llvm::Log2_64(banks);
     int64_t reduceCost = reduceTreeLevels * (cloneLatency + reduceLatency);
     best = std::min(best, local + reduceCost);
@@ -250,7 +255,16 @@ static int64_t estimateBestParallelBanksForLoop(scf::ForOp forOp) {
   for (int64_t banks = 1; banks <= std::min<int64_t>(tripCount, kNumBanks);
        banks <<= 1) {
     int64_t iterPerBank = (tripCount + banks - 1) / banks;
-    int64_t local = iterPerBank * bodyLatency;
+    int64_t local;
+    if (isSliceReductionFor(forOp) && reduceLatency > 0) {
+      // Same model as estimateForLatency: n pre-reduce iters + (n-1)
+      // intra-bank reductions.  The reduce op is NOT counted in every iteration.
+      int64_t preReduceLatency = bodyLatency - reduceLatency;
+      local = iterPerBank * preReduceLatency
+            + std::max<int64_t>(0, iterPerBank - 1) * reduceLatency;
+    } else {
+      local = iterPerBank * bodyLatency;
+    }
     int64_t reduceTreeLevels = llvm::Log2_64(banks);
     int64_t reduceCost =
         isSliceReductionFor(forOp) ? reduceTreeLevels * (cloneLatency + reduceLatency)
@@ -353,15 +367,19 @@ static RegionPlan planLeafForRegions(scf::ForOp forOp, int64_t baseBank,
   for (int64_t regions : candidates) {
     int64_t banksPerRegion = std::max<int64_t>(1, availBanks / regions);
     int64_t iterPerRegion = std::max<int64_t>(1, tripCount / regions);
-    int64_t local = iterPerRegion * bodyLatency;
-    int64_t reduceInRegion = 0;
-    if (isSliceReductionFor(forOp) && reduceLatency > 0)
-      reduceInRegion = std::max<int64_t>(0, iterPerRegion - 1) * reduceLatency;
+    // For reduction loops: each bank computes n iterations of pre-reduce work,
+    // then folds n partial results with (n-1) intra-bank reductions before the
+    // inter-bank tree reduction phase.
+    bool isReduce = isSliceReductionFor(forOp) && reduceLatency > 0;
+    int64_t preReduceLatency = isReduce ? (bodyLatency - reduceLatency) : bodyLatency;
+    int64_t local = iterPerRegion * preReduceLatency;
+    int64_t intraReduce = isReduce
+        ? std::max<int64_t>(0, iterPerRegion - 1) * reduceLatency
+        : 0;
     int64_t interRegionReduce = 0;
     if (isSliceReductionFor(forOp) && regions > 1)
       interRegionReduce = llvm::Log2_64(regions) * (reduceLatency + cloneLatency);
-    int64_t makespan = local + reduceInRegion + interRegionReduce;
-
+    int64_t makespan = local + intraReduce + interRegionReduce;
     if (makespan < best.estimatedMakespan) {
       best.estimatedMakespan = makespan;
       best.regionCount = regions;
@@ -761,11 +779,19 @@ struct BitsOptimiseMappingPass
       Builder attrBuilder(ctx);
  
       // Phase 4: annotate ILP nodes.
-      // For-loop nodes receive bits.bank_id (the ILP-assigned base bank).
-      // Top-level slice compute ops (non-loop nodes in the DAG) additionally
-      // receive bits.start_time and, for each result consumed by an op on a
-      // different bank, bits.out_xfer = [{dst_bank, time}, ...] where time is
-      // the ILP end cycle of this op (earliest the source bank can send).
+      // Attributes set on each compute op:
+      //   bits.bank_id    i64  – ILP-assigned bank (also set on scf.for nodes)
+      //   bits.start_time i64  – cycle at which execution begins
+      //   bits.end_time   i64  – cycle at which the result is ready
+      //   bits.out_xfer   array – one entry per cross-bank consumer:
+      //                     { result_idx i64, dst_bank i64,
+      //                       send_time i64, recv_time i64 }
+      //                     send_time = end_time of this op
+      //                     recv_time = start_time of the consumer op
+      //   bits.in_xfer    array – one entry per cross-bank operand:
+      //                     { src_bank i64, operand_idx i64, ready_time i64 }
+      //                     ready_time = start_time of this op
+      DenseMap<Operation *, SmallVector<Attribute>> inXferMap;
       for (int i = 0; i < static_cast<int>(dag.nodes.size()); ++i) {
         if (chosen[i] < 0) {
           continue;
@@ -780,46 +806,114 @@ struct BitsOptimiseMappingPass
         op->setAttr("bits.start_time",
                     IntegerAttr::get(IntegerType::get(ctx, 64),
                                      solution.startTime[i]));
+        op->setAttr("bits.end_time",
+                    IntegerAttr::get(IntegerType::get(ctx, 64),
+                                     solution.endTime[i]));
 
         SmallVector<Attribute> outXfers;
-        for (Value result : op->getResults()) {
+        for (auto [resultIdx, result] : llvm::enumerate(op->getResults())) {
           for (Operation *user : result.getUsers()) {
             auto it = dag.opToNodeID.find(user);
             if (it == dag.opToNodeID.end())
               continue;
             int j = it->second;
-            if (chosen[j] >= 0 && chosen[j] != chosen[i]) {
-              NamedAttrList xfer;
-              xfer.set("dst_bank",
-                       IntegerAttr::get(IntegerType::get(ctx, 64), chosen[j]));
-              xfer.set("time",
-                       IntegerAttr::get(IntegerType::get(ctx, 64),
-                                        solution.endTime[i]));
-              outXfers.push_back(DictionaryAttr::get(ctx, xfer.getAttrs()));
+            if (chosen[j] < 0 || chosen[j] == chosen[i])
+              continue;
+            // Cross-bank transfer: build out_xfer entry on the source op.
+            NamedAttrList xfer;
+            xfer.set("result_idx",
+                     attrBuilder.getI64IntegerAttr((int64_t)resultIdx));
+            xfer.set("dst_bank",
+                     IntegerAttr::get(IntegerType::get(ctx, 64), chosen[j]));
+            xfer.set("send_time",
+                     IntegerAttr::get(IntegerType::get(ctx, 64),
+                                      solution.endTime[i]));
+            xfer.set("recv_time",
+                     IntegerAttr::get(IntegerType::get(ctx, 64),
+                                      solution.startTime[j]));
+            outXfers.push_back(DictionaryAttr::get(ctx, xfer.getAttrs()));
+            // Build in_xfer entry on each matching operand slot of the consumer.
+            for (auto [opIdx, operand] : llvm::enumerate(user->getOperands())) {
+              if (operand.getDefiningOp() != op)
+                continue;
+              NamedAttrList inXfer;
+              inXfer.set("src_bank",
+                         IntegerAttr::get(IntegerType::get(ctx, 64), chosen[i]));
+              inXfer.set("operand_idx",
+                         attrBuilder.getI64IntegerAttr((int64_t)opIdx));
+              inXfer.set("ready_time",
+                         IntegerAttr::get(IntegerType::get(ctx, 64),
+                                          solution.startTime[j]));
+              inXferMap[user].push_back(DictionaryAttr::get(ctx, inXfer.getAttrs()));
             }
           }
         }
         if (!outXfers.empty())
           op->setAttr("bits.out_xfer", ArrayAttr::get(ctx, outXfers));
       }
+      // Apply accumulated in_xfer annotations.
+      for (auto &[destOp, inXfers] : inXferMap)
+        destOp->setAttr("bits.in_xfer", ArrayAttr::get(ctx, inXfers));
  
       // Phase 5: for-loop parallelism planning.
-      // Each scf.for receives exactly one attribute:
+      // Attributes set on each scf.for:
+      //   bits.parallel_factor  i64 – number of banks sharing the loop
+      //   bits.loop_kind        str – "reduction" | "parallel"
+      //   bits.iters_per_bank   i64 – tripCount / parallel_factor
       //
-      //   bits.parallel_factor  (i64)
-      //     Number of independent execution units this loop is split across:
-      //       non-reduction loop   -> number of parallel outer instances
-      //       slice-reduction loop -> number of banks computing partial sums
+      // Additional attributes for reduction loops only:
+      //   bits.intra_reduce_count i64   – (iters_per_bank - 1) per-bank reductions
+      //   bits.reduce_levels      i64   – log2(parallel_factor) inter-bank levels
+      //   bits.reduce_tree  array<array<{src_bank i64, dst_bank i64}>>
+      //                           one inner array per tree level (outermost first);
+      //                           src sends to dst at each step
       //
-      // The dispatch codegen derives all other scheduling parameters:
-      //   iters_per_unit     = tripCount / parallel_factor
-      //   banks_per_instance = kNumBanks / outer_parallel_factor  (outer only)
-      //   reduce_levels      = log2(parallel_factor)              (reduction only)
-      //
-      // A two-level nest (non-reduction outer + reduction inner) is planned
-      // jointly so the bank budget is split correctly. The child for is
-      // annotated inside the outer loop's planning and skipped when the walk
-      // reaches it independently.
+      // The reduce op inside each reduction loop body also receives:
+      //   bits.is_reduce_op (unit) – distinguishes compute from reduction steps
+      // Helper: apply all loop scheduling attributes to a for op.
+      auto annotateForLoop = [&](scf::ForOp lp, int64_t parallelFactor,
+                                 int64_t tc, bool isReduction) {
+        lp->setAttr("bits.parallel_factor",
+                    attrBuilder.getI64IntegerAttr(parallelFactor));
+        lp->setAttr("bits.loop_kind",
+                    StringAttr::get(ctx, isReduction ? "reduction" : "parallel"));
+        int64_t itersPerBank =
+            parallelFactor > 0 ? tc / parallelFactor : tc;
+        lp->setAttr("bits.iters_per_bank",
+                    attrBuilder.getI64IntegerAttr(itersPerBank));
+        if (!isReduction)
+          return;
+        lp->setAttr("bits.intra_reduce_count",
+                    attrBuilder.getI64IntegerAttr(
+                        std::max<int64_t>(0, itersPerBank - 1)));
+        int64_t reduceLevels =
+            parallelFactor > 1 ? (int64_t)llvm::Log2_64(parallelFactor) : 0;
+        lp->setAttr("bits.reduce_levels",
+                    attrBuilder.getI64IntegerAttr(reduceLevels));
+        // Build inter-bank tree descriptor using the ILP-assigned base bank.
+        // At each level the "right half" of active banks sends to the "left
+        // half"; only the left banks survive to the next level.
+        int64_t baseBank = 0;
+        if (auto bankAttr = lp->getAttrOfType<IntegerAttr>("bits.bank_id"))
+          baseBank = bankAttr.getInt();
+        SmallVector<Attribute> treeLevels;
+        for (int64_t step = parallelFactor / 2; step >= 1; step /= 2) {
+          SmallVector<Attribute> levelPairs;
+          for (int64_t idx = 0; idx < step; ++idx) {
+            int64_t dstBank = (baseBank + idx) % kNumBanks;
+            int64_t srcBank = (baseBank + idx + step) % kNumBanks;
+            NamedAttrList pair;
+            pair.set("src_bank",
+                     IntegerAttr::get(IntegerType::get(ctx, 64), srcBank));
+            pair.set("dst_bank",
+                     IntegerAttr::get(IntegerType::get(ctx, 64), dstBank));
+            levelPairs.push_back(DictionaryAttr::get(ctx, pair.getAttrs()));
+          }
+          treeLevels.push_back(ArrayAttr::get(ctx, levelPairs));
+        }
+        if (!treeLevels.empty())
+          lp->setAttr("bits.reduce_tree", ArrayAttr::get(ctx, treeLevels));
+      };
       SmallVector<scf::ForOp> allForOps;
       func.walk([&](scf::ForOp forOp) { allForOps.push_back(forOp); });
 
@@ -842,10 +936,6 @@ struct BitsOptimiseMappingPass
         }
 
         if (childForCount == 1) {
-          // Joint optimisation for a two-level nest: find the outer instance
-          // count (bestOuterRegions) and inner bank count
-          // (bestInnerParallelFactor) minimising
-          //   outer_iters_per_instance * inner_makespan.
           int64_t bestCost = std::numeric_limits<int64_t>::max();
           int64_t bestOuterRegions = 1;
           int64_t bestInnerParallelFactor = 1;
@@ -863,17 +953,33 @@ struct BitsOptimiseMappingPass
               bestInnerParallelFactor = innerPlan.regionCount;
             }
           }
+          // Outer loop is always parallel (instances are independent).
+          annotateForLoop(forOp, bestOuterRegions, tripCount,
+                          /*isReduction=*/false);
+          auto childTripMaybe = getConstTripCount(childFor);
+          int64_t childTripCount =
+              succeeded(childTripMaybe) ? *childTripMaybe : 1;
+          annotateForLoop(childFor, bestInnerParallelFactor, childTripCount,
+                          isSliceReductionFor(childFor));
 
-          forOp->setAttr("bits.parallel_factor",
-                         attrBuilder.getI64IntegerAttr(bestOuterRegions));
-          childFor->setAttr("bits.parallel_factor",
-                            attrBuilder.getI64IntegerAttr(bestInnerParallelFactor));
         } else {
           RegionPlan plan = planLeafForRegions(forOp, 0, kNumBanks);
-          forOp->setAttr("bits.parallel_factor",
-                         attrBuilder.getI64IntegerAttr(plan.regionCount));
+          annotateForLoop(forOp, plan.regionCount, tripCount,
+                          isSliceReductionFor(forOp));
         }
       }
+      // Mark the accumulator op inside each slice-reduction loop body so the
+      // dispatcher can distinguish regular compute work from reduction steps.
+      func.walk([&](scf::ForOp forOp) {
+        if (!isSliceReductionFor(forOp))
+          return;
+        auto yield = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+        if (!yield || yield.getNumOperands() != 1)
+          return;
+        Operation *reduceProducer = yield.getOperand(0).getDefiningOp();
+        if (reduceProducer && isSupportedBitsSliceComputeOp(reduceProducer))
+          reduceProducer->setAttr("bits.is_reduce_op", UnitAttr::get(ctx));
+      });
     } catch (GRBException &e) {
       std::cerr << "Gurobi error: " << e.getMessage() << "\n";
     } catch (std::exception &ex) {
