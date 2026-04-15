@@ -334,8 +334,10 @@ struct MulIPattern : public OpRewritePattern<MulIOp> {
               bodyLoc, rowType, curPartialSlice, partialRowIndex);
           auto finalLoopAdd = builder.create<RowAddOp>(
               bodyLoc, rowType, rowType, finalLoopAnd, partialRow, currCin);
+        //   Value resRowIndex = builder.create<arith::AddIOp>(
+        //       bodyLoc, partialRowIndex, partialAddBitwidthVal);
           Value resRowIndex = builder.create<arith::AddIOp>(
-              bodyLoc, partialRowIndex, partialAddBitwidthVal);
+              bodyLoc, ivI64, mrBitwidthIndexV);
           Value updatedResSlice4 =
               builder.create<InsertRowOp>(bodyLoc, resSliceType, curResSlice,
                                           finalLoopAdd.getSum(), resRowIndex);
@@ -477,7 +479,7 @@ struct BitsPatternApplyPass
   void runOnOperation() final {
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
-    constexpr bool useReadableMulIPattern = true;
+    constexpr bool useReadableMulIPattern = false;
     if (useReadableMulIPattern) {
       patterns
           .add<AddIPattern, MulIReadablePattern, RowWiseLogicPattern<AndOp, RowAndOp>,

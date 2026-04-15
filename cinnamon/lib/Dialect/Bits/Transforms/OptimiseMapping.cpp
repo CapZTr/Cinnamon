@@ -37,7 +37,7 @@ namespace mlir::bits {
 //===----------------------------------------------------------------------===//
 
 constexpr int64_t kNumBanks = 64;
-constexpr int64_t kCloneCostPerBit = 3;
+constexpr int64_t kCloneCostPerBit = 14;
 constexpr bool kEnableVerboseMappingLog = true;
 
 struct Node {
@@ -115,20 +115,20 @@ static int64_t getSliceBitwidth(Value value) {
 
 static int64_t getComputeLatency(Operation *op) {
   if (auto add = dyn_cast<AddIOp>(op))
-    return 3 * getSliceBitwidth(add.getResult());
+    return 8 * getSliceBitwidth(add.getResult());
   if (auto mul = dyn_cast<MulIOp>(op))
-    return 4 * getSliceBitwidth(mul.getLhs()) * getSliceBitwidth(mul.getRhs()) -
-           3 * getSliceBitwidth(mul.getLhs());
+    return 11 * getSliceBitwidth(mul.getLhs()) * getSliceBitwidth(mul.getRhs()) -
+           11 * getSliceBitwidth(mul.getLhs()) + 4;
   if (auto andOp = dyn_cast<AndOp>(op))
-    return getSliceBitwidth(andOp.getResult());
+    return 4 * getSliceBitwidth(andOp.getResult());
   if (auto orOp = dyn_cast<OrOp>(op))
-    return getSliceBitwidth(orOp.getResult());
-  if (auto xorOp = dyn_cast<XOrOp>(op))
-    return 3 * getSliceBitwidth(xorOp.getResult());
+    return 4 * getSliceBitwidth(orOp.getResult());
+  // if (auto xorOp = dyn_cast<XOrOp>(op))
+  //   return 3 * getSliceBitwidth(xorOp.getResult());
 
   if (op->getNumResults() == 0)
     return 0;
-  return 2 * getSliceBitwidth(op->getResult(0));
+  return 6 * getSliceBitwidth(op->getResult(0));
 }
 
 static FailureOr<int64_t> getConstTripCount(scf::ForOp forOp) {
