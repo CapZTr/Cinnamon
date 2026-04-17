@@ -7,6 +7,7 @@
 #include <iostream>
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <utility>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/DenseSet.h>
@@ -36,7 +37,7 @@ namespace mlir::bits {
 
 //===----------------------------------------------------------------------===//
 
-constexpr int64_t kNumBanks = 64;
+constexpr int64_t kNumBanks = 32;
 constexpr int64_t kCloneCostPerBit = 14;
 constexpr bool kEnableVerboseMappingLog = true;
 
@@ -69,6 +70,40 @@ struct TransferEvent {
   int64_t start = 0;
   int64_t end = 0;
   int64_t valueId = -1;
+};
+
+struct MuliEvent {
+  int64_t lhsBitwidth = 0;
+  int64_t rhsBitwidth = 0;
+  int64_t start = 0;
+  int64_t end = 0;
+  int64_t bankId = -1;
+};
+
+struct AddiEvent {
+  int64_t lhsBitwidth = 0;
+  int64_t rhsBitwidth = 0;
+  int64_t start = 0;
+  int64_t end = 0;
+  int64_t bankId = -1;
+};
+
+struct RowCopyEvent {
+  int64_t srcBankId = -1;
+  int64_t dstBankId = -1;
+  int64_t bitwidth = 0;
+  int64_t start = 0;
+  int64_t end = 0;
+};
+
+struct FlattenedEvent {
+  enum class Kind { Muli, Addi, RowCopy };
+  Kind kind = Kind::Muli;
+  int64_t start = 0;
+  int64_t end = 0;
+  MuliEvent muli;
+  AddiEvent addi;
+  RowCopyEvent rowCopy;
 };
 
 // void modelAndSolveILP(const DAG &dag) {
@@ -117,8 +152,8 @@ static int64_t getComputeLatency(Operation *op) {
   if (auto add = dyn_cast<AddIOp>(op))
     return 8 * getSliceBitwidth(add.getResult());
   if (auto mul = dyn_cast<MulIOp>(op))
-    return 11 * getSliceBitwidth(mul.getLhs()) * getSliceBitwidth(mul.getRhs()) -
-           11 * getSliceBitwidth(mul.getLhs()) + 4;
+    return 12 * getSliceBitwidth(mul.getLhs()) * getSliceBitwidth(mul.getRhs()) -
+           12 * getSliceBitwidth(mul.getLhs()) + 4;
   if (auto andOp = dyn_cast<AndOp>(op))
     return 4 * getSliceBitwidth(andOp.getResult());
   if (auto orOp = dyn_cast<OrOp>(op))
@@ -129,6 +164,262 @@ static int64_t getComputeLatency(Operation *op) {
   if (op->getNumResults() == 0)
     return 0;
   return 6 * getSliceBitwidth(op->getResult(0));
+}
+
+static FailureOr<int64_t> getConstTripCount(scf::ForOp forOp);
+static SmallVector<int64_t> buildBankGroup(int64_t baseBank, int64_t numBanks);
+
+static bool isMuliOrAddi(Operation *op) {
+  return isa<MulIOp>(op) || isa<AddIOp>(op);
+}
+
+static SmallVector<int64_t> getReduceBanksFromAttr(scf::ForOp forOp) {
+  SmallVector<int64_t> banks;
+  auto treeAttr = forOp->getAttrOfType<ArrayAttr>("bits.reduce_tree");
+  if (!treeAttr || treeAttr.empty())
+    return banks;
+  auto firstLevel = dyn_cast<ArrayAttr>(treeAttr[0]);
+  if (!firstLevel)
+    return banks;
+  llvm::DenseSet<int64_t> uniqueBanks;
+  for (Attribute pairAttr : firstLevel) {
+    auto pair = dyn_cast<DictionaryAttr>(pairAttr);
+    if (!pair)
+      continue;
+    auto src = dyn_cast_or_null<IntegerAttr>(pair.get("src_bank"));
+    auto dst = dyn_cast_or_null<IntegerAttr>(pair.get("dst_bank"));
+    if (src)
+      uniqueBanks.insert(src.getInt());
+    if (dst)
+      uniqueBanks.insert(dst.getInt());
+  }
+  for (int64_t bank : uniqueBanks)
+    banks.push_back(bank);
+  llvm::sort(banks);
+  return banks;
+}
+
+static void dumpFlattenedEventSequence(func::FuncOp func) {
+  SmallVector<FlattenedEvent> events;
+  std::map<int64_t, SmallVector<FlattenedEvent>> eventsByStartTime;
+
+  auto recordEvent = [&](const FlattenedEvent &evt) {
+    events.push_back(evt);
+    eventsByStartTime[evt.start].push_back(evt);
+  };
+
+  auto pushMuli = [&](int64_t lhsBw, int64_t rhsBw, int64_t start, int64_t end,
+                      int64_t bank) {
+    FlattenedEvent evt;
+    evt.kind = FlattenedEvent::Kind::Muli;
+    evt.start = start;
+    evt.end = end;
+    evt.muli = MuliEvent{lhsBw, rhsBw, start, end, bank};
+    recordEvent(evt);
+  };
+  auto pushAddi = [&](int64_t lhsBw, int64_t rhsBw, int64_t start, int64_t end,
+                      int64_t bank) {
+    FlattenedEvent evt;
+    evt.kind = FlattenedEvent::Kind::Addi;
+    evt.start = start;
+    evt.end = end;
+    evt.addi = AddiEvent{lhsBw, rhsBw, start, end, bank};
+    recordEvent(evt);
+  };
+  auto pushRowCopy = [&](int64_t srcBank, int64_t dstBank, int64_t bw,
+                         int64_t start, int64_t end) {
+    FlattenedEvent evt;
+    evt.kind = FlattenedEvent::Kind::RowCopy;
+    evt.start = start;
+    evt.end = end;
+    evt.rowCopy = RowCopyEvent{srcBank, dstBank, bw, start, end};
+    recordEvent(evt);
+  };
+
+  func.walk([&](scf::ForOp forOp) {
+    auto tripMaybe = getConstTripCount(forOp);
+    if (failed(tripMaybe))
+      return;
+    int64_t tripCount = *tripMaybe;
+    if (tripCount <= 0)
+      return;
+
+    int64_t parallelFactor = 1;
+    if (auto pf = forOp->getAttrOfType<IntegerAttr>("bits.parallel_factor"))
+      parallelFactor = std::max<int64_t>(1, pf.getInt());
+    int64_t itersPerBank = std::max<int64_t>(1, tripCount / parallelFactor);
+
+    int64_t baseBank = 0;
+    if (auto b = forOp->getAttrOfType<IntegerAttr>("bits.bank_id"))
+      baseBank = b.getInt();
+
+    SmallVector<int64_t> activeBanks;
+    auto banksFromTree = getReduceBanksFromAttr(forOp);
+    if (!banksFromTree.empty()) {
+      activeBanks = banksFromTree;
+    } else {
+      activeBanks = buildBankGroup(baseBank, parallelFactor);
+    }
+
+    Operation *reduceProducer = nullptr;
+    if (auto yield = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator())) {
+      if (yield.getNumOperands() == 1)
+        reduceProducer = yield.getOperand(0).getDefiningOp();
+    }
+
+    SmallVector<Operation *> linearOps;
+    for (Operation &op : forOp.getBody()->without_terminator()) {
+      if (!isMuliOrAddi(&op))
+        continue;
+      linearOps.push_back(&op);
+    }
+    if (linearOps.empty())
+      return;
+
+    DenseMap<int64_t, int64_t> bankReady;
+    for (int64_t bank : activeBanks)
+      bankReady[bank] = 0;
+
+    int64_t reduceBitwidth = 0;
+    int64_t reduceLatency = 0;
+    if (reduceProducer && isMuliOrAddi(reduceProducer)) {
+      reduceLatency = getComputeLatency(reduceProducer);
+      if (reduceProducer->getNumOperands() >= 1)
+        reduceBitwidth = getSliceBitwidth(reduceProducer->getOperand(0));
+    }
+    int64_t rowCopyLatency = kCloneCostPerBit * std::max<int64_t>(1, reduceBitwidth);
+
+    for (int64_t bank : activeBanks) {
+      int64_t cursor = bankReady[bank];
+      for (int64_t iter = 0; iter < itersPerBank; ++iter) {
+        for (Operation *op : linearOps) {
+          if (op == reduceProducer)
+            continue;
+          int64_t lat = getComputeLatency(op);
+          int64_t start = cursor;
+          int64_t end = start + lat;
+          if (auto mul = dyn_cast<MulIOp>(op)) {
+            pushMuli(getSliceBitwidth(mul.getLhs()), getSliceBitwidth(mul.getRhs()),
+                     start, end, bank);
+          } else if (auto add = dyn_cast<AddIOp>(op)) {
+            pushAddi(getSliceBitwidth(add.getLhs()), getSliceBitwidth(add.getRhs()),
+                     start, end, bank);
+          }
+          cursor = end;
+        }
+        if (reduceProducer && iter > 0) {
+          int64_t start = cursor;
+          int64_t end = start + reduceLatency;
+          if (auto add = dyn_cast<AddIOp>(reduceProducer)) {
+            pushAddi(getSliceBitwidth(add.getLhs()), getSliceBitwidth(add.getRhs()),
+                     start, end, bank);
+          } else if (auto mul = dyn_cast<MulIOp>(reduceProducer)) {
+            pushMuli(getSliceBitwidth(mul.getLhs()), getSliceBitwidth(mul.getRhs()),
+                     start, end, bank);
+          }
+          cursor = end;
+        }
+      }
+      bankReady[bank] = cursor;
+    }
+
+    auto treeAttr = forOp->getAttrOfType<ArrayAttr>("bits.reduce_tree");
+    if (!treeAttr || !reduceProducer)
+      return;
+
+    for (Attribute levelAttr : treeAttr) {
+      auto level = dyn_cast<ArrayAttr>(levelAttr);
+      if (!level)
+        continue;
+      for (Attribute pairAttr : level) {
+        auto pair = dyn_cast<DictionaryAttr>(pairAttr);
+        if (!pair)
+          continue;
+        auto srcAttr = dyn_cast_or_null<IntegerAttr>(pair.get("src_bank"));
+        auto dstAttr = dyn_cast_or_null<IntegerAttr>(pair.get("dst_bank"));
+        if (!srcAttr || !dstAttr)
+          continue;
+        int64_t srcBank = srcAttr.getInt();
+        int64_t dstBank = dstAttr.getInt();
+        int64_t copyStart = bankReady[srcBank];
+        int64_t copyEnd = copyStart + rowCopyLatency;
+        pushRowCopy(srcBank, dstBank, reduceBitwidth, copyStart, copyEnd);
+        int64_t addStart = std::max<int64_t>(bankReady[dstBank], copyEnd);
+        int64_t addEnd = addStart + reduceLatency;
+        if (auto add = dyn_cast<AddIOp>(reduceProducer)) {
+          pushAddi(getSliceBitwidth(add.getLhs()), getSliceBitwidth(add.getRhs()),
+                   addStart, addEnd, dstBank);
+        } else if (auto mul = dyn_cast<MulIOp>(reduceProducer)) {
+          pushMuli(getSliceBitwidth(mul.getLhs()), getSliceBitwidth(mul.getRhs()),
+                   addStart, addEnd, dstBank);
+        }
+        bankReady[dstBank] = addEnd;
+      }
+    }
+  });
+
+  llvm::stable_sort(events, [](const FlattenedEvent &lhs, const FlattenedEvent &rhs) {
+    if (lhs.start != rhs.start)
+      return lhs.start < rhs.start;
+    return lhs.end < rhs.end;
+  });
+
+  // llvm::outs() << "=== flattened-op-sequence ===\n";
+  // for (const FlattenedEvent &event : events) {
+  //   switch (event.kind) {
+  //   case FlattenedEvent::Kind::Muli:
+  //     llvm::outs() << "muli(lhs_bw=" << event.muli.lhsBitwidth
+  //                  << ", rhs_bw=" << event.muli.rhsBitwidth
+  //                  << ", start=" << event.muli.start
+  //                  << ", end=" << event.muli.end
+  //                  << ", bank=" << event.muli.bankId << ")\n";
+  //     break;
+  //   case FlattenedEvent::Kind::Addi:
+  //     llvm::outs() << "addi(lhs_bw=" << event.addi.lhsBitwidth
+  //                  << ", rhs_bw=" << event.addi.rhsBitwidth
+  //                  << ", start=" << event.addi.start
+  //                  << ", end=" << event.addi.end
+  //                  << ", bank=" << event.addi.bankId << ")\n";
+  //     break;
+  //   case FlattenedEvent::Kind::RowCopy:
+  //     llvm::outs() << "row_copy(src_bank=" << event.rowCopy.srcBankId
+  //                  << ", dst_bank=" << event.rowCopy.dstBankId
+  //                  << ", bitwidth=" << event.rowCopy.bitwidth
+  //                  << ", start=" << event.rowCopy.start
+  //                  << ", end=" << event.rowCopy.end << ")\n";
+  //     break;
+  //   }
+  // }
+
+  llvm::outs() << "=== flattened-op-sequence-grouped-by-start ===\n";
+  for (const auto &[startTime, sameStartEvents] : eventsByStartTime) {
+    llvm::outs() << "start_time=" << startTime << ":\n";
+    for (const FlattenedEvent &event : sameStartEvents) {
+      switch (event.kind) {
+      case FlattenedEvent::Kind::Muli:
+        llvm::outs() << "  muli(lhs_bw=" << event.muli.lhsBitwidth
+                     << ", rhs_bw=" << event.muli.rhsBitwidth
+                     << ", start=" << event.muli.start
+                     << ", end=" << event.muli.end
+                     << ", bank=" << event.muli.bankId << ")\n";
+        break;
+      case FlattenedEvent::Kind::Addi:
+        llvm::outs() << "  addi(lhs_bw=" << event.addi.lhsBitwidth
+                     << ", rhs_bw=" << event.addi.rhsBitwidth
+                     << ", start=" << event.addi.start
+                     << ", end=" << event.addi.end
+                     << ", bank=" << event.addi.bankId << ")\n";
+        break;
+      case FlattenedEvent::Kind::RowCopy:
+        llvm::outs() << "  row_copy(src_bank=" << event.rowCopy.srcBankId
+                     << ", dst_bank=" << event.rowCopy.dstBankId
+                     << ", bitwidth=" << event.rowCopy.bitwidth
+                     << ", start=" << event.rowCopy.start
+                     << ", end=" << event.rowCopy.end << ")\n";
+        break;
+      }
+    }
+  }
 }
 
 static FailureOr<int64_t> getConstTripCount(scf::ForOp forOp) {
@@ -980,6 +1271,8 @@ struct BitsOptimiseMappingPass
         if (reduceProducer && isSupportedBitsSliceComputeOp(reduceProducer))
           reduceProducer->setAttr("bits.is_reduce_op", UnitAttr::get(ctx));
       });
+
+      dumpFlattenedEventSequence(func);
     } catch (GRBException &e) {
       std::cerr << "Gurobi error: " << e.getMessage() << "\n";
     } catch (std::exception &ex) {
