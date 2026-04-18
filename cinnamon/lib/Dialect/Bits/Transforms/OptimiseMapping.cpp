@@ -168,6 +168,9 @@ static int64_t getComputeLatency(Operation *op) {
 
 static FailureOr<int64_t> getConstTripCount(scf::ForOp forOp);
 static SmallVector<int64_t> buildBankGroup(int64_t baseBank, int64_t numBanks);
+static bool isSliceReductionFor(scf::ForOp forOp);
+static int64_t estimatePeakBanksPerIteration(scf::ForOp forOp);
+static int64_t estimateBestParallelBanksForLoop(scf::ForOp forOp);
 
 static bool isMuliOrAddi(Operation *op) {
   return isa<MulIOp>(op) || isa<AddIOp>(op);
@@ -208,32 +211,56 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
     eventsByStartTime[evt.start].push_back(evt);
   };
 
-  auto pushMuli = [&](int64_t lhsBw, int64_t rhsBw, int64_t start, int64_t end,
-                      int64_t bank) {
-    FlattenedEvent evt;
-    evt.kind = FlattenedEvent::Kind::Muli;
-    evt.start = start;
-    evt.end = end;
-    evt.muli = MuliEvent{lhsBw, rhsBw, start, end, bank};
-    recordEvent(evt);
+  auto getAncestorWaveRepeat = [&](scf::ForOp forOp) {
+    int64_t repeat = 1;
+    for (Operation *parent = forOp->getParentOp(); parent;
+         parent = parent->getParentOp()) {
+      auto parentFor = dyn_cast<scf::ForOp>(parent);
+      if (!parentFor)
+        continue;
+      auto tripMaybe = getConstTripCount(parentFor);
+      if (failed(tripMaybe))
+        continue;
+      int64_t tripCount = *tripMaybe;
+      int64_t banksPerIter = 1;
+      if (isSliceReductionFor(parentFor)) {
+        banksPerIter =
+            std::max<int64_t>(1, estimateBestParallelBanksForLoop(parentFor));
+      } else {
+        banksPerIter =
+            std::max<int64_t>(1, estimatePeakBanksPerIteration(parentFor));
+      }
+      int64_t concurrentIters = std::max<int64_t>(1, kNumBanks / banksPerIter);
+      int64_t waves = std::max<int64_t>(1, (tripCount + concurrentIters - 1) / concurrentIters);
+      if (repeat > std::numeric_limits<int64_t>::max() / waves)
+        return std::numeric_limits<int64_t>::max();
+      repeat *= waves;
+    }
+    return repeat;
   };
-  auto pushAddi = [&](int64_t lhsBw, int64_t rhsBw, int64_t start, int64_t end,
-                      int64_t bank) {
-    FlattenedEvent evt;
-    evt.kind = FlattenedEvent::Kind::Addi;
-    evt.start = start;
-    evt.end = end;
-    evt.addi = AddiEvent{lhsBw, rhsBw, start, end, bank};
-    recordEvent(evt);
-  };
-  auto pushRowCopy = [&](int64_t srcBank, int64_t dstBank, int64_t bw,
-                         int64_t start, int64_t end) {
-    FlattenedEvent evt;
-    evt.kind = FlattenedEvent::Kind::RowCopy;
-    evt.start = start;
-    evt.end = end;
-    evt.rowCopy = RowCopyEvent{srcBank, dstBank, bw, start, end};
-    recordEvent(evt);
+
+  auto getNearestAncestorConcurrentGroups = [&](scf::ForOp forOp,
+                                                int64_t banksPerGroup) {
+    for (Operation *parent = forOp->getParentOp(); parent;
+         parent = parent->getParentOp()) {
+      auto parentFor = dyn_cast<scf::ForOp>(parent);
+      if (!parentFor)
+        continue;
+      auto tripMaybe = getConstTripCount(parentFor);
+      if (failed(tripMaybe))
+        return int64_t{1};
+      int64_t tripCount = *tripMaybe;
+      int64_t parentParallel = tripCount;
+      if (auto pf =
+              parentFor->getAttrOfType<IntegerAttr>("bits.parallel_factor")) {
+        parentParallel = std::max<int64_t>(1, pf.getInt());
+      }
+      int64_t bankLimited =
+          std::max<int64_t>(1, kNumBanks / std::max<int64_t>(1, banksPerGroup));
+      return std::max<int64_t>(
+          1, std::min<int64_t>({tripCount, parentParallel, bankLimited}));
+    }
+    return int64_t{1};
   };
 
   func.walk([&](scf::ForOp forOp) {
@@ -247,7 +274,6 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
     int64_t parallelFactor = 1;
     if (auto pf = forOp->getAttrOfType<IntegerAttr>("bits.parallel_factor"))
       parallelFactor = std::max<int64_t>(1, pf.getInt());
-    int64_t itersPerBank = std::max<int64_t>(1, tripCount / parallelFactor);
 
     int64_t baseBank = 0;
     if (auto b = forOp->getAttrOfType<IntegerAttr>("bits.bank_id"))
@@ -260,6 +286,10 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
     } else {
       activeBanks = buildBankGroup(baseBank, parallelFactor);
     }
+    int64_t effectiveParallel =
+        std::max<int64_t>(1, static_cast<int64_t>(activeBanks.size()));
+    int64_t itersPerBank = std::max<int64_t>(
+        1, (tripCount + effectiveParallel - 1) / effectiveParallel);
 
     Operation *reduceProducer = nullptr;
     if (auto yield = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator())) {
@@ -279,6 +309,7 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
     DenseMap<int64_t, int64_t> bankReady;
     for (int64_t bank : activeBanks)
       bankReady[bank] = 0;
+    SmallVector<FlattenedEvent> localEvents;
 
     int64_t reduceBitwidth = 0;
     int64_t reduceLatency = 0;
@@ -299,11 +330,21 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
           int64_t start = cursor;
           int64_t end = start + lat;
           if (auto mul = dyn_cast<MulIOp>(op)) {
-            pushMuli(getSliceBitwidth(mul.getLhs()), getSliceBitwidth(mul.getRhs()),
-                     start, end, bank);
+            FlattenedEvent evt;
+            evt.kind = FlattenedEvent::Kind::Muli;
+            evt.start = start;
+            evt.end = end;
+            evt.muli = MuliEvent{getSliceBitwidth(mul.getLhs()),
+                                 getSliceBitwidth(mul.getRhs()), start, end, bank};
+            localEvents.push_back(evt);
           } else if (auto add = dyn_cast<AddIOp>(op)) {
-            pushAddi(getSliceBitwidth(add.getLhs()), getSliceBitwidth(add.getRhs()),
-                     start, end, bank);
+            FlattenedEvent evt;
+            evt.kind = FlattenedEvent::Kind::Addi;
+            evt.start = start;
+            evt.end = end;
+            evt.addi = AddiEvent{getSliceBitwidth(add.getLhs()),
+                                 getSliceBitwidth(add.getRhs()), start, end, bank};
+            localEvents.push_back(evt);
           }
           cursor = end;
         }
@@ -311,11 +352,21 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
           int64_t start = cursor;
           int64_t end = start + reduceLatency;
           if (auto add = dyn_cast<AddIOp>(reduceProducer)) {
-            pushAddi(getSliceBitwidth(add.getLhs()), getSliceBitwidth(add.getRhs()),
-                     start, end, bank);
+            FlattenedEvent evt;
+            evt.kind = FlattenedEvent::Kind::Addi;
+            evt.start = start;
+            evt.end = end;
+            evt.addi = AddiEvent{getSliceBitwidth(add.getLhs()),
+                                 getSliceBitwidth(add.getRhs()), start, end, bank};
+            localEvents.push_back(evt);
           } else if (auto mul = dyn_cast<MulIOp>(reduceProducer)) {
-            pushMuli(getSliceBitwidth(mul.getLhs()), getSliceBitwidth(mul.getRhs()),
-                     start, end, bank);
+            FlattenedEvent evt;
+            evt.kind = FlattenedEvent::Kind::Muli;
+            evt.start = start;
+            evt.end = end;
+            evt.muli = MuliEvent{getSliceBitwidth(mul.getLhs()),
+                                 getSliceBitwidth(mul.getRhs()), start, end, bank};
+            localEvents.push_back(evt);
           }
           cursor = end;
         }
@@ -324,36 +375,87 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
     }
 
     auto treeAttr = forOp->getAttrOfType<ArrayAttr>("bits.reduce_tree");
-    if (!treeAttr || !reduceProducer)
-      return;
-
-    for (Attribute levelAttr : treeAttr) {
-      auto level = dyn_cast<ArrayAttr>(levelAttr);
-      if (!level)
-        continue;
-      for (Attribute pairAttr : level) {
-        auto pair = dyn_cast<DictionaryAttr>(pairAttr);
-        if (!pair)
+    if (treeAttr && reduceProducer) {
+      for (Attribute levelAttr : treeAttr) {
+        auto level = dyn_cast<ArrayAttr>(levelAttr);
+        if (!level)
           continue;
-        auto srcAttr = dyn_cast_or_null<IntegerAttr>(pair.get("src_bank"));
-        auto dstAttr = dyn_cast_or_null<IntegerAttr>(pair.get("dst_bank"));
-        if (!srcAttr || !dstAttr)
-          continue;
-        int64_t srcBank = srcAttr.getInt();
-        int64_t dstBank = dstAttr.getInt();
-        int64_t copyStart = bankReady[srcBank];
-        int64_t copyEnd = copyStart + rowCopyLatency;
-        pushRowCopy(srcBank, dstBank, reduceBitwidth, copyStart, copyEnd);
-        int64_t addStart = std::max<int64_t>(bankReady[dstBank], copyEnd);
-        int64_t addEnd = addStart + reduceLatency;
-        if (auto add = dyn_cast<AddIOp>(reduceProducer)) {
-          pushAddi(getSliceBitwidth(add.getLhs()), getSliceBitwidth(add.getRhs()),
-                   addStart, addEnd, dstBank);
-        } else if (auto mul = dyn_cast<MulIOp>(reduceProducer)) {
-          pushMuli(getSliceBitwidth(mul.getLhs()), getSliceBitwidth(mul.getRhs()),
-                   addStart, addEnd, dstBank);
+        for (Attribute pairAttr : level) {
+          auto pair = dyn_cast<DictionaryAttr>(pairAttr);
+          if (!pair)
+            continue;
+          auto srcAttr = dyn_cast_or_null<IntegerAttr>(pair.get("src_bank"));
+          auto dstAttr = dyn_cast_or_null<IntegerAttr>(pair.get("dst_bank"));
+          if (!srcAttr || !dstAttr)
+            continue;
+          int64_t srcBank = srcAttr.getInt();
+          int64_t dstBank = dstAttr.getInt();
+          int64_t copyStart = bankReady[srcBank];
+          int64_t copyEnd = copyStart + rowCopyLatency;
+          FlattenedEvent copyEvt;
+          copyEvt.kind = FlattenedEvent::Kind::RowCopy;
+          copyEvt.start = copyStart;
+          copyEvt.end = copyEnd;
+          copyEvt.rowCopy = RowCopyEvent{srcBank, dstBank, reduceBitwidth, copyStart, copyEnd};
+          localEvents.push_back(copyEvt);
+          int64_t addStart = std::max<int64_t>(bankReady[dstBank], copyEnd);
+          int64_t addEnd = addStart + reduceLatency;
+          if (auto add = dyn_cast<AddIOp>(reduceProducer)) {
+            FlattenedEvent evt;
+            evt.kind = FlattenedEvent::Kind::Addi;
+            evt.start = addStart;
+            evt.end = addEnd;
+            evt.addi = AddiEvent{getSliceBitwidth(add.getLhs()),
+                                 getSliceBitwidth(add.getRhs()), addStart, addEnd, dstBank};
+            localEvents.push_back(evt);
+          } else if (auto mul = dyn_cast<MulIOp>(reduceProducer)) {
+            FlattenedEvent evt;
+            evt.kind = FlattenedEvent::Kind::Muli;
+            evt.start = addStart;
+            evt.end = addEnd;
+            evt.muli = MuliEvent{getSliceBitwidth(mul.getLhs()),
+                                 getSliceBitwidth(mul.getRhs()), addStart, addEnd, dstBank};
+            localEvents.push_back(evt);
+          }
+          bankReady[dstBank] = addEnd;
         }
-        bankReady[dstBank] = addEnd;
+      }
+    }
+
+    int64_t localLatency = 0;
+    for (const FlattenedEvent &evt : localEvents)
+      localLatency = std::max<int64_t>(localLatency, evt.end);
+    int64_t bankGroupStride =
+        std::max<int64_t>(1, estimateBestParallelBanksForLoop(forOp));
+    int64_t groupsPerWave =
+        getNearestAncestorConcurrentGroups(forOp, bankGroupStride);
+    int64_t repeatCount = std::max<int64_t>(1, getAncestorWaveRepeat(forOp));
+    for (int64_t wave = 0; wave < repeatCount; ++wave) {
+      int64_t offset = wave * localLatency;
+      for (int64_t group = 0; group < groupsPerWave; ++group) {
+        int64_t bankOffset = group * bankGroupStride;
+        for (const FlattenedEvent &evt : localEvents) {
+          FlattenedEvent shifted = evt;
+          shifted.start += offset;
+          shifted.end += offset;
+          if (shifted.kind == FlattenedEvent::Kind::Muli) {
+            shifted.muli.start = shifted.start;
+            shifted.muli.end = shifted.end;
+            shifted.muli.bankId = (shifted.muli.bankId + bankOffset) % kNumBanks;
+          } else if (shifted.kind == FlattenedEvent::Kind::Addi) {
+            shifted.addi.start = shifted.start;
+            shifted.addi.end = shifted.end;
+            shifted.addi.bankId = (shifted.addi.bankId + bankOffset) % kNumBanks;
+          } else {
+            shifted.rowCopy.start = shifted.start;
+            shifted.rowCopy.end = shifted.end;
+            shifted.rowCopy.srcBankId =
+                (shifted.rowCopy.srcBankId + bankOffset) % kNumBanks;
+            shifted.rowCopy.dstBankId =
+                (shifted.rowCopy.dstBankId + bankOffset) % kNumBanks;
+          }
+          recordEvent(shifted);
+        }
       }
     }
   });
@@ -481,10 +583,13 @@ static int64_t estimateForLatency(scf::ForOp forOp) {
     return 0;
 
   if (!isSliceReductionFor(forOp)) {
-    // Non-reduction loops (both nested and non-nested) can be fully parallelized
-    // across bank groups: each outer iteration runs independently on its own bank
-    // group. Use ceil(tripCount / kNumBanks) to model available parallelism.
-    return bodyLatency * ((tripCount + kNumBanks - 1) / kNumBanks);
+    // Non-reduction loops can run multiple iterations in parallel, but each
+    // iteration may consume more than one bank when the body contains nested
+    // parallel/reduction loops. Bound throughput by the per-iteration bank
+    // footprint inferred from nested loop planning.
+    int64_t banksPerIter = std::max<int64_t>(1, estimatePeakBanksPerIteration(forOp));
+    int64_t concurrentIters = std::max<int64_t>(1, kNumBanks / banksPerIter);
+    return bodyLatency * ((tripCount + concurrentIters - 1) / concurrentIters);
   }
 
   auto yield = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
@@ -514,6 +619,17 @@ static int64_t estimateForLatency(scf::ForOp forOp) {
     best = std::min(best, local + reduceCost);
   }
   return best == std::numeric_limits<int64_t>::max() ? 0 : best;
+}
+
+static int64_t estimatePeakBanksPerIteration(scf::ForOp forOp) {
+  int64_t peakBanks = 1;
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (auto innerFor = dyn_cast<scf::ForOp>(&op)) {
+      peakBanks = std::max<int64_t>(
+          peakBanks, std::max<int64_t>(1, estimateBestParallelBanksForLoop(innerFor)));
+    }
+  }
+  return peakBanks;
 }
 
 static int64_t estimateBestParallelBanksForLoop(scf::ForOp forOp) {
