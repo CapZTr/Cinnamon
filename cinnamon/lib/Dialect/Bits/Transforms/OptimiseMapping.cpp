@@ -4,6 +4,8 @@
 #include "gurobi_c.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <exception>
 #include <iostream>
 #include <algorithm>
@@ -202,6 +204,33 @@ static SmallVector<int64_t> getReduceBanksFromAttr(scf::ForOp forOp) {
   llvm::sort(banks);
   return banks;
 }
+
+// Binary trace file layout (shared with C reader).
+// Header: 32 bytes
+struct TraceHeader {
+  char     magic[8];      // "CIMTRACE"
+  uint32_t version;       // = 1
+  uint32_t record_size;   // = sizeof(TraceRecord) = 24
+  uint64_t num_records;
+  int64_t  last_end_time;
+};
+static_assert(sizeof(TraceHeader) == 32, "TraceHeader size mismatch");
+ 
+// Record: 32 bytes, one entry per merged event (MULI/ADDI) or per edge (ROWCOPY).
+// MULI/ADDI banks are encoded as a bitmask in `banks` (kNumBanks==32 fits uint32_t).
+// ROWCOPY emits one record per (src,dst) edge; `banks` is unused (0).
+struct TraceRecord {
+  int64_t  start;      // offset  0, 8B: cycle start
+  int64_t  end;        // offset  8, 8B: cycle end
+  uint32_t banks;      // offset 16, 4B: MULI/ADDI bank bitmask; 0 for ROWCOPY
+  uint16_t lhs_bw;     // offset 20, 2B: MULI/ADDI→lhsBitwidth, ROWCOPY→bitwidth
+  uint16_t rhs_bw;     // offset 22, 2B: MULI/ADDI→rhsBitwidth, ROWCOPY→0
+  uint8_t  kind;       // offset 24, 1B: 0=MULI, 1=ADDI, 2=ROWCOPY
+  uint8_t  src;        // offset 25, 1B: ROWCOPY→srcBank, others→0
+  uint8_t  dst;        // offset 26, 1B: ROWCOPY→dstBank, others→0
+  uint8_t  pad[5];     // offset 27, 5B: explicit pad to 32 bytes
+};
+static_assert(sizeof(TraceRecord) == 32, "TraceRecord size mismatch");
 
 static void dumpFlattenedEventSequence(func::FuncOp func) {
   std::map<int64_t, std::vector<FlattenedEvent>> eventsByStartTime;
@@ -548,62 +577,84 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
   //   }
   // }
 
-  int64_t lastEventEndTime = 0;
-  int64_t eventId = 0;
-  bool hasPrintedEvent = false;
+  constexpr size_t kTraceBufCap = 1u << 16; // 64 K records per fwrite
+  std::vector<TraceRecord> traceBuf(kTraceBufCap);
+  size_t   traceBufLen  = 0;
+  uint64_t totalRecords = 0;
+  int64_t  lastEndTime  = 0;
+ 
+  const char *tracePath =
+      "/home/tianruiz/cimdram/traces/trace.bin";
+  FILE *traceFp = std::fopen(tracePath, "wb");
+  if (!traceFp) {
+    llvm::errs() << "error: cannot open trace file: " << tracePath << "\n";
+    return;
+  }
+ 
+  // Write placeholder header; num_records / last_end_time filled in at end.
+  TraceHeader hdr{};
+  std::memcpy(hdr.magic, "CIMTRACE", 8);
+  hdr.version     = 1;
+  hdr.record_size = static_cast<uint32_t>(sizeof(TraceRecord));
+  std::fwrite(&hdr, sizeof(TraceHeader), 1, traceFp);
+ 
+  auto traceFlush = [&]() {
+    std::fwrite(traceBuf.data(), sizeof(TraceRecord), traceBufLen, traceFp);
+    totalRecords += traceBufLen;
+    traceBufLen = 0;
+  };
+  auto traceEmit = [&](TraceRecord r) {
+    traceBuf[traceBufLen++] = r;
+    if (traceBufLen == kTraceBufCap)
+      traceFlush();
+  };
+
   for (const auto &[startTime, sameStartEvents] : eventsByStartTime) {
     (void)startTime;
     for (const FlattenedEvent &event : sameStartEvents) {
+      TraceRecord r{};
+      r.start = event.start;
+      r.end   = event.end;
       switch (event.kind) {
       case FlattenedEvent::Kind::Muli:
-        {
-        SmallVector<int64_t> banks = event.muli.banks;
-        llvm::sort(banks);
-        llvm::outs() << eventId << " muli(lhs_bw=" << event.muli.lhsBitwidth
-                     << ", rhs_bw=" << event.muli.rhsBitwidth
-                     << ", banks=[";
-        for (size_t i = 0; i < banks.size(); ++i) {
-          if (i)
-            llvm::outs() << ", ";
-          llvm::outs() << banks[i];
-        }
-        llvm::outs() << "])\n";
+        r.kind   = 0;
+        r.lhs_bw = static_cast<uint16_t>(event.muli.lhsBitwidth);
+        r.rhs_bw = static_cast<uint16_t>(event.muli.rhsBitwidth);
+        for (int64_t bank : event.muli.banks)
+          r.banks |= (1u << bank);  // fold all banks into bitmask, one record
+        traceEmit(r);
         break;
-        }
       case FlattenedEvent::Kind::Addi:
-        {
-        SmallVector<int64_t> banks = event.addi.banks;
-        llvm::sort(banks);
-        llvm::outs() << eventId << " addi(lhs_bw=" << event.addi.lhsBitwidth
-                     << ", rhs_bw=" << event.addi.rhsBitwidth
-                     << ", banks=[";
-        for (size_t i = 0; i < banks.size(); ++i) {
-          if (i)
-            llvm::outs() << ", ";
-          llvm::outs() << banks[i];
-        }
-        llvm::outs() << "])\n";
+        r.kind   = 1;
+        r.lhs_bw = static_cast<uint16_t>(event.addi.lhsBitwidth);
+        r.rhs_bw = static_cast<uint16_t>(event.addi.rhsBitwidth);
+        for (int64_t bank : event.addi.banks)
+          r.banks |= (1u << bank);  // fold all banks into bitmask, one record
+        traceEmit(r);
         break;
-        }
       case FlattenedEvent::Kind::RowCopy:
-        llvm::outs() << eventId << " row_copy(edges=[";
-        for (size_t i = 0; i < event.rowCopy.edges.size(); ++i) {
-          if (i)
-            llvm::outs() << ", ";
-          llvm::outs() << "[" << event.rowCopy.edges[i].first << ", "
-                       << event.rowCopy.edges[i].second << "]";
+        r.kind   = 2;
+        r.lhs_bw = static_cast<uint16_t>(event.rowCopy.bitwidth);
+        for (const auto &[src, dst] : event.rowCopy.edges) {
+          r.src = static_cast<uint8_t>(src);
+          r.dst = static_cast<uint8_t>(dst);
+          traceEmit(r);  // one record per edge (edges carry pairing info)
         }
-        llvm::outs() << "], bitwidth=" << event.rowCopy.bitwidth
-                     << ")\n";
         break;
       }
-      lastEventEndTime = event.end;
-      hasPrintedEvent = true;
-      eventId++;
+      lastEndTime = event.end;
     }
   }
-  if (hasPrintedEvent)
-    llvm::outs() << "last_end_time=" << lastEventEndTime << "\n";
+  traceFlush();
+ 
+  // Back-fill header with final counts.
+  hdr.num_records   = totalRecords;
+  hdr.last_end_time = lastEndTime;
+  std::rewind(traceFp);
+  std::fwrite(&hdr, sizeof(TraceHeader), 1, traceFp);
+  std::fclose(traceFp);
+
+  llvm::outs() << "last_end_time=" << lastEndTime << "\n";
 }
 
 static FailureOr<int64_t> getConstTripCount(scf::ForOp forOp) {
