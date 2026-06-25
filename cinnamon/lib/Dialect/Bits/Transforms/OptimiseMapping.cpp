@@ -41,8 +41,12 @@ namespace mlir::bits {
 
 //===----------------------------------------------------------------------===//
 
-constexpr int64_t kNumBanks = 32;
+constexpr int64_t kNumBanks = 128;
 constexpr int64_t kCloneCostPerBit = 14;
+// Width (in vector lanes / columns) of one bank row. Independent same-kind,
+// same-bitwidth ops whose vector lengths sum to <= this value can be packed
+// into a single bank row and executed as one concurrent SIMD wave.
+constexpr int64_t kBankRowWidth = 8192;
 constexpr bool kEnableVerboseMappingLog = true;
 
 struct Node {
@@ -151,6 +155,34 @@ static int64_t getSliceBitwidth(Value value) {
   return sliceTy ? sliceTy.getBitWidth() : 0;
 }
 
+static int64_t getSliceVectorLength(Value value) {
+  auto sliceTy = dyn_cast<SliceType>(value.getType());
+  return sliceTy ? sliceTy.getVectorLength() : 0;
+}
+
+// Identifies whether two ops may share a bank row and run concurrently. Only
+// add/mul are packable, and two ops pack only when their signatures match
+// exactly (same kind and same operand bitwidths) so that they have identical
+// compute latency and execute in lockstep. `kind` < 0 means "not packable".
+struct PackSignature {
+  int kind = -1; // 0 = bits.addi, 1 = bits.muli
+  int64_t lhsBitwidth = 0;
+  int64_t rhsBitwidth = 0;
+  bool packable() const { return kind >= 0; }
+  bool operator==(const PackSignature &o) const {
+    return kind == o.kind && lhsBitwidth == o.lhsBitwidth &&
+           rhsBitwidth == o.rhsBitwidth;
+  }
+};
+
+static PackSignature getPackSignature(Operation *op) {
+  if (auto add = dyn_cast<AddIOp>(op))
+    return {0, getSliceBitwidth(add.getLhs()), getSliceBitwidth(add.getRhs())};
+  if (auto mul = dyn_cast<MulIOp>(op))
+    return {1, getSliceBitwidth(mul.getLhs()), getSliceBitwidth(mul.getRhs())};
+  return {};
+}
+
 static int64_t getComputeLatency(Operation *op) {
   if (auto add = dyn_cast<AddIOp>(op))
     return 8 * getSliceBitwidth(add.getResult());
@@ -174,6 +206,7 @@ static SmallVector<int64_t> buildBankGroup(int64_t baseBank, int64_t numBanks);
 static bool isSliceReductionFor(scf::ForOp forOp);
 static int64_t estimatePeakBanksPerIteration(scf::ForOp forOp);
 static int64_t estimateBestParallelBanksForLoop(scf::ForOp forOp);
+static int64_t getLoopPackFactor(scf::ForOp forOp);
 
 static bool isMuliOrAddi(Operation *op) {
   return isa<MulIOp>(op) || isa<AddIOp>(op);
@@ -210,27 +243,28 @@ static SmallVector<int64_t> getReduceBanksFromAttr(scf::ForOp forOp) {
 struct TraceHeader {
   char     magic[8];      // "CIMTRACE"
   uint32_t version;       // = 1
-  uint32_t record_size;   // = sizeof(TraceRecord) = 24
+  uint32_t record_size;   // = sizeof(TraceRecord) = 48
   uint64_t num_records;
   int64_t  last_end_time;
 };
 static_assert(sizeof(TraceHeader) == 32, "TraceHeader size mismatch");
- 
-// Record: 32 bytes, one entry per merged event (MULI/ADDI) or per edge (ROWCOPY).
-// MULI/ADDI banks are encoded as a bitmask in `banks` (kNumBanks==32 fits uint32_t).
+
+// Record: 48 bytes, one entry per merged event (MULI/ADDI) or per edge (ROWCOPY).
+// MULI/ADDI banks are encoded as a 128-bit bitmask in `banks` (covers
+// kNumBanks up to 128): bit b lives in banks[b>>6] at position (b&63).
 // ROWCOPY emits one record per (src,dst) edge; `banks` is unused (0).
 struct TraceRecord {
-  int64_t  start;      // offset  0, 8B: cycle start
-  int64_t  end;        // offset  8, 8B: cycle end
-  uint32_t banks;      // offset 16, 4B: MULI/ADDI bank bitmask; 0 for ROWCOPY
-  uint16_t lhs_bw;     // offset 20, 2B: MULI/ADDI→lhsBitwidth, ROWCOPY→bitwidth
-  uint16_t rhs_bw;     // offset 22, 2B: MULI/ADDI→rhsBitwidth, ROWCOPY→0
-  uint8_t  kind;       // offset 24, 1B: 0=MULI, 1=ADDI, 2=ROWCOPY
-  uint8_t  src;        // offset 25, 1B: ROWCOPY→srcBank, others→0
-  uint8_t  dst;        // offset 26, 1B: ROWCOPY→dstBank, others→0
-  uint8_t  pad[5];     // offset 27, 5B: explicit pad to 32 bytes
+  int64_t  start;      // offset  0,  8B: cycle start
+  int64_t  end;        // offset  8,  8B: cycle end
+  uint64_t banks[2];   // offset 16, 16B: 128-bit MULI/ADDI bank bitmask; 0 for ROWCOPY
+  uint16_t lhs_bw;     // offset 32,  2B: MULI/ADDI→lhsBitwidth, ROWCOPY→bitwidth
+  uint16_t rhs_bw;     // offset 34,  2B: MULI/ADDI→rhsBitwidth, ROWCOPY→0
+  uint8_t  kind;       // offset 36,  1B: 0=MULI, 1=ADDI, 2=ROWCOPY
+  uint8_t  src;        // offset 37,  1B: ROWCOPY→srcBank (0..127), others→0
+  uint8_t  dst;        // offset 38,  1B: ROWCOPY→dstBank (0..127), others→0
+  uint8_t  pad[9];     // offset 39,  9B: explicit pad to 48 bytes
 };
-static_assert(sizeof(TraceRecord) == 32, "TraceRecord size mismatch");
+static_assert(sizeof(TraceRecord) == 48, "TraceRecord size mismatch");
 
 static void dumpFlattenedEventSequence(func::FuncOp func) {
   std::map<int64_t, std::vector<FlattenedEvent>> eventsByStartTime;
@@ -359,6 +393,13 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
         std::max<int64_t>(1, static_cast<int64_t>(activeBanks.size()));
     int64_t itersPerBank = std::max<int64_t>(
         1, (tripCount + effectiveParallel - 1) / effectiveParallel);
+    // Intra-bank SIMD packing: P independent iterations share one bank row and
+    // execute as a single full-row wave, so each bank runs ceil(itersPerBank/P)
+    // waves and then folds the P packed lanes (ceil(log2 P) levels).
+    int64_t packFactor = getLoopPackFactor(forOp);
+    int64_t wavesPerBank = (itersPerBank + packFactor - 1) / packFactor;
+    int64_t foldLevels =
+        packFactor > 1 ? (int64_t)llvm::Log2_64_Ceil(packFactor) : 0;
 
     Operation *reduceProducer = nullptr;
     if (auto yield = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator())) {
@@ -391,7 +432,7 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
 
     for (int64_t bank : activeBanks) {
       int64_t cursor = bankReady[bank];
-      for (int64_t iter = 0; iter < itersPerBank; ++iter) {
+      for (int64_t wave = 0; wave < wavesPerBank; ++wave) {
         for (Operation *op : linearOps) {
           if (op == reduceProducer)
             continue;
@@ -423,7 +464,7 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
           }
           cursor = end;
         }
-        if (reduceProducer && iter > 0) {
+        if (reduceProducer && wave > 0) {
           int64_t start = cursor;
           int64_t end = start + reduceLatency;
           if (auto add = dyn_cast<AddIOp>(reduceProducer)) {
@@ -450,6 +491,50 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
             localEvents.push_back(evt);
           }
           cursor = end;
+        }
+      }
+      // Intra-bank fold of the P packed lanes into one partial sum before the
+      // inter-bank tree. Each level is a cost-proxy intra-bank row copy
+      // (src == dst bank) plus one reduce op (decision: reuse cross-bank cost).
+      if (reduceProducer && isMuliOrAddi(reduceProducer)) {
+        for (int64_t level = 0; level < foldLevels; ++level) {
+          int64_t copyStart = cursor;
+          int64_t copyEnd = copyStart + rowCopyLatency;
+          FlattenedEvent copyEvt;
+          copyEvt.kind = FlattenedEvent::Kind::RowCopy;
+          copyEvt.start = copyStart;
+          copyEvt.end = copyEnd;
+          copyEvt.rowCopy.bitwidth = reduceBitwidth;
+          copyEvt.rowCopy.start = copyStart;
+          copyEvt.rowCopy.end = copyEnd;
+          copyEvt.rowCopy.edges.push_back({bank, bank});
+          localEvents.push_back(copyEvt);
+          int64_t addStart = copyEnd;
+          int64_t addEnd = addStart + reduceLatency;
+          if (auto add = dyn_cast<AddIOp>(reduceProducer)) {
+            FlattenedEvent evt;
+            evt.kind = FlattenedEvent::Kind::Addi;
+            evt.start = addStart;
+            evt.end = addEnd;
+            evt.addi.lhsBitwidth = getSliceBitwidth(add.getLhs());
+            evt.addi.rhsBitwidth = getSliceBitwidth(add.getRhs());
+            evt.addi.start = addStart;
+            evt.addi.end = addEnd;
+            evt.addi.banks.push_back(bank);
+            localEvents.push_back(evt);
+          } else if (auto mul = dyn_cast<MulIOp>(reduceProducer)) {
+            FlattenedEvent evt;
+            evt.kind = FlattenedEvent::Kind::Muli;
+            evt.start = addStart;
+            evt.end = addEnd;
+            evt.muli.lhsBitwidth = getSliceBitwidth(mul.getLhs());
+            evt.muli.rhsBitwidth = getSliceBitwidth(mul.getRhs());
+            evt.muli.start = addStart;
+            evt.muli.end = addEnd;
+            evt.muli.banks.push_back(bank);
+            localEvents.push_back(evt);
+          }
+          cursor = addEnd;
         }
       }
       bankReady[bank] = cursor;
@@ -584,7 +669,7 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
   int64_t  lastEndTime  = 0;
  
   const char *tracePath =
-      "/home/tianruiz/cimdram/traces/trace.bin";
+      "/home/tianruiz/papers/cimdram/traces/trace.bin";
   FILE *traceFp = std::fopen(tracePath, "wb");
   if (!traceFp) {
     llvm::errs() << "error: cannot open trace file: " << tracePath << "\n";
@@ -621,7 +706,7 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
         r.lhs_bw = static_cast<uint16_t>(event.muli.lhsBitwidth);
         r.rhs_bw = static_cast<uint16_t>(event.muli.rhsBitwidth);
         for (int64_t bank : event.muli.banks)
-          r.banks |= (1u << bank);  // fold all banks into bitmask, one record
+          r.banks[bank >> 6] |= (1ull << (bank & 63));  // 128-bit bank bitmask
         traceEmit(r);
         break;
       case FlattenedEvent::Kind::Addi:
@@ -629,7 +714,7 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
         r.lhs_bw = static_cast<uint16_t>(event.addi.lhsBitwidth);
         r.rhs_bw = static_cast<uint16_t>(event.addi.rhsBitwidth);
         for (int64_t bank : event.addi.banks)
-          r.banks |= (1u << bank);  // fold all banks into bitmask, one record
+          r.banks[bank >> 6] |= (1ull << (bank & 63));  // 128-bit bank bitmask
         traceEmit(r);
         break;
       case FlattenedEvent::Kind::RowCopy:
@@ -688,6 +773,27 @@ static bool hasNestedForOp(scf::ForOp forOp) {
   return false;
 }
 
+// Intra-bank SIMD packing factor for a leaf slice-reduction loop: how many
+// independent iterations fit side-by-side in one bank row, i.e.
+// floor(kBankRowWidth / V) where V is the widest body op vector length. The
+// P packed iterations compute concurrently as one full-row wave; their P
+// partial sums are then folded within the bank (ceil(log2 P) levels). Returns
+// 1 (no packing) for any non-leaf or non-reduction loop. Scope: leaf
+// slice-reduction loops only.
+static int64_t getLoopPackFactor(scf::ForOp forOp) {
+  if (!isSliceReductionFor(forOp) || hasNestedForOp(forOp))
+    return 1;
+  int64_t maxVecLen = 0;
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (!isMuliOrAddi(&op) || op.getNumResults() == 0)
+      continue;
+    maxVecLen = std::max(maxVecLen, getSliceVectorLength(op.getResult(0)));
+  }
+  if (maxVecLen <= 0)
+    return 1;
+  return std::max<int64_t>(1, kBankRowWidth / maxVecLen);
+}
+
 static int64_t estimateForLatency(scf::ForOp forOp);
 
 static int64_t estimateLoopBodyLatency(scf::ForOp forOp) {
@@ -737,19 +843,25 @@ static int64_t estimateForLatency(scf::ForOp forOp) {
   int64_t reduceBitwidth = getSliceBitwidth(yield.getOperand(0));
   int64_t cloneLatency = kCloneCostPerBit * reduceBitwidth;
 
+  int64_t packFactor = getLoopPackFactor(forOp);
+  int64_t foldLevels =
+      packFactor > 1 ? (int64_t)llvm::Log2_64_Ceil(packFactor) : 0;
+  int64_t foldCost = foldLevels * (cloneLatency + reduceLatency);
+
   int64_t best = std::numeric_limits<int64_t>::max();
   for (int64_t banks = 1; banks <= std::min<int64_t>(tripCount, kNumBanks);
        banks <<= 1) {
     int64_t iterPerBank = (tripCount + banks - 1) / banks;
-    // Each bank: n iterations of pre-reduce work (body minus the reduce op),
-    // then (n-1) intra-bank reductions to fold n partial results into one.
-    // Only after that does inter-bank tree reduction begin.
+    // Each bank runs ceil(iterPerBank / P) packed waves of pre-reduce work,
+    // then (waves - 1) intra-bank reductions across waves, then a ceil(log2 P)
+    // intra-bank fold of the P packed lanes, then inter-bank tree reduction.
+    int64_t wavesPerBank = (iterPerBank + packFactor - 1) / packFactor;
     int64_t preReduceLatency = bodyLatency - reduceLatency;
-    int64_t local = iterPerBank * preReduceLatency
-                  + std::max<int64_t>(0, iterPerBank - 1) * reduceLatency;
+    int64_t local = wavesPerBank * preReduceLatency
+                  + std::max<int64_t>(0, wavesPerBank - 1) * reduceLatency;
     int64_t reduceTreeLevels = llvm::Log2_64(banks);
     int64_t reduceCost = reduceTreeLevels * (cloneLatency + reduceLatency);
-    best = std::min(best, local + reduceCost);
+    best = std::min(best, local + foldCost + reduceCost);
   }
   return best == std::numeric_limits<int64_t>::max() ? 0 : best;
 }
@@ -904,17 +1016,23 @@ static RegionPlan planLeafForRegions(scf::ForOp forOp, int64_t baseBank,
   }
   int64_t cloneLatency = kCloneCostPerBit * reduceBitwidth;
 
+  int64_t packFactor = getLoopPackFactor(forOp);
+  int64_t foldLevels =
+      packFactor > 1 ? (int64_t)llvm::Log2_64_Ceil(packFactor) : 0;
+  int64_t foldCost = foldLevels * (reduceLatency + cloneLatency);
+
   for (int64_t regions : candidates) {
     int64_t banksPerRegion = std::max<int64_t>(1, availBanks / regions);
     int64_t iterPerRegion = std::max<int64_t>(1, tripCount / regions);
-    // For reduction loops: each bank computes n iterations of pre-reduce work,
-    // then folds n partial results with (n-1) intra-bank reductions before the
-    // inter-bank tree reduction phase.
+    // For reduction loops each bank runs ceil(iterPerRegion / P) packed waves
+    // of pre-reduce work, folds them with (waves - 1) intra-bank reductions
+    // plus a ceil(log2 P) lane fold, then joins the inter-bank tree.
     bool isReduce = isSliceReductionFor(forOp) && reduceLatency > 0;
+    int64_t wavesPerRegion = (iterPerRegion + packFactor - 1) / packFactor;
     int64_t preReduceLatency = isReduce ? (bodyLatency - reduceLatency) : bodyLatency;
-    int64_t local = iterPerRegion * preReduceLatency;
+    int64_t local = wavesPerRegion * preReduceLatency;
     int64_t intraReduce = isReduce
-        ? std::max<int64_t>(0, iterPerRegion - 1) * reduceLatency
+        ? std::max<int64_t>(0, wavesPerRegion - 1) * reduceLatency + foldCost
         : 0;
     int64_t interRegionReduce = 0;
     if (isSliceReductionFor(forOp) && regions > 1)
@@ -1101,79 +1219,170 @@ MappingSolution modelAndSolveILP(const DAG &dag) {
     for (size_t e2 = e1 + 1; e2 < cloneEdges.size(); ++e2) {
       const CloneEdge &c1 = cloneEdges[e1];
       const CloneEdge &c2 = cloneEdges[e2];
-      auto addCloneOrderConstraints = [&](int a, int b, llvm::StringRef tag) {
+      // Binary == 1 iff DAG nodes a and b are mapped to the same bank.
+      auto sameBankVar = [&](int a, int b, llvm::StringRef tag) -> GRBVar {
         GRBLinExpr sumB;
         for (int bank = 0; bank < kNumBanks; ++bank) {
           GRBVar bVar = model.addVar(
               0.0, 1.0, 0.0, GRB_BINARY,
-              "b_" + std::string(tag) + "_" + std::to_string(a) + "_" +
-                  std::to_string(b) + "_" + std::to_string(bank));
+              "b_" + std::string(tag) + "_" + std::to_string(e1) + "_" +
+                  std::to_string(e2) + "_" + std::to_string(bank));
           model.addConstr(bVar <= x[a][bank]);
           model.addConstr(bVar <= x[b][bank]);
           model.addConstr(bVar >= x[a][bank] + x[b][bank] - 1);
           sumB += bVar;
         }
-        GRBVar sameBank =
-            model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-                         "same_" + std::string(tag) + "_" + std::to_string(a) +
-                             "_" + std::to_string(b));
+        GRBVar sameBank = model.addVar(
+            0.0, 1.0, 0.0, GRB_BINARY,
+            "same_" + std::string(tag) + "_" + std::to_string(e1) + "_" +
+                std::to_string(e2));
         model.addConstr(sumB == sameBank, "same_link_" + std::string(tag) +
-                                              "_" + std::to_string(a) + "_" +
-                                              std::to_string(b));
-        GRBVar orderVar =
-            model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-                         "order_" + std::string(tag) + "_" + std::to_string(a) +
-                             "_" + std::to_string(b));
-        model.addConstr(end[c1.src] + kCloneCostPerBit <=
-                            end[c2.src] + M * (3 - c1.active - c2.active -
-                                               sameBank + orderVar),
-                        "clone_serial_ab_" + std::string(tag) + "_" +
-                            std::to_string(a) + "_" + std::to_string(b));
-        model.addConstr(end[c2.src] + kCloneCostPerBit <=
-                            end[c1.src] + M * (3 - c1.active - c2.active -
-                                               sameBank + (1 - orderVar)),
-                        "clone_serial_ba_" + std::string(tag) + "_" +
-                            std::to_string(a) + "_" + std::to_string(b));
+                                              "_" + std::to_string(e1) + "_" +
+                                              std::to_string(e2));
+        return sameBank;
       };
 
-      addCloneOrderConstraints(c1.src, c2.src, "src_src");
-      addCloneOrderConstraints(c1.dst, c2.dst, "dst_dst");
-      addCloneOrderConstraints(c1.src, c2.dst, "src_dst");
-      addCloneOrderConstraints(c1.dst, c2.src, "dst_src");
+      // Serialize the two transfers' kCloneCostPerBit windows when their
+      // endpoints share a bank, unless `relax` (== 1) marks them as merged
+      // into a single row copy and therefore safe to run simultaneously.
+      auto addCloneOrderConstraints = [&](GRBVar sameBank, GRBLinExpr relax,
+                                          llvm::StringRef tag) {
+        GRBVar orderVar = model.addVar(
+            0.0, 1.0, 0.0, GRB_BINARY,
+            "order_" + std::string(tag) + "_" + std::to_string(e1) + "_" +
+                std::to_string(e2));
+        model.addConstr(end[c1.src] + kCloneCostPerBit <=
+                            end[c2.src] + M * (3 - c1.active - c2.active -
+                                               sameBank + orderVar + relax),
+                        "clone_serial_ab_" + std::string(tag) + "_" +
+                            std::to_string(e1) + "_" + std::to_string(e2));
+        model.addConstr(end[c2.src] + kCloneCostPerBit <=
+                            end[c1.src] +
+                                M * (3 - c1.active - c2.active - sameBank +
+                                     (1 - orderVar) + relax),
+                        "clone_serial_ba_" + std::string(tag) + "_" +
+                            std::to_string(e1) + "_" + std::to_string(e2));
+      };
+
+      GRBVar sameSrc = sameBankVar(c1.src, c2.src, "src_src");
+      GRBVar sameDst = sameBankVar(c1.dst, c2.dst, "dst_dst");
+      // Two transfers sharing both source and destination bank move the same
+      // row to the same place: a single row copy carries both results, so they
+      // need not be serialized. merge = sameSrc AND sameDst.
+      GRBVar merge =
+          model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+                       "merge_" + std::to_string(e1) + "_" + std::to_string(e2));
+      model.addConstr(merge <= sameSrc);
+      model.addConstr(merge <= sameDst);
+      model.addConstr(merge >= sameSrc + sameDst - 1);
+
+      GRBVar sameSrcDst = sameBankVar(c1.src, c2.dst, "src_dst");
+      GRBVar sameDstSrc = sameBankVar(c1.dst, c2.src, "dst_src");
+
+      // Same src+dst (merge) relaxes the src/src and dst/dst windows. A bank
+      // acting as both a source and a destination (src/dst, dst/src) is a real
+      // conflict and is always serialized.
+      addCloneOrderConstraints(sameSrc, merge, "src_src");
+      addCloneOrderConstraints(sameDst, merge, "dst_dst");
+      addCloneOrderConstraints(sameSrcDst, GRBLinExpr(0.0), "src_dst");
+      addCloneOrderConstraints(sameDstSrc, GRBLinExpr(0.0), "dst_src");
     }
+  }
+
+  // Intra-bank SIMD packing. Independent, non-container ops of the same kind
+  // and bitwidth signature may share a bank and run as one concurrent wave so
+  // long as the total vector length of all ops co-located in that bank's row
+  // stays within kBankRowWidth. For every packable op we accumulate the vector
+  // lengths of its co-packed partners into rowCols[i] and cap the sum below.
+  std::vector<bool> packable(N, false);
+  std::vector<int64_t> vlen(N, 0);
+  std::vector<GRBLinExpr> rowCols(N);
+  for (int i = 0; i < N; ++i) {
+    if (dag.nodes[i].isContainer)
+      continue;
+    if (!getPackSignature(dag.nodes[i].op).packable())
+      continue;
+    int64_t v = getSliceVectorLength(dag.nodes[i].op->getResult(0));
+    if (v <= 0 || v > kBankRowWidth)
+      continue; // a single op wider than a row cannot pack; keep it serial.
+    packable[i] = true;
+    vlen[i] = v;
+    rowCols[i] = (double)v;
   }
 
   for (int i = 0; i < N; ++i) {
     for (int j = i + 1; j < N; ++j) {
-      if (!dep[i][j] && !dep[j][i] && !dag.nodes[i].isContainer &&
-          !dag.nodes[j].isContainer) {
-        GRBVar orderVar = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-                                       "order_" + std::to_string(i) + "_" +
-                                           std::to_string(j));
-        GRBVar diffVar =
+      if (dep[i][j] || dep[j][i] || dag.nodes[i].isContainer ||
+          dag.nodes[j].isContainer)
+        continue;
+      GRBVar orderVar = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+                                     "order_" + std::to_string(i) + "_" +
+                                         std::to_string(j));
+      GRBVar diffVar =
+          model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+                       "diff_" + std::to_string(i) + "_" + std::to_string(j));
+      GRBLinExpr sumB;
+      for (int k = 0; k < kNumBanks; ++k) {
+        GRBVar b =
             model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-                         "diff_" + std::to_string(i) + "_" + std::to_string(j));
-        GRBLinExpr sumB;
-        for (int k = 0; k < kNumBanks; ++k) {
-          GRBVar b =
-              model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-                           "b_" + std::to_string(i) + "_" + std::to_string(j) +
-                               "_" + std::to_string(k));
-          model.addConstr(b <= x[i][k]);
-          model.addConstr(b <= x[j][k]);
-          model.addConstr(b >= x[i][k] + x[j][k] - 1);
-          sumB += b;
-        }
-        model.addConstr(diffVar + sumB == 1, "diff_link_" + std::to_string(i) +
-                                                 "_" + std::to_string(j));
+                         "b_" + std::to_string(i) + "_" + std::to_string(j) +
+                             "_" + std::to_string(k));
+        model.addConstr(b <= x[i][k]);
+        model.addConstr(b <= x[j][k]);
+        model.addConstr(b >= x[i][k] + x[j][k] - 1);
+        sumB += b;
+      }
+      model.addConstr(diffVar + sumB == 1, "diff_link_" + std::to_string(i) +
+                                               "_" + std::to_string(j));
+
+      bool canPack = packable[i] && packable[j] &&
+                     getPackSignature(dag.nodes[i].op) ==
+                         getPackSignature(dag.nodes[j].op);
+      if (!canPack) {
+        // Incompatible (different kind/bitwidth, or non-packable): the two ops
+        // must run serially whenever they share a bank.
         model.addConstr(start[j] >= end[i] - M * (diffVar + 1.0 - orderVar),
                         "serial_ij_" + std::to_string(i) + "_" +
                             std::to_string(j));
         model.addConstr(start[i] >= end[j] - M * (diffVar + orderVar),
                         "serial_ji_" + std::to_string(i) + "_" +
                             std::to_string(j));
+        continue;
       }
+
+      // Packable pair: pack == 1 places them in the same bank at the same start
+      // time (equal latency => equal end time => fully simultaneous); pack == 0
+      // falls back to serialization. Row capacity is enforced via rowCols.
+      GRBVar pack =
+          model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
+                       "pack_" + std::to_string(i) + "_" + std::to_string(j));
+      model.addConstr(pack + diffVar <= 1, "pack_samebank_" +
+                                               std::to_string(i) + "_" +
+                                               std::to_string(j));
+      model.addConstr(start[i] - start[j] <= M * (1 - pack),
+                      "pack_start_lo_" + std::to_string(i) + "_" +
+                          std::to_string(j));
+      model.addConstr(start[j] - start[i] <= M * (1 - pack),
+                      "pack_start_hi_" + std::to_string(i) + "_" +
+                          std::to_string(j));
+      model.addConstr(start[j] >=
+                          end[i] - M * (diffVar + pack + 1.0 - orderVar),
+                      "serial_ij_" + std::to_string(i) + "_" +
+                          std::to_string(j));
+      model.addConstr(start[i] >= end[j] - M * (diffVar + pack + orderVar),
+                      "serial_ji_" + std::to_string(i) + "_" +
+                          std::to_string(j));
+      rowCols[i] += (double)vlen[j] * pack;
+      rowCols[j] += (double)vlen[i] * pack;
     }
+  }
+
+  // Bank-row capacity: the vector lengths of all ops packed together in one
+  // bank row may not exceed kBankRowWidth.
+  for (int i = 0; i < N; ++i) {
+    if (packable[i])
+      model.addConstr(rowCols[i] <= (double)kBankRowWidth,
+                      "row_cap_" + std::to_string(i));
   }
 
   GRBVar makespan =
@@ -1394,7 +1603,37 @@ struct BitsOptimiseMappingPass
       // Apply accumulated in_xfer annotations.
       for (auto &[destOp, inXfers] : inXferMap)
         destOp->setAttr("bits.in_xfer", ArrayAttr::get(ctx, inXfers));
- 
+
+      // Annotate intra-bank SIMD packing groups so the chosen mapping is
+      // inspectable. Packable ops the ILP placed on the same bank at the same
+      // start time with the same pack signature form one concurrent wave; each
+      // such wave (size >= 2) receives a distinct bits.simd_group id.
+      {
+        std::map<std::tuple<int, int64_t, int, int64_t, int64_t>,
+                 SmallVector<Operation *>>
+            waves;
+        for (int i = 0; i < static_cast<int>(dag.nodes.size()); ++i) {
+          if (chosen[i] < 0 || dag.nodes[i].isContainer)
+            continue;
+          PackSignature sig = getPackSignature(dag.nodes[i].op);
+          if (!sig.packable())
+            continue;
+          waves[{chosen[i], solution.startTime[i], sig.kind, sig.lhsBitwidth,
+                 sig.rhsBitwidth}]
+              .push_back(dag.nodes[i].op);
+        }
+        int64_t groupId = 0;
+        for (auto &[key, members] : waves) {
+          (void)key;
+          if (members.size() < 2)
+            continue;
+          for (Operation *member : members)
+            member->setAttr("bits.simd_group",
+                            attrBuilder.getI64IntegerAttr(groupId));
+          ++groupId;
+        }
+      }
+
       // Phase 5: for-loop parallelism planning.
       // Attributes set on each scf.for:
       //   bits.parallel_factor  i64 – number of banks sharing the loop
@@ -1423,9 +1662,20 @@ struct BitsOptimiseMappingPass
                     attrBuilder.getI64IntegerAttr(itersPerBank));
         if (!isReduction)
           return;
+        // Intra-bank SIMD packing: P iterations per bank row run as one wave,
+        // so each bank does ceil(itersPerBank/P) waves with (waves-1) intra-bank
+        // reductions, plus a ceil(log2 P) lane fold.
+        int64_t packFactor = getLoopPackFactor(lp);
+        int64_t wavesPerBank = (itersPerBank + packFactor - 1) / packFactor;
+        lp->setAttr("bits.pack_factor",
+                    attrBuilder.getI64IntegerAttr(packFactor));
         lp->setAttr("bits.intra_reduce_count",
                     attrBuilder.getI64IntegerAttr(
-                        std::max<int64_t>(0, itersPerBank - 1)));
+                        std::max<int64_t>(0, wavesPerBank - 1)));
+        if (packFactor > 1)
+          lp->setAttr("bits.fold_levels",
+                      attrBuilder.getI64IntegerAttr(
+                          (int64_t)llvm::Log2_64_Ceil(packFactor)));
         int64_t reduceLevels =
             parallelFactor > 1 ? (int64_t)llvm::Log2_64(parallelFactor) : 0;
         lp->setAttr("bits.reduce_levels",
