@@ -41,8 +41,36 @@ namespace mlir::bits {
 
 //===----------------------------------------------------------------------===//
 
-constexpr int64_t kNumBanks = 128;
-constexpr int64_t kCloneCostPerBit = 14;
+// Configured from the pass options (num-banks / mem-type) at runOnOperation
+// entry; the pass runs on a single func so plain globals are safe here.
+// Time unit throughout: one AAP.
+static int64_t kNumBanks = 32;
+static int64_t kBanksPerChannel = 32;        // ddr: 32, hbm: 16
+static int64_t kCopyCostIntraChPerBit = 19;  // same-channel inter-bank; hbm: 6
+static int64_t kCopyCostCrossChPerBit = 10;  // cross-channel;           hbm: 3
+// Intra-bank lane-fold copy: one AAP per bit-plane row, matching how the
+// gem5 RowOpTracePlayer replays src==dst ROW_COPY records (same-subarray
+// RowClone FPM path, tRAS+tWLOV+tRP per row). NOTE this is a deliberate
+// idealisation kept consistent across scheduler and simulator: physically,
+// folding P packed SIMD lanes needs a COLUMN-shifted copy (the surviving
+// lanes must move sideways to align with their partners), which neither a
+// plain AAP nor any modelled gem5 primitive performs.
+constexpr int64_t kLaneFoldCostPerBit = 1;
+
+static int64_t channelOfBank(int64_t bank) { return bank / kBanksPerChannel; }
+
+// Per-bit cost of one reduce-tree row copy, by physical location. Calibrated
+// against gem5 (rowOpMakespan steady state, in units of one AAP): the
+// intra-channel copy streams the row twice over one channel data bus, the
+// cross-channel copy streams it once per channel over two buses that
+// pipeline. src == dst keeps the lane-fold proxy.
+static int64_t copyCostPerBit(int64_t srcBank, int64_t dstBank) {
+  if (srcBank == dstBank)
+    return kLaneFoldCostPerBit;
+  return channelOfBank(srcBank) == channelOfBank(dstBank)
+             ? kCopyCostIntraChPerBit
+             : kCopyCostCrossChPerBit;
+}
 // Width (in vector lanes / columns) of one bank row. Independent same-kind,
 // same-bitwidth ops whose vector lengths sum to <= this value can be packed
 // into a single bank row and executed as one concurrent SIMD wave.
@@ -184,11 +212,15 @@ static PackSignature getPackSignature(Operation *op) {
 }
 
 static int64_t getComputeLatency(Operation *op) {
+  // Exact SIMDRAM row-op counts of the gem5 expansion (AAP units):
+  //   ADDI(n)    = 8n + 1            (1 carry-init AAP + 8 ops/bit)
+  //   MULI(m,n)  = 13mn + 4m - 8     (shift-add: (4m+1) init + 13m per rhs
+  //                                   bit + (13m-9) final row)
   if (auto add = dyn_cast<AddIOp>(op))
-    return 8 * getSliceBitwidth(add.getResult());
+    return 8 * getSliceBitwidth(add.getResult()) + 1;
   if (auto mul = dyn_cast<MulIOp>(op))
-    return 12 * getSliceBitwidth(mul.getLhs()) * getSliceBitwidth(mul.getRhs()) -
-           12 * getSliceBitwidth(mul.getLhs()) + 4;
+    return 13 * getSliceBitwidth(mul.getLhs()) * getSliceBitwidth(mul.getRhs()) +
+           4 * getSliceBitwidth(mul.getLhs()) - 8;
   if (auto andOp = dyn_cast<AndOp>(op))
     return 4 * getSliceBitwidth(andOp.getResult());
   if (auto orOp = dyn_cast<OrOp>(op))
@@ -203,6 +235,10 @@ static int64_t getComputeLatency(Operation *op) {
 
 static FailureOr<int64_t> getConstTripCount(scf::ForOp forOp);
 static SmallVector<int64_t> buildBankGroup(int64_t baseBank, int64_t numBanks);
+static SmallVector<SmallVector<std::pair<int64_t, int64_t>>>
+buildChannelAwareReduceTree(ArrayRef<int64_t> activeBanks);
+static int64_t estimateReduceTreeCost(int64_t banks, int64_t bitwidth,
+                                      int64_t reduceLatency);
 static bool isSliceReductionFor(scf::ForOp forOp);
 static int64_t estimatePeakBanksPerIteration(scf::ForOp forOp);
 static int64_t estimateBestParallelBanksForLoop(scf::ForOp forOp);
@@ -217,20 +253,25 @@ static SmallVector<int64_t> getReduceBanksFromAttr(scf::ForOp forOp) {
   auto treeAttr = forOp->getAttrOfType<ArrayAttr>("bits.reduce_tree");
   if (!treeAttr || treeAttr.empty())
     return banks;
-  auto firstLevel = dyn_cast<ArrayAttr>(treeAttr[0]);
-  if (!firstLevel)
-    return banks;
+  // Union over ALL levels: in the channel-aware tree the first level does
+  // not necessarily touch every active bank (a channel holding a single
+  // bank only joins at the cross-channel phase).
   llvm::DenseSet<int64_t> uniqueBanks;
-  for (Attribute pairAttr : firstLevel) {
-    auto pair = dyn_cast<DictionaryAttr>(pairAttr);
-    if (!pair)
+  for (Attribute levelAttr : treeAttr) {
+    auto level = dyn_cast<ArrayAttr>(levelAttr);
+    if (!level)
       continue;
-    auto src = dyn_cast_or_null<IntegerAttr>(pair.get("src_bank"));
-    auto dst = dyn_cast_or_null<IntegerAttr>(pair.get("dst_bank"));
-    if (src)
-      uniqueBanks.insert(src.getInt());
-    if (dst)
-      uniqueBanks.insert(dst.getInt());
+    for (Attribute pairAttr : level) {
+      auto pair = dyn_cast<DictionaryAttr>(pairAttr);
+      if (!pair)
+        continue;
+      auto src = dyn_cast_or_null<IntegerAttr>(pair.get("src_bank"));
+      auto dst = dyn_cast_or_null<IntegerAttr>(pair.get("dst_bank"));
+      if (src)
+        uniqueBanks.insert(src.getInt());
+      if (dst)
+        uniqueBanks.insert(dst.getInt());
+    }
   }
   for (int64_t bank : uniqueBanks)
     banks.push_back(bank);
@@ -428,7 +469,7 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
       if (reduceProducer->getNumOperands() >= 1)
         reduceBitwidth = getSliceBitwidth(reduceProducer->getOperand(0));
     }
-    int64_t rowCopyLatency = kCloneCostPerBit * std::max<int64_t>(1, reduceBitwidth);
+    int64_t rowCopyLatency = kLaneFoldCostPerBit * std::max<int64_t>(1, reduceBitwidth);
 
     for (int64_t bank : activeBanks) {
       int64_t cursor = bankReady[bank];
@@ -542,10 +583,18 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
 
     auto treeAttr = forOp->getAttrOfType<ArrayAttr>("bits.reduce_tree");
     if (treeAttr && reduceProducer) {
+      // Channel data-bus cursors: copies whose src or dst share a channel
+      // serialise on that channel's bus; distinct channels overlap. Bank
+      // readiness still orders copies against the producing compute.
+      DenseMap<int64_t, int64_t> chanReady;
       for (Attribute levelAttr : treeAttr) {
         auto level = dyn_cast<ArrayAttr>(levelAttr);
         if (!level)
           continue;
+        // Phase A: schedule the level's copies. Copies sharing a channel
+        // serialise on that channel's bus; distinct channels overlap.
+        SmallVector<int64_t> levelDstBanks;
+        int64_t levelEnd = 0;
         for (Attribute pairAttr : level) {
           auto pair = dyn_cast<DictionaryAttr>(pairAttr);
           if (!pair)
@@ -556,8 +605,20 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
             continue;
           int64_t srcBank = srcAttr.getInt();
           int64_t dstBank = dstAttr.getInt();
-          int64_t copyStart = bankReady[srcBank];
-          int64_t copyEnd = copyStart + rowCopyLatency;
+          int64_t srcChan = channelOfBank(srcBank);
+          int64_t dstChan = channelOfBank(dstBank);
+          int64_t copyCost = copyCostPerBit(srcBank, dstBank) *
+                             std::max<int64_t>(1, reduceBitwidth);
+          int64_t copyStart =
+              std::max({bankReady[srcBank], bankReady[dstBank],
+                        chanReady[srcChan], chanReady[dstChan]});
+          int64_t copyEnd = copyStart + copyCost;
+          chanReady[srcChan] = copyEnd;
+          chanReady[dstChan] = copyEnd;
+          bankReady[srcBank] = copyEnd;
+          bankReady[dstBank] = copyEnd;
+          levelEnd = std::max(levelEnd, copyEnd);
+          levelDstBanks.push_back(dstBank);
           FlattenedEvent copyEvt;
           copyEvt.kind = FlattenedEvent::Kind::RowCopy;
           copyEvt.start = copyStart;
@@ -567,8 +628,13 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
           copyEvt.rowCopy.end = copyEnd;
           copyEvt.rowCopy.edges.push_back({srcBank, dstBank});
           localEvents.push_back(copyEvt);
-          int64_t addStart = std::max<int64_t>(bankReady[dstBank], copyEnd);
-          int64_t addEnd = addStart + reduceLatency;
+        }
+        // Phase B: one SIMD reduce wave per level -- all dst banks run the
+        // reduce op concurrently once every copy of the level has landed
+        // (shared start/end lets recordEvent merge them into one record).
+        int64_t addStart = levelEnd;
+        int64_t addEnd = addStart + reduceLatency;
+        for (int64_t dstBank : levelDstBanks) {
           if (auto add = dyn_cast<AddIOp>(reduceProducer)) {
             FlattenedEvent evt;
             evt.kind = FlattenedEvent::Kind::Addi;
@@ -841,7 +907,7 @@ static int64_t estimateForLatency(scf::ForOp forOp) {
           ? getComputeLatency(reduceProducer)
           : 0;
   int64_t reduceBitwidth = getSliceBitwidth(yield.getOperand(0));
-  int64_t cloneLatency = kCloneCostPerBit * reduceBitwidth;
+  int64_t cloneLatency = kLaneFoldCostPerBit * reduceBitwidth;
 
   int64_t packFactor = getLoopPackFactor(forOp);
   int64_t foldLevels =
@@ -859,8 +925,8 @@ static int64_t estimateForLatency(scf::ForOp forOp) {
     int64_t preReduceLatency = bodyLatency - reduceLatency;
     int64_t local = wavesPerBank * preReduceLatency
                   + std::max<int64_t>(0, wavesPerBank - 1) * reduceLatency;
-    int64_t reduceTreeLevels = llvm::Log2_64(banks);
-    int64_t reduceCost = reduceTreeLevels * (cloneLatency + reduceLatency);
+    int64_t reduceCost =
+        estimateReduceTreeCost(banks, reduceBitwidth, reduceLatency);
     best = std::min(best, local + foldCost + reduceCost);
   }
   return best == std::numeric_limits<int64_t>::max() ? 0 : best;
@@ -900,7 +966,6 @@ static int64_t estimateBestParallelBanksForLoop(scf::ForOp forOp) {
       (reduceProducer && isSupportedBitsSliceComputeOp(reduceProducer))
           ? getComputeLatency(reduceProducer)
           : 0;
-  int64_t cloneLatency = kCloneCostPerBit * reduceBitwidth;
 
   int64_t bestBanks = 1;
   int64_t bestCost = std::numeric_limits<int64_t>::max();
@@ -917,10 +982,10 @@ static int64_t estimateBestParallelBanksForLoop(scf::ForOp forOp) {
     } else {
       local = iterPerBank * bodyLatency;
     }
-    int64_t reduceTreeLevels = llvm::Log2_64(banks);
     int64_t reduceCost =
-        isSliceReductionFor(forOp) ? reduceTreeLevels * (cloneLatency + reduceLatency)
-                                   : 0;
+        isSliceReductionFor(forOp)
+            ? estimateReduceTreeCost(banks, reduceBitwidth, reduceLatency)
+            : 0;
     int64_t totalCost = local + reduceCost;
     if (totalCost < bestCost) {
       bestCost = totalCost;
@@ -938,6 +1003,90 @@ static SmallVector<int64_t> buildBankGroup(int64_t baseBank, int64_t numBanks) {
   for (int64_t i = 0; i < numBanks; ++i)
     banks.push_back((baseBank + i) % kNumBanks);
   return banks;
+}
+
+// Channel-aware inter-bank reduction tree over an active bank group.
+// Phase 1 halves within each channel (per-channel copies run on that
+// channel's own data bus; channels proceed in parallel); phase 2 halves
+// across the per-channel survivors (cross-channel copies between disjoint
+// channel pairs, parallel). Levels are returned outermost first as
+// {src_bank, dst_bank} pairs; the final result lands in activeBanks[0],
+// same as the legacy stride-halving tree. Compared to that tree this cuts
+// the cross-channel rows from (N - banksPerChannel) to (#channels - 1).
+static SmallVector<SmallVector<std::pair<int64_t, int64_t>>>
+buildChannelAwareReduceTree(ArrayRef<int64_t> activeBanks) {
+  SmallVector<SmallVector<std::pair<int64_t, int64_t>>> levels;
+  if (activeBanks.size() <= 1)
+    return levels;
+
+  // Group by channel, preserving group order (first bank stays first).
+  llvm::MapVector<int64_t, SmallVector<int64_t>> byChannel;
+  for (int64_t b : activeBanks)
+    byChannel[channelOfBank(b)].push_back(b);
+
+  // Phase 1: intra-channel halving, all channels in lockstep per level.
+  bool more = true;
+  while (more) {
+    more = false;
+    SmallVector<std::pair<int64_t, int64_t>> level;
+    for (auto &entry : byChannel) {
+      SmallVector<int64_t> &list = entry.second;
+      size_t n = list.size();
+      if (n <= 1)
+        continue;
+      size_t half = (n + 1) / 2;
+      for (size_t i = 0; i + half < n; ++i)
+        level.push_back({list[i + half], list[i]}); // {src, dst}
+      list.truncate(half);
+      if (list.size() > 1)
+        more = true;
+    }
+    if (!level.empty())
+      levels.push_back(std::move(level));
+  }
+
+  // Phase 2: cross-channel halving over the per-channel survivors.
+  SmallVector<int64_t> reps;
+  for (auto &entry : byChannel)
+    reps.push_back(entry.second.front());
+  while (reps.size() > 1) {
+    size_t n = reps.size();
+    size_t half = (n + 1) / 2;
+    SmallVector<std::pair<int64_t, int64_t>> level;
+    for (size_t i = 0; i + half < n; ++i)
+      level.push_back({reps[i + half], reps[i]}); // {src, dst}
+    reps.truncate(half);
+    levels.push_back(std::move(level));
+  }
+  return levels;
+}
+
+// Critical-path cost of the inter-bank reduce tree for `banks` consecutive
+// active banks (base 0): within a level, copies serialise on each channel's
+// data bus (a copy occupies both its src and dst channel bus for its whole
+// duration) while distinct channels run in parallel; one reduce-op wave
+// (SIMD across the level's dst banks) follows each level.
+static int64_t estimateReduceTreeCost(int64_t banks, int64_t bitwidth,
+                                      int64_t reduceLatency) {
+  if (banks <= 1)
+    return 0;
+  auto levels = buildChannelAwareReduceTree(buildBankGroup(0, banks));
+  int64_t bw = std::max<int64_t>(1, bitwidth);
+  llvm::DenseMap<int64_t, int64_t> chanBusy; // bus busy-until per channel
+  int64_t cursor = 0;
+  for (const auto &level : levels) {
+    int64_t levelEnd = cursor;
+    for (const auto &[src, dst] : level) {
+      int64_t sc = channelOfBank(src), dc = channelOfBank(dst);
+      int64_t start = std::max({cursor, chanBusy[sc], chanBusy[dc]});
+      int64_t end = start + copyCostPerBit(src, dst) * bw;
+      chanBusy[sc] = end;
+      chanBusy[dc] = end;
+      levelEnd = std::max(levelEnd, end);
+    }
+    cursor = levelEnd + reduceLatency; // level barrier: copies then reduce
+  }
+  return cursor;
 }
 
 static DenseMap<int64_t, int64_t>
@@ -1014,7 +1163,7 @@ static RegionPlan planLeafForRegions(scf::ForOp forOp, int64_t baseBank,
         reduceBitwidth = getSliceBitwidth(op.getResult(0));
     }
   }
-  int64_t cloneLatency = kCloneCostPerBit * reduceBitwidth;
+  int64_t cloneLatency = kLaneFoldCostPerBit * reduceBitwidth;
 
   int64_t packFactor = getLoopPackFactor(forOp);
   int64_t foldLevels =
@@ -1036,7 +1185,8 @@ static RegionPlan planLeafForRegions(scf::ForOp forOp, int64_t baseBank,
         : 0;
     int64_t interRegionReduce = 0;
     if (isSliceReductionFor(forOp) && regions > 1)
-      interRegionReduce = llvm::Log2_64(regions) * (reduceLatency + cloneLatency);
+      interRegionReduce =
+          estimateReduceTreeCost(regions, reduceBitwidth, reduceLatency);
     int64_t makespan = local + intraReduce + interRegionReduce;
     if (makespan < best.estimatedMakespan) {
       best.estimatedMakespan = makespan;
@@ -1120,8 +1270,20 @@ MappingSolution modelAndSolveILP(const DAG &dag) {
     int src;
     int dst;
     GRBVar active;
+    GRBLinExpr cost; // location-aware transfer window (0 when same bank)
   };
   llvm::SmallVector<CloneEdge> cloneEdges;
+
+  // Bitwidth of the value a dataflow edge out of node i transfers (a bw-bit
+  // slice moves as bw bit-plane rows); 1 for non-slice results.
+  auto xferBitwidth = [&](int i) -> int64_t {
+    int64_t bw = 0;
+    for (Value r : dag.nodes[i].op->getResults())
+      bw = std::max(bw, getSliceBitwidth(r));
+    return std::max<int64_t>(1, bw);
+  };
+  const int64_t numChannels =
+      (kNumBanks + kBanksPerChannel - 1) / kBanksPerChannel;
 
   const int64_t M = std::max<int64_t>(100, totalDuration + 1024);
   for (int i = 0; i < N; ++i) {
@@ -1129,7 +1291,6 @@ MappingSolution modelAndSolveILP(const DAG &dag) {
       GRBVar cloneVar =
           model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
                        "clone_" + std::to_string(i) + "_" + std::to_string(j));
-      cloneEdges.push_back(CloneEdge{i, j, cloneVar});
       GRBLinExpr sumB;
       for (int k = 0; k < kNumBanks; ++k) {
         GRBVar b =
@@ -1143,7 +1304,38 @@ MappingSolution modelAndSolveILP(const DAG &dag) {
       }
       model.addConstr(cloneVar + sumB == 1, "clone_link_" + std::to_string(i) +
                                                 "_" + std::to_string(j));
-      model.addConstr(start[j] >= end[i] + kCloneCostPerBit * cloneVar,
+
+      // Location-aware transfer cost, consistent with copyCostPerBit():
+      // 0 when i and j share a bank; kCopyCostIntraChPerBit*bw when they
+      // share a channel but not a bank; kCopyCostCrossChPerBit*bw across
+      // channels. sameChan (sumBC) is linearised per channel from the
+      // bank-assignment vars; same bank implies same channel, so
+      // (sumBC - sumB) flags exactly the intra-channel inter-bank case.
+      GRBLinExpr sumBC;
+      for (int64_t c = 0; c < numChannels; ++c) {
+        GRBLinExpr yi, yj;
+        for (int64_t k = c * kBanksPerChannel;
+             k < std::min<int64_t>((c + 1) * kBanksPerChannel, kNumBanks);
+             ++k) {
+          yi += x[i][k];
+          yj += x[j][k];
+        }
+        GRBVar bc = model.addVar(
+            0.0, 1.0, 0.0, GRB_BINARY,
+            "bc_" + std::to_string(i) + "_" + std::to_string(j) + "_" +
+                std::to_string(c));
+        model.addConstr(bc <= yi);
+        model.addConstr(bc <= yj);
+        model.addConstr(bc >= yi + yj - 1);
+        sumBC += bc;
+      }
+      int64_t bwXfer = xferBitwidth(i);
+      GRBLinExpr xferCost =
+          kCopyCostIntraChPerBit * bwXfer * (sumBC - sumB) +
+          kCopyCostCrossChPerBit * bwXfer * (1 - sumBC);
+      cloneEdges.push_back(CloneEdge{i, j, cloneVar, xferCost});
+
+      model.addConstr(start[j] >= end[i] + xferCost,
                       "sched_dep_" + std::to_string(i) + "_" +
                           std::to_string(j));
 
@@ -1175,7 +1367,7 @@ MappingSolution modelAndSolveILP(const DAG &dag) {
             "clone_src_before_" + std::to_string(i) + "_" + std::to_string(j) +
                 "_" + std::to_string(k));
         model.addConstr(
-            start[k] >= end[i] + kCloneCostPerBit -
+            start[k] >= end[i] + xferCost -
                             M * (2 - cloneVar - sameBankSrc + (1 - orderSrc)),
             "clone_src_after_" + std::to_string(i) + "_" + std::to_string(j) +
                 "_" + std::to_string(k));
@@ -1207,7 +1399,7 @@ MappingSolution modelAndSolveILP(const DAG &dag) {
             "clone_dst_before_" + std::to_string(i) + "_" + std::to_string(j) +
                 "_" + std::to_string(k));
         model.addConstr(
-            start[k] >= end[i] + kCloneCostPerBit -
+            start[k] >= end[i] + xferCost -
                             M * (2 - cloneVar - sameBankDst + (1 - orderDst)),
             "clone_dst_after_" + std::to_string(i) + "_" + std::to_string(j) +
                 "_" + std::to_string(k));
@@ -1242,7 +1434,7 @@ MappingSolution modelAndSolveILP(const DAG &dag) {
         return sameBank;
       };
 
-      // Serialize the two transfers' kCloneCostPerBit windows when their
+      // Serialize the two transfers' location-priced windows when their
       // endpoints share a bank, unless `relax` (== 1) marks them as merged
       // into a single row copy and therefore safe to run simultaneously.
       auto addCloneOrderConstraints = [&](GRBVar sameBank, GRBLinExpr relax,
@@ -1251,12 +1443,12 @@ MappingSolution modelAndSolveILP(const DAG &dag) {
             0.0, 1.0, 0.0, GRB_BINARY,
             "order_" + std::string(tag) + "_" + std::to_string(e1) + "_" +
                 std::to_string(e2));
-        model.addConstr(end[c1.src] + kCloneCostPerBit <=
+        model.addConstr(end[c1.src] + c1.cost <=
                             end[c2.src] + M * (3 - c1.active - c2.active -
                                                sameBank + orderVar + relax),
                         "clone_serial_ab_" + std::string(tag) + "_" +
                             std::to_string(e1) + "_" + std::to_string(e2));
-        model.addConstr(end[c2.src] + kCloneCostPerBit <=
+        model.addConstr(end[c2.src] + c2.cost <=
                             end[c1.src] +
                                 M * (3 - c1.active - c2.active - sameBank +
                                      (1 - orderVar) + relax),
@@ -1443,6 +1635,32 @@ struct BitsOptimiseMappingPass
 
   void runOnOperation() final {
     func::FuncOp func = getOperation();
+
+    // Apply pass options to the file-scope model parameters.
+    if (numBanks < 1 || numBanks > 128 ||
+        !llvm::isPowerOf2_64(static_cast<uint64_t>(numBanks))) {
+      func.emitError("bits-opt-mapping: num-banks must be a power of two in "
+                     "[1, 128], got ")
+          << numBanks;
+      signalPassFailure();
+      return;
+    }
+    if (memType == "ddr") {
+      kBanksPerChannel = 32;
+      kCopyCostIntraChPerBit = 19;
+      kCopyCostCrossChPerBit = 10;
+    } else if (memType == "hbm") {
+      kBanksPerChannel = 16;
+      kCopyCostIntraChPerBit = 6;
+      kCopyCostCrossChPerBit = 3;
+    } else {
+      func.emitError("bits-opt-mapping: mem-type must be 'ddr' or 'hbm', "
+                     "got '")
+          << memType << "'";
+      signalPassFailure();
+      return;
+    }
+    kNumBanks = numBanks;
     DAG dag;
     DenseMap<Operation *, int64_t> loopTripCount;
     DenseMap<Operation *, int64_t> loopBestBanks;
@@ -1680,18 +1898,20 @@ struct BitsOptimiseMappingPass
             parallelFactor > 1 ? (int64_t)llvm::Log2_64(parallelFactor) : 0;
         lp->setAttr("bits.reduce_levels",
                     attrBuilder.getI64IntegerAttr(reduceLevels));
-        // Build inter-bank tree descriptor using the ILP-assigned base bank.
-        // At each level the "right half" of active banks sends to the "left
-        // half"; only the left banks survive to the next level.
+        // Build the inter-bank tree descriptor using the ILP-assigned base
+        // bank. Channel-aware: halve within each channel first (copies stay
+        // on that channel's data bus), then across the per-channel survivors
+        // (one cross-channel copy per surviving pair). The final result
+        // lands in baseBank, as with the legacy stride-halving tree.
         int64_t baseBank = 0;
         if (auto bankAttr = lp->getAttrOfType<IntegerAttr>("bits.bank_id"))
           baseBank = bankAttr.getInt();
+        auto levels = buildChannelAwareReduceTree(
+            buildBankGroup(baseBank, parallelFactor));
         SmallVector<Attribute> treeLevels;
-        for (int64_t step = parallelFactor / 2; step >= 1; step /= 2) {
+        for (const auto &level : levels) {
           SmallVector<Attribute> levelPairs;
-          for (int64_t idx = 0; idx < step; ++idx) {
-            int64_t dstBank = (baseBank + idx) % kNumBanks;
-            int64_t srcBank = (baseBank + idx + step) % kNumBanks;
+          for (const auto &[srcBank, dstBank] : level) {
             NamedAttrList pair;
             pair.set("src_bank",
                      IntegerAttr::get(IntegerType::get(ctx, 64), srcBank));

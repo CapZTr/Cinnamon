@@ -13,6 +13,14 @@ def BitsOptmiseMappingPass : Pass<"bits-opt-mapping", "func::FuncOp"> {
   let summary = "Generate optimal mapping using integer linear programming.";
   let description = [{}];
   let dependentDialects = [];
+  let options = [
+    Option<"numBanks", "num-banks", "int64_t", /*default=*/"32",
+           "Total number of PuD banks to map onto (power of two, <= 128)">,
+    Option<"memType", "mem-type", "std::string", /*default=*/"\"ddr\"",
+           "Target memory: 'ddr' (32 banks/channel; inter-bank row-copy cost "
+           "19/10 AAP-units per bit intra-/cross-channel) or 'hbm' (16 "
+           "banks/channel; 6/3)">,
+  ];
 }
 
 def BitsCubeToSlicePass : Pass<"bits-cube-to-slice", "func::FuncOp"> {
