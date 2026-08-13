@@ -249,6 +249,44 @@ LogicalResult AddIOp::verify() {
   return success();
 }
 
+LogicalResult SubIOp::verify() {
+  auto lhsType = cast<SliceType>(getLhs().getType());
+  auto rhsType = cast<SliceType>(getRhs().getType());
+  auto resType = cast<SliceType>(getResult().getType());
+
+  if (!lhsType || !rhsType || !resType)
+    return emitOpError("operands and result must all be of SliceType");
+
+  if (lhsType.getBitWidth() != rhsType.getBitWidth() ||
+      lhsType.getBitWidth() != resType.getBitWidth())
+    return emitOpError("bit widths of operands and result must match");
+
+  if (lhsType.getVectorLength() != resType.getVectorLength() ||
+      rhsType.getVectorLength() != resType.getVectorLength())
+    return emitOpError("vector lengths of operands and result must match");
+
+  return success();
+}
+
+LogicalResult AddIFullOp::verify() {
+  auto lhsType = cast<SliceType>(getLhs().getType());
+  auto rhsType = cast<SliceType>(getRhs().getType());
+  auto resType = cast<SliceType>(getResult().getType());
+
+  if (lhsType.getBitWidth() != rhsType.getBitWidth())
+    return emitOpError("operand bit widths must match");
+
+  if (resType.getBitWidth() != lhsType.getBitWidth() + 1)
+    return emitOpError("result must be exactly one bit wider than the "
+                       "operands (the carry-out row)");
+
+  if (lhsType.getVectorLength() != resType.getVectorLength() ||
+      rhsType.getVectorLength() != resType.getVectorLength())
+    return emitOpError("vector lengths of operands and result must match");
+
+  return success();
+}
+
 LogicalResult MulIOp::verify() {
   auto lhsType = cast<SliceType>(getLhs().getType());
   auto rhsType = cast<SliceType>(getRhs().getType());
@@ -312,6 +350,38 @@ LogicalResult OrOp::verify() {
 
   if (!lhsType || !rhsType || !resType)
     return emitOpError("operands and result must all be of SliceType");
+
+  if (lhsType.getBitWidth() != rhsType.getBitWidth() ||
+      lhsType.getBitWidth() != resType.getBitWidth())
+    return emitOpError("bit widths of operands and result must match");
+
+  if (lhsType.getVectorLength() != resType.getVectorLength() ||
+      rhsType.getVectorLength() != resType.getVectorLength())
+    return emitOpError("vector lengths of operands and result must match");
+
+  return success();
+}
+
+LogicalResult RangeScanOp::verify() {
+  auto inType = cast<SliceType>(getInput().getType());
+  auto resType = cast<SliceType>(getResult().getType());
+
+  if (resType.getBitWidth() != 1)
+    return emitOpError("result must be a one-bit match mask");
+
+  if (inType.getVectorLength() != resType.getVectorLength())
+    return emitOpError("vector lengths of input and result must match");
+
+  if (inType.getBitWidth() < 1)
+    return emitOpError("scanned column must be at least one bit wide");
+
+  return success();
+}
+
+LogicalResult XNOrOp::verify() {
+  auto lhsType = cast<SliceType>(getLhs().getType());
+  auto rhsType = cast<SliceType>(getRhs().getType());
+  auto resType = cast<SliceType>(getResult().getType());
 
   if (lhsType.getBitWidth() != rhsType.getBitWidth() ||
       lhsType.getBitWidth() != resType.getBitWidth())
