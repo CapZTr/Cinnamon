@@ -50,48 +50,38 @@ llvm::StringRef getBackendName(PudBackend backend);
 // Control rows
 //===----------------------------------------------------------------------===//
 
-/// Control-row slots, mirroring RowOpTracePlayer's slot indices and the rows
-/// init_ambit() sets up in the guest runtime. Slots 0-17 are control rows;
-/// data pools start at 18.
+/// The rows a subarray reserves for computation.
 ///
-/// The group slots name the row sets a single activation drives. Slots 8-11 are
-/// the dual-row activate (DRA) pairs and 12-15 the triple-row activate (TRA)
-/// triples; both are taken from lime's SIMDRAM architecture definition, which
-/// is what the templates below are compiled against.
-///
-/// NOTE: the DRA pairs already agree with the simulator, but its TRA triples are
-/// currently Ambit's -- (T1,T2,T3), (DCC0,T1,T2), (DCC1,T0,T3) -- and three of
-/// the four differ from SIMDRAM's. The simulator's slot table and init_ambit()
-/// have to be switched over before generated code can run; that is a
-/// replacement, not an addition, so slot numbering, the data pool base and the
-/// trace format are all unaffected.
-enum RowSlot : int {
-  SLOT_T0 = 0,
-  SLOT_T1,
-  SLOT_T2,
-  SLOT_T3,
-  SLOT_DCC0,
-  SLOT_DCC0N,
-  SLOT_DCC1,
-  SLOT_DCC1N,
-  // dual-row activate pairs
-  SLOT_DCC0N_T0,
-  SLOT_DCC1N_T1,
-  SLOT_T2_T3,
-  SLOT_T0_T3,
-  // triple-row activate groups (SIMDRAM)
-  SLOT_T0_T1_T2,
-  SLOT_T0_T1_T3,
-  SLOT_DCC0_T1_T3,
-  SLOT_DCC1_T0_T2,
-  // constant rows
-  SLOT_C_0,
-  SLOT_C_1,
+/// Four compute rows and two dual-contact cells, each presenting its value on
+/// one row and its complement on another. The compound names are the row sets a
+/// single activation drives: the pairs, and the triples whose activation leaves
+/// the majority of the three in every one of them. Which sets exist is a
+/// property of the substrate -- they are wired that way -- so they are named
+/// rather than derived. Two constant rows, held at 0 and at 1, complete the set.
+enum class ControlRow {
+  T0,
+  T1,
+  T2,
+  T3,
+  DCC0,
+  DCC0N,
+  DCC1,
+  DCC1N,
+  DCC0N_T0,
+  DCC1N_T1,
+  T2_T3,
+  T0_T3,
+  T0_T1_T2,
+  T0_T1_T3,
+  DCC0_T1_T3,
+  DCC1_T0_T2,
+  C_0,
+  C_1,
 
-  SLOT_DATA_BASE = 18,
+  NUM_CONTROL_ROWS,
 };
 
-llvm::StringRef getSlotName(int slot);
+llvm::StringRef getControlRowName(ControlRow row);
 
 //===----------------------------------------------------------------------===//
 // Instruction templates
@@ -101,7 +91,7 @@ llvm::StringRef getSlotName(int slot);
 /// substrate, or a placeholder the caller binds to a data row.
 struct RowOperand {
   enum class Kind {
-    /// A control row or row group; `index` is a RowSlot.
+    /// A row the subarray reserves for computation; `index` is a ControlRow.
     Control,
     /// The template's `index`-th data input.
     Input,
@@ -114,7 +104,10 @@ struct RowOperand {
   Kind kind = Kind::Control;
   int index = 0;
 
-  static RowOperand control(int slot) { return {Kind::Control, slot}; }
+  static RowOperand control(ControlRow row) {
+    return {Kind::Control, static_cast<int>(row)};
+  }
+  ControlRow getControlRow() const { return static_cast<ControlRow>(index); }
   static RowOperand input(int i) { return {Kind::Input, i}; }
   static RowOperand output(int i) { return {Kind::Output, i}; }
   static RowOperand temp(int i) { return {Kind::Temp, i}; }
@@ -156,7 +149,7 @@ struct RowOpTemplate {
   /// Rows the caller must have loaded before the sequence runs, and where each
   /// result lands. A value appearing in both is loop-carried: it stays resident
   /// in a dual-contact cell across bit iterations, which is what makes a
-  /// bit-serial carry free.
+  /// bit-serial carry cost nothing to keep.
   llvm::SmallVector<RowOperand, 4> inputBindings;
   llvm::SmallVector<RowOperand, 4> outputBindings;
 

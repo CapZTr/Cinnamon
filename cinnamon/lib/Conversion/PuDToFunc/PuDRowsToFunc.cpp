@@ -3,17 +3,20 @@
 // Lowers the PuD row ops to calls into the guest runtime, leaving the loop
 // structure alone so the rest of the pipeline can take it to LLVM IR normally.
 //
-// The three callees are the whole ABI:
+// The ABI is four calls:
 //
-//   void *pud_row_addr(int64_t slot, int64_t bank)
-//   void  rowop_ap (void *dst)
-//   void  rowop_aap(void *dst, void *src)
+//   void *pud_row     (int64_t channel, int64_t rank, int64_t bank,
+//                      int64_t subarray, int64_t row, int32_t group)
+//   void *pud_ctrl_row(int64_t channel, int64_t rank, int64_t bank,
+//                      int64_t subarray, int32_t ctrlRow)
+//   void  rowop_ap    (void *dst)
+//   void  rowop_aap   (void *dst, void *src)
 //
-// `rowop_ap` and `rowop_aap` are the existing guest stubs -- two-byte opcodes
-// the CPU decodes into row-op microops, with their pointer arguments arriving in
-// the usual argument registers. `pud_row_addr` is the runtime's own: row slots
-// are allocated as row-aligned blocks, so only the program that allocated them
-// can turn a (slot, bank) pair into an address.
+// The two address calls are where a location becomes something a target can
+// execute against: the dialect says which row of which bank, and the target
+// runtime, which owns the memory, says where that is. Control rows go through
+// their own call because they are named rather than numbered -- the substrate
+// reserves them, so the runtime knows where they are without being told.
 //
 //===----------------------------------------------------------------------===//
 
@@ -52,20 +55,53 @@ func::FuncOp getOrDeclare(ModuleOp module, StringRef name, FunctionType type) {
   return fn;
 }
 
-struct RowAddrLowering : public OpConversionPattern<RowAddrOp> {
+/// A data row: the full coordinate, plus which group of the row space it is in.
+struct GetRowLowering : public OpConversionPattern<GetRowOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(RowAddrOp op, OpAdaptor adaptor,
+  matchAndRewrite(GetRowOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto module = op->getParentOfType<ModuleOp>();
     auto ptrType = LLVM::LLVMPointerType::get(op.getContext());
-    auto type = rewriter.getFunctionType({rewriter.getI64Type(),
-                                          rewriter.getI64Type()},
-                                         {ptrType});
-    func::FuncOp callee = getOrDeclare(module, "pud_row_addr", type);
+    auto i64 = rewriter.getI64Type();
+    auto i32 = rewriter.getI32Type();
+    auto type =
+        rewriter.getFunctionType({i64, i64, i64, i64, i64, i32}, {ptrType});
+    func::FuncOp callee = getOrDeclare(module, "pud_row", type);
+
+    auto rowType = cast<RowType>(op.getAddr().getType());
+    Value group = rewriter.create<arith::ConstantIntOp>(
+        op.getLoc(), rowType.getGroup(), 32);
     rewriter.replaceOpWithNewOp<func::CallOp>(
-        op, callee, ValueRange{adaptor.getSlot(), adaptor.getBank()});
+        op, callee,
+        ValueRange{adaptor.getChannelID(), adaptor.getRankID(),
+                   adaptor.getBankID(), adaptor.getSubarrayID(),
+                   adaptor.getRowID(), group});
+    return success();
+  }
+};
+
+/// A control row: named rather than numbered, so the name is what crosses.
+struct GetCtrlRowLowering : public OpConversionPattern<GetCtrlRowOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(GetCtrlRowOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto module = op->getParentOfType<ModuleOp>();
+    auto ptrType = LLVM::LLVMPointerType::get(op.getContext());
+    auto i64 = rewriter.getI64Type();
+    auto i32 = rewriter.getI32Type();
+    auto type = rewriter.getFunctionType({i64, i64, i64, i64, i32}, {ptrType});
+    func::FuncOp callee = getOrDeclare(module, "pud_ctrl_row", type);
+
+    Value which = rewriter.create<arith::ConstantIntOp>(
+        op.getLoc(), static_cast<int64_t>(op.getCtrlRow()), 32);
+    rewriter.replaceOpWithNewOp<func::CallOp>(
+        op, callee,
+        ValueRange{adaptor.getChannelID(), adaptor.getRankID(),
+                   adaptor.getBankID(), adaptor.getSubarrayID(), which});
     return success();
   }
 };
@@ -122,7 +158,8 @@ struct ConvertPuDRowsToFunc
                            scf::SCFDialect, LLVM::LLVMDialect>();
 
     RewritePatternSet patterns(ctx);
-    patterns.add<RowAddrLowering, AAPLowering, APLowering>(converter, ctx);
+    patterns.add<GetRowLowering, GetCtrlRowLowering, AAPLowering, APLowering>(
+        converter, ctx);
 
     if (failed(applyPartialConversion(func, target, std::move(patterns))))
       signalPassFailure();

@@ -238,25 +238,26 @@ std::optional<unsigned> getRequiredCommands(RowOpKind kind) {
 // lime cell -> row slot
 //===----------------------------------------------------------------------===//
 
-/// A destination group, as the set of cells one activation drives.
+/// A row set one activation drives, as the cells lime names it by.
 struct GroupPattern {
-  int slot;
+  ControlRow row;
   llvm::SmallVector<std::pair<const char *, uint32_t>, 3> cells;
   llvm::SmallVector<bool, 3> inverted;
 };
 
-/// The row groups of lime's SIMDRAM architecture, in the slot order the
-/// simulator and the guest runtime lay them out.
+/// The row sets SIMDRAM wires together: two dual-row pairs involving a
+/// dual-contact cell's complement, two more between compute rows, and four
+/// triples whose activation leaves the majority of the three in all of them.
 const std::array<GroupPattern, 8> &getSimdramGroups() {
   static const std::array<GroupPattern, 8> groups = {{
-      {SLOT_DCC0N_T0, {{"DCC", 0}, {"T", 0}}, {true, false}},
-      {SLOT_DCC1N_T1, {{"DCC", 1}, {"T", 1}}, {true, false}},
-      {SLOT_T2_T3, {{"T", 2}, {"T", 3}}, {false, false}},
-      {SLOT_T0_T3, {{"T", 0}, {"T", 3}}, {false, false}},
-      {SLOT_T0_T1_T2, {{"T", 0}, {"T", 1}, {"T", 2}}, {false, false, false}},
-      {SLOT_T0_T1_T3, {{"T", 0}, {"T", 1}, {"T", 3}}, {false, false, false}},
-      {SLOT_DCC0_T1_T3, {{"DCC", 0}, {"T", 1}, {"T", 3}}, {false, false, false}},
-      {SLOT_DCC1_T0_T2, {{"DCC", 1}, {"T", 0}, {"T", 2}}, {false, false, false}},
+      {ControlRow::DCC0N_T0, {{"DCC", 0}, {"T", 0}}, {true, false}},
+      {ControlRow::DCC1N_T1, {{"DCC", 1}, {"T", 1}}, {true, false}},
+      {ControlRow::T2_T3, {{"T", 2}, {"T", 3}}, {false, false}},
+      {ControlRow::T0_T3, {{"T", 0}, {"T", 3}}, {false, false}},
+      {ControlRow::T0_T1_T2, {{"T", 0}, {"T", 1}, {"T", 2}}, {false, false, false}},
+      {ControlRow::T0_T1_T3, {{"T", 0}, {"T", 1}, {"T", 3}}, {false, false, false}},
+      {ControlRow::DCC0_T1_T3, {{"DCC", 0}, {"T", 1}, {"T", 3}}, {false, false, false}},
+      {ControlRow::DCC1_T0_T2, {{"DCC", 1}, {"T", 0}, {"T", 2}}, {false, false, false}},
   }};
   return groups;
 }
@@ -290,14 +291,17 @@ public:
   RowOperand resolve(const ffi_cell &cell, bool inverted) {
     llvm::StringRef type = typeName(cell);
     if (type == "bool")
-      return RowOperand::control(cell.cell_index != 0 ? SLOT_C_1 : SLOT_C_0);
+      return RowOperand::control(cell.cell_index != 0 ? ControlRow::C_1
+                                                      : ControlRow::C_0);
     if (type == "T")
-      return RowOperand::control(SLOT_T0 + static_cast<int>(cell.cell_index));
+      return RowOperand::control(static_cast<ControlRow>(
+          static_cast<int>(ControlRow::T0) + cell.cell_index));
     if (type == "DCC") {
-      // the two rows of a dual-contact cell sit next to each other; the odd one
-      // presents the complement
-      int base = SLOT_DCC0 + 2 * static_cast<int>(cell.cell_index);
-      return RowOperand::control(inverted ? base + 1 : base);
+      // a dual-contact cell presents its value on one row and its complement on
+      // another; the two are adjacent in the enumeration
+      int base = static_cast<int>(ControlRow::DCC0) + 2 * cell.cell_index;
+      return RowOperand::control(
+          static_cast<ControlRow>(inverted ? base + 1 : base));
     }
     if (type == "D") {
       auto it = dataRows.find(cell.cell_index);
@@ -321,7 +325,7 @@ public:
       if (group.cells.size() != operands.size())
         continue;
       if (matches(group, operands))
-        return RowOperand::control(group.slot);
+        return RowOperand::control(group.row);
     }
     llvm::report_fatal_error(
         "lime emitted a row group that the SIMDRAM slot table does not name");
@@ -467,28 +471,29 @@ llvm::StringRef mlir::bits::getBackendName(PudBackend backend) {
   llvm_unreachable("unhandled backend");
 }
 
-llvm::StringRef mlir::bits::getSlotName(int slot) {
-  switch (slot) {
-  case SLOT_T0: return "T0";
-  case SLOT_T1: return "T1";
-  case SLOT_T2: return "T2";
-  case SLOT_T3: return "T3";
-  case SLOT_DCC0: return "DCC0";
-  case SLOT_DCC0N: return "DCC0N";
-  case SLOT_DCC1: return "DCC1";
-  case SLOT_DCC1N: return "DCC1N";
-  case SLOT_DCC0N_T0: return "DCC0N_T0";
-  case SLOT_DCC1N_T1: return "DCC1N_T1";
-  case SLOT_T2_T3: return "T2_T3";
-  case SLOT_T0_T3: return "T0_T3";
-  case SLOT_T0_T1_T2: return "T0_T1_T2";
-  case SLOT_T0_T1_T3: return "T0_T1_T3";
-  case SLOT_DCC0_T1_T3: return "DCC0_T1_T3";
-  case SLOT_DCC1_T0_T2: return "DCC1_T0_T2";
-  case SLOT_C_0: return "C_0";
-  case SLOT_C_1: return "C_1";
-  default: return "?";
+llvm::StringRef mlir::bits::getControlRowName(ControlRow row) {
+  switch (row) {
+  case ControlRow::T0: return "T0";
+  case ControlRow::T1: return "T1";
+  case ControlRow::T2: return "T2";
+  case ControlRow::T3: return "T3";
+  case ControlRow::DCC0: return "DCC0";
+  case ControlRow::DCC0N: return "DCC0N";
+  case ControlRow::DCC1: return "DCC1";
+  case ControlRow::DCC1N: return "DCC1N";
+  case ControlRow::DCC0N_T0: return "DCC0N_T0";
+  case ControlRow::DCC1N_T1: return "DCC1N_T1";
+  case ControlRow::T2_T3: return "T2_T3";
+  case ControlRow::T0_T3: return "T0_T3";
+  case ControlRow::T0_T1_T2: return "T0_T1_T2";
+  case ControlRow::T0_T1_T3: return "T0_T1_T3";
+  case ControlRow::DCC0_T1_T3: return "DCC0_T1_T3";
+  case ControlRow::DCC1_T0_T2: return "DCC1_T0_T2";
+  case ControlRow::C_0: return "C_0";
+  case ControlRow::C_1: return "C_1";
+  case ControlRow::NUM_CONTROL_ROWS: break;
   }
+  llvm_unreachable("unhandled control row");
 }
 
 llvm::StringRef mlir::bits::getRowOpName(RowOpKind kind) {
@@ -522,7 +527,7 @@ RowOpKind mlir::bits::getRangeScanKind(bool lowerBit, bool upperBit) {
 std::string RowOperand::str() const {
   switch (kind) {
   case Kind::Control:
-    return getSlotName(index).str();
+    return getControlRowName(getControlRow()).str();
   case Kind::Input:
     return "in" + std::to_string(index);
   case Kind::Output:

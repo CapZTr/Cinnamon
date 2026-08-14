@@ -24,4 +24,5 @@ using namespace mlir::pud;
 void PuDDialect::initialize() {
   registerOps();
   registerTypes();
+  registerAttributes();
 }

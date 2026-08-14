@@ -1,107 +1,33 @@
 #include "cinm-mlir/Dialect/PuD/Codegen/AddressAllocator.h"
 
+#include <cassert>
 
-RowAddress AddressAllocator::allocate(int64_t numRows) {
-  assert(numRows <= MAX_ROW);
+using namespace mlir::pud;
 
-  if (fixedBank >= 0) {
-    if (currentRow + numRows > MAX_ROW) {
-      currentRow = 0;
-      ++currentSubarray;
-      if (currentSubarray > MAX_SUBARRAY) {
-        currentSubarray = 0;
-      }
-    }
-
-    RowAddress addr = {currentChannel,
-                       currentRank,
-                       fixedBank,
-                       currentSubarray,
-                       currentRow};
-    currentRow += numRows;
-    return addr;
-  }
-
-  auto subArrayID = checkSpace(numRows);
-  auto saLocalID = subArrayID % 64;
-
-  int64_t channel = currentChannel;
-  int64_t rank = currentRank;
-  int64_t bank = currentBank;
-  int64_t sa = currentSubarray;
-  int64_t row = currentRow;
-  if (saLocalID == currentBank) {
-    currentRow += numRows;
-    row = currentRow;
-  } else if (subArrayID == -1) {
-    currentRow = 0;
-    ++currentSubarray;
-    if (currentSubarray > MAX_SUBARRAY) {
-      currentSubarray = 0;
-      ++currentBank;
-      if (currentBank > MAX_BANK) {
-        currentBank = 0;
-        ++currentRank;
-        if (currentRank > MAX_RANK) {
-          currentRank = 0;
-          ++currentChannel;
-          if (currentChannel > MAX_CHANNEL) {
-          }
-        }
-      }
-    }
-    channel = currentChannel;
-    rank = currentRank;
-    bank = currentRank;
-    sa = currentSubarray;
-    row = currentRow;
-  } else {
-    int64_t channelSANum = 2 * 8 * 64;
-    channel = subArrayID < channelSANum ? 0 : 1;
-
-    auto saChannelID = subArrayID % channelSANum;
-    int64_t rankSANum = 8 * 64;
-
-    rank = saChannelID < rankSANum ? 0 : 1;
-    auto saRankID = saChannelID % rankSANum;
-
-    bank = saRankID / 8;
-
-    sa = saLocalID;
-    auto space = restSpace.lookup(subArrayID);
-    row = MAX_ROW - space;
-  }
-
-  RowAddress addr = { 
-      channel, 
-      rank, 
-      bank, 
-      sa, 
-      row-numRows
-  };
-
-  int64_t saToUpdate = channel * 2 + rank * 2 + bank * 8 + sa;
-  int64_t rest = MAX_ROW - row - numRows;
-  restSpace[saToUpdate] = rest;
-
+RowAddress AddressAllocator::bankAddress(int64_t flatBank) const {
+  assert(geometry.banksPerChannel > 0 && "a channel holds at least one bank");
+  RowAddress addr;
+  // The mapping numbers banks flatly across the whole memory; a channel holds a
+  // fixed number of them, so the index splits on that boundary.
+  addr.channel = flatBank / geometry.banksPerChannel;
+  addr.bank = flatBank % geometry.banksPerChannel;
+  // Ranks are part of the coordinate but nothing distributes over them yet.
+  addr.rank = 0;
+  addr.subarray = 0;
+  addr.row = 0;
   return addr;
 }
 
-RowAddress AddressAllocator::getRowFromOffset(
-    const RowAddress &base, const int64_t offset) {
-  auto rowID = base.row + offset;
-  assert(rowID <= MAX_ROW);
-  return {base.channel, base.rank, base.bank, base.subarray, rowID};
+RowAddress AddressAllocator::allocate(int64_t flatBank, int64_t numRows) {
+  assert(numRows > 0 && "an allocation covers at least one row");
+  RowAddress addr = bankAddress(flatBank);
+  int64_t &next = nextRow[flatBank];
+  addr.row = next;
+  next += numRows;
+  return addr;
 }
 
-int AddressAllocator::checkSpace(int64_t numRows) const {
-  if (restSpace.empty()) {
-    return 0;
-  }
-  int subArrayID = -1;
-  for (const auto &pair : restSpace) {
-    if (numRows <= pair.second)
-      subArrayID = pair.first;
-  }
-  return subArrayID;
+int64_t AddressAllocator::rowsAllocated(int64_t flatBank) const {
+  auto it = nextRow.find(flatBank);
+  return it == nextRow.end() ? 0 : it->second;
 }

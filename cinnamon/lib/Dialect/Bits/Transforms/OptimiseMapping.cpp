@@ -2588,6 +2588,24 @@ struct BitsOptimiseMappingPass
     kEmitTrace = emitTrace;
     kWideAdd = wideAdd;
     kNumBanks = numBanks;
+
+    // Record how the memory this mapping chose banks in is organised. Banks are
+    // numbered flatly here; anything downstream that has to turn one of those
+    // numbers back into a location needs to split it the same way, and guessing
+    // is how the two would come to disagree.
+    if (auto module = func->getParentOfType<ModuleOp>()) {
+      OpBuilder builder(func.getContext());
+      module->setAttr(
+          "bits.memory_geometry",
+          builder.getDictionaryAttr({
+              builder.getNamedAttr("total_banks",
+                                   builder.getI64IntegerAttr(numBanks)),
+              builder.getNamedAttr("banks_per_channel",
+                                   builder.getI64IntegerAttr(kBanksPerChannel)),
+              builder.getNamedAttr("ranks_per_channel",
+                                   builder.getI64IntegerAttr(1)),
+          }));
+    }
     DAG dag;
     DenseMap<Operation *, int64_t> loopTripCount;
     DenseMap<Operation *, int64_t> loopBestBanks;

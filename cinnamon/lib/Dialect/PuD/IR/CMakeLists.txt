@@ -1,4 +1,5 @@
 add_mlir_dialect_library(PuDIR
+    PuDAttributes.cpp
     PuDBase.cpp
     PuDOps.cpp
     PuDTypes.cpp

@@ -8,6 +8,7 @@
 #define PUD_OPS
 
 include "PuDBase.td"
+include "PuDAttributes.td"
 include "PuDTypes.td"
 
 include "cinm-mlir/Dialect/Bits/IR/BitsTypes.td"
@@ -19,9 +20,18 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 
 def AAPOp : PuD_Op<"AAP", [Pure]> {
   let summary = "Activate ; Activate ; Precharge";
-  let description = [{}];
+  let description = [{
+    Copies the source row into the destination, which may name a set of rows
+    driven by one activation rather than a single row. Both operand staging and
+    result write-back are this op; a compute step is an AP on a row set whose
+    activation leaves the majority of its rows in all of them.
+  }];
 
-  let arguments = (ins RowType:$srcAddr, RowType:$dstAddr);
+  let arguments = (ins
+    RowType:$srcAddr,
+    RowType:$dstAddr,
+    PuD_BackendAttr:$backend
+  );
 
   let assemblyFormat = "$srcAddr `,` $dstAddr attr-dict `:` "
       "qualified(type($srcAddr)) `,` qualified(type($dstAddr))";
@@ -30,9 +40,13 @@ def AAPOp : PuD_Op<"AAP", [Pure]> {
 
 def APOp : PuD_Op<"AP", [Pure]> {
   let summary = "Activate ; Precharge";
-  let description = [{}];
+  let description = [{
+    Activates one row set and precharges. Where the set holds three rows the
+    activation leaves their majority in every one of them, which is how a
+    compute step is expressed; nothing is read out.
+  }];
 
-  let arguments = (ins RowType:$addr);
+  let arguments = (ins RowType:$addr, PuD_BackendAttr:$backend);
 
   let assemblyFormat = "$addr attr-dict `:` qualified(type($addr))";
   let hasVerifier = 1;
@@ -62,29 +76,31 @@ def LoadOp : PuD_Op<"load", [Pure]> {
   let hasVerifier = 1;
 }
 
-def RowAddrOp : PuD_Op<"row_addr", [Pure]> {
-  let summary = "Address of one bank's copy of a row slot";
+def GetCtrlRowOp : PuD_Op<"get_ctrl_row", [Pure]> {
+  let summary = "Address of a reserved control row";
   let description = [{
-    A row slot is a logical row that exists once per bank: slots 0-17 are the
-    control rows the guest runtime sets up (T0-T3, the dual-contact cells, their
-    activation groups and the two constant rows), and slots 18 and up are the
-    data pools the kernel computes in. `bank` selects which bank's copy this
-    address refers to, so issuing the same slot across a bank range is what
-    makes banks run a row op in parallel.
+    Names one of the rows a subarray reserves for computation -- the compute
+    rows, the dual-contact cells and their complements, the row sets a single
+    activation drives, and the two constant rows. Which rows exist and which
+    sets are wired together is a property of the substrate, so they are named
+    rather than computed, and the name is what appears in the IR.
 
-    This is the only way a row address enters the PuD dialect. It replaces
-    `get_row`'s channel/rank/bank/subarray/row tuple, which described a
-    coordinate the guest runtime has no way to ask for: under gem5's SE mode the
-    program allocates row-aligned blocks and lets the address map decide where
-    they land, so a slot index plus a bank is exactly as much as the program can
-    actually name.
+    Only the subarray has to be given: a control row is at the same place in
+    every subarray of the substrate.
   }];
 
-  let arguments = (ins I64:$slot, I64:$bank);
+  let arguments = (ins
+    I64:$channelID,
+    I64:$rankID,
+    I64:$bankID,
+    I64:$subarrayID,
+    PuD_SimdramCtrlRowAttr:$ctrlRow
+  );
   let results = (outs RowType:$addr);
 
-  let assemblyFormat = "$slot `,` $bank attr-dict `:` type($slot) `,` "
-      "type($bank) `->` qualified(type($addr))";
+  let assemblyFormat = "$ctrlRow `,` $channelID `,` $rankID `,` $bankID `,` "
+      "$subarrayID attr-dict `:` type($channelID) `,` type($rankID) `,` "
+      "type($bankID) `,` type($subarrayID) `->` qualified(type($addr))";
 }
 
 def GetRowOp : PuD_Op<"get_row", [Pure]> {
