@@ -1,5 +1,6 @@
 add_mlir_conversion_library(MLIRBitsToPuD
   BitsToPuD.cpp
+  BitsRowsToPuD.cpp
   ${CMAKE_SOURCE_DIR}/lib/Dialect/Bits/Codegen/NetworkBuilder.cpp
   ${CMAKE_SOURCE_DIR}/lib/Dialect/PuD/Codegen/AddressAllocator.cpp
   ${CMAKE_SOURCE_DIR}/lib/Dialect/PuD/Codegen/OperandTracker.cpp
@@ -23,7 +24,9 @@ add_mlir_conversion_library(MLIRBitsToPuD
     MLIRTensorDialect
     MLIRTransformUtils
     MLIRReconcileUnrealizedCasts
+    MLIRSCFDialect
     PuDIR
+    BitsCodegen
 )
 
 target_link_libraries(MLIRBitsToPuD PUBLIC PuDCodegen)

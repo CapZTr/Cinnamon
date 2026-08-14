@@ -45,6 +45,8 @@ using namespace mlir::pud;
 
 using MIG = mockturtle::mig_network;
 
+#include <mlir/Dialect/SCF/IR/SCF.h>
+
 #define GEN_PASS_CLASSES
 #include <cinm-mlir/Conversion/BitsPasses.h.inc>
 

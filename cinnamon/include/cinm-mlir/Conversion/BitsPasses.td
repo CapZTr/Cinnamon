@@ -24,4 +24,36 @@ def ConvertBitsToPuD : Pass<"convert-bits-to-pud", operation="func::FuncOp"> {
   ];
 }
 
+def ConvertBitsRowsToPuD
+    : Pass<"convert-bits-rows-to-pud", operation="func::FuncOp"> {
+  let summary = "Lower row-level Bits ops to PuD row ops";
+  let description = [{
+    Turns each row-level Bits op into the row-op sequence the substrate actually
+    executes, by instantiating the template RowOpLibrary compiled for it and
+    binding the template's operands to concrete row slots.
+
+    This runs after `bits-opt-mapping` and `bits-pattern-apply`: the first
+    annotates the tile loop with the banks it was mapped onto, the second turns
+    slice ops into loops over bit rows. Each row op is emitted once per bank in
+    the mapped range, command by command -- the same order the trace player
+    replays, which is what lets banks overlap their activations.
+
+    Distinct from `convert-bits-to-pud`, which builds one majority-inverter
+    graph for a whole function and does not scale past small kernels.
+  }];
+  let constructor = "mlir::bits::createConvertBitsRowsToPuDPass()";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::bits::BitsDialect",
+    "mlir::func::FuncDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::pud::PuDDialect"
+  ];
+  let options = [
+    Option<"backend", "backend", "std::string", /*default=*/"\"simdram\"",
+           "PuD substrate whose row-op templates are instantiated. Must match "
+           "the backend the mapping was priced for.">
+  ];
+}
+
 #endif // BITS_CONVERSION_PASSES

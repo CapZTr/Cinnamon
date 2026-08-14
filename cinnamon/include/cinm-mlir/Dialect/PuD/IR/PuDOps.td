@@ -62,6 +62,31 @@ def LoadOp : PuD_Op<"load", [Pure]> {
   let hasVerifier = 1;
 }
 
+def RowAddrOp : PuD_Op<"row_addr", [Pure]> {
+  let summary = "Address of one bank's copy of a row slot";
+  let description = [{
+    A row slot is a logical row that exists once per bank: slots 0-17 are the
+    control rows the guest runtime sets up (T0-T3, the dual-contact cells, their
+    activation groups and the two constant rows), and slots 18 and up are the
+    data pools the kernel computes in. `bank` selects which bank's copy this
+    address refers to, so issuing the same slot across a bank range is what
+    makes banks run a row op in parallel.
+
+    This is the only way a row address enters the PuD dialect. It replaces
+    `get_row`'s channel/rank/bank/subarray/row tuple, which described a
+    coordinate the guest runtime has no way to ask for: under gem5's SE mode the
+    program allocates row-aligned blocks and lets the address map decide where
+    they land, so a slot index plus a bank is exactly as much as the program can
+    actually name.
+  }];
+
+  let arguments = (ins I64:$slot, I64:$bank);
+  let results = (outs RowType:$addr);
+
+  let assemblyFormat = "$slot `,` $bank attr-dict `:` type($slot) `,` "
+      "type($bank) `->` qualified(type($addr))";
+}
+
 def GetRowOp : PuD_Op<"get_row", [Pure]> {
   let summary = "";
   let description = [{}];

@@ -1,5 +1,6 @@
 add_mlir_conversion_library(MLIRPuDToFunc
   PuDToFunc.cpp
+  PuDRowsToFunc.cpp
 
   ADDITIONAL_HEADER_DIRS
     ${MLIR_MAIN_INCLUDE_DIR}/pud/Conversion/PuDToFunc
@@ -17,4 +18,6 @@ add_mlir_conversion_library(MLIRPuDToFunc
     MLIRLLVMDialect
     MLIRTransformUtils
     MLIRReconcileUnrealizedCasts
+    MLIRSCFDialect
+    MLIRArithDialect
 )

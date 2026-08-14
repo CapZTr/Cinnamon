@@ -24,6 +24,8 @@
 using namespace mlir;
 using namespace mlir::pud;
 
+#include <mlir/Dialect/SCF/IR/SCF.h>
+
 #define GEN_PASS_CLASSES
 #include <cinm-mlir/Conversion/PuDPasses.h.inc>
 
