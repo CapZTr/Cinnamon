@@ -19,6 +19,12 @@ set(MOCKTURTLE_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(MOCKTURTLE_TEST OFF CACHE BOOL "" FORCE)
 set(MOCKTURTLE_EXPERIMENTS OFF CACHE BOOL "" FORCE)
 add_compile_definitions(FMT_HEADER_ONLY)
+# mockturtle's bundled percy carries this as an INTERFACE definition, but MLIR's
+# add_mlir_library compiles through an obj.<name> target that does not pick up
+# link-interface usage requirements, so percy/dag.hpp would try to include
+# nauty.h. Set it project-wide alongside FMT_HEADER_ONLY, which is here for the
+# same reason.
+add_compile_definitions(DISABLE_NAUTY)
 add_subdirectory(${CMAKE_SOURCE_DIR}/extern/lime)
 if (TARGET fmt AND NOT TARGET cinm::fmt)
   add_library(cinm::fmt ALIAS fmt)

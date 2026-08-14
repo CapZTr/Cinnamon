@@ -12,21 +12,14 @@ add_mlir_dialect_library(PuDCodegen
     MLIRFuncDialect
 )
 
+# mockturtle now lives under lime/eggmock/mockturtle and exports its headers
+# (plus kitty/lorina/fmt/... ) through the `eggmock` interface target, so linking
+# lime_base is enough; only lime's own headers (gp.h, utils.h) need a raw path.
 target_include_directories(PuDCodegen PRIVATE
-  ${CMAKE_SOURCE_DIR}/extern/lime/mockturtle/include
   ${CMAKE_SOURCE_DIR}/extern/lime/src
-  ${CMAKE_SOURCE_DIR}/extern/lime/eggmock/include
 )
 
-file(GLOB LIB_DIRS "${CMAKE_SOURCE_DIR}/extern/lime/mockturtle/lib/*")
-
-foreach(dir ${LIB_DIRS})
-  if(IS_DIRECTORY "${dir}")
-    target_include_directories(PuDCodegen PRIVATE ${dir})
-  endif()
-endforeach()
-
-target_link_libraries(PuDCodegen PUBLIC cinm::fmt)
+target_link_libraries(PuDCodegen PUBLIC cinm::fmt lime_base)
 target_compile_definitions(PuDCodegen PRIVATE FMT_HEADER_ONLY)
 
 set_source_files_properties(

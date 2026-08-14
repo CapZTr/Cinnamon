@@ -28,18 +28,12 @@ add_mlir_conversion_library(MLIRBitsToPuD
 
 target_link_libraries(MLIRBitsToPuD PUBLIC PuDCodegen)
 
+# mockturtle now lives under lime/eggmock/mockturtle and exports its headers
+# (plus kitty/lorina/fmt/... ) through the `eggmock` interface target, so linking
+# lime_base is enough; only lime's own headers (gp.h, utils.h) need a raw path.
 target_include_directories(MLIRBitsToPuD PRIVATE
-  ${CMAKE_SOURCE_DIR}/extern/lime/mockturtle/include
   ${CMAKE_SOURCE_DIR}/extern/lime/src
 )
-
-file(GLOB LIB_DIRS "${CMAKE_SOURCE_DIR}/extern/lime/mockturtle/lib/*")
-
-foreach(dir ${LIB_DIRS})
-  if(IS_DIRECTORY "${dir}")
-    target_include_directories(MLIRBitsToPuD PRIVATE ${dir})
-  endif()
-endforeach()
 
 target_link_libraries(MLIRBitsToPuD PUBLIC cinm::fmt)
 # target_link_libraries(MLIRBitsToPuD PRIVATE lime_base fmt-local)
