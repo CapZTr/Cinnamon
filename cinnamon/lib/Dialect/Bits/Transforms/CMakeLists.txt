@@ -10,6 +10,7 @@ DEPENDS
 LINK_LIBS PUBLIC
   MLIRIR
   MLIRTransformUtils
+  BitsCodegen
 )
 
 # set(GUROBI_ROOT "/home/tianruiz/gurobi/linux64")

@@ -47,6 +47,26 @@ def BitsOptmiseMappingPass : Pass<"bits-opt-mapping", "func::FuncOp"> {
            "XNOR and range scan dearer -- so a schedule is only optimal for "
            "the substrate it was priced for. Must match the simulator's "
            "--backend.">,
+    Option<"costSource", "cost-source", "std::string", /*default=*/"\"lime\"",
+           "Where the per-op row-op counts come from. 'lime': compile each "
+           "row-op primitive from its majority-inverter graph, with SAT "
+           "equivalence checking, and count the instructions -- the same "
+           "templates code generation emits, so an op's price and the code "
+           "produced for it cannot drift apart. 'legacy': the hand-maintained "
+           "table calibrated against the simulator's expand* routines, kept "
+           "for comparison. The two agree exactly on add/and/or/relu/min/max "
+           "and multiply; they differ on sub, xnor and the range scan, where "
+           "`rowop-sanity` prints both. Backends lime has no architecture "
+           "definition for (everything but simdram) fall back to the legacy "
+           "table whichever is selected.">,
+    Option<"emitTrace", "emit-trace", "bool", /*default=*/"true",
+           "Write the CIMTRACE binary the trace player replays. On by default "
+           "so the pass behaves exactly as before; the pud code generation "
+           "path turns it off, because it needs the mapping annotations "
+           "without the side effect of writing a large trace to a shared "
+           "path. Transitional: once simulation is entered through generated "
+           "code rather than the trace player, this format has no consumer "
+           "left.">,
     Option<"wideAdd", "wide-add", "bool", /*default=*/"false",
            "Emit every plain bits.add_i as a WIDENING add (trace kind "
            "OP_ADDI_WIDE): one extra row-op stores the carry-out, so the sum "

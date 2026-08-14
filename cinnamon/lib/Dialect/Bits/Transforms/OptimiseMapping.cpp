@@ -1,3 +1,4 @@
+#include "cinm-mlir/Dialect/Bits/Codegen/RowOpLibrary.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 #include "cinm-mlir/Dialect/Bits/Transforms/Passes.h"
 #include "gurobi_c++.h"
@@ -117,11 +118,37 @@ static int64_t costWidth(int64_t bw) { return kBlindWidth ? 1 : bw; }
 enum class Backend { Simdram, Prada };
 static Backend kBackend = Backend::Simdram;
 
+// Where the per-op row-op counts come from (pass option cost-source). With
+// `lime`, each primitive is compiled from its majority-inverter graph and its
+// instructions counted, which is the same template code generation emits -- so
+// an op's price and the code produced for it are one artifact rather than two
+// that have to be kept in step by hand. `legacy` keeps the hand-maintained
+// formulas below for comparison. Every op falls back to the legacy formula when
+// lime has nothing to say, which today means every backend but SIMDRAM.
+enum class CostSource { Lime, Legacy };
+static CostSource kCostSource = CostSource::Lime;
+
+// Total commands for a slice-level op from the compiled row-op templates, or
+// nullopt to let the legacy formula answer.
+static std::optional<int64_t>
+limeRecipeCost(std::optional<bits::RowOpRecipe> recipe) {
+  if (kCostSource != CostSource::Lime || !recipe)
+    return std::nullopt;
+  bits::PudBackend backend = kBackend == Backend::Prada
+                                 ? bits::PudBackend::Prada
+                                 : bits::PudBackend::Simdram;
+  return recipe->totalCommands(backend);
+}
+
 // Emit plain bits.add_i as a WIDENING add (pass option wide-add): same
 // operands, one extra row-op to store the carry-out, and a result one bit wider
 // -- so the sum cannot silently wrap. Both the price and the emitted record
 // kind move together; see makeAddiEvent.
 static bool kWideAdd = false;
+// Write the CIMTRACE binary (pass option emit-trace). On by default so the pass
+// behaves as it always has; the pud code generation path turns it off, since it
+// wants the mapping annotations without a large trace landing on a shared path.
+static bool kEmitTrace = true;
 // Intra-bank lane-fold copy: one AAP per bit-plane row, matching how the
 // gem5 RowOpTracePlayer replays src==dst ROW_COPY records (same-subarray
 // RowClone FPM path, tRAS+tWLOV+tRP per row). NOTE this is a deliberate
@@ -346,40 +373,61 @@ static int64_t getComputeLatency(Operation *op) {
   if (auto add = dyn_cast<AddIOp>(op)) {
     // With wide-add on, this op is emitted as the widening add and must be
     // priced as one: the carry-out store is one extra row-op.
+    int64_t width = getSliceBitwidth(add.getResult());
+    if (auto c = limeRecipeCost(bits::getRecipeForAdd(width, kWideAdd)))
+      return *c;
     int64_t perBit = prada ? 6 : 8;
-    return perBit * getSliceBitwidth(add.getResult()) + (kWideAdd ? 2 : 1);
+    return perBit * width + (kWideAdd ? 2 : 1);
   }
   // Subtraction reuses the full-adder chain with the carry initialised to one
   // and the subtrahend complemented. The adder reads the subtrahend row twice
   // per bit, so the complement must be materialised rather than read on the fly:
   // one extra AAP per bit through a dual-contact cell on SIMDRAM (9n + 1), one
   // extra single-command NOT per bit on PRADA (7n + 1).
-  if (auto sub = dyn_cast<SubIOp>(op))
-    return (prada ? 7 : 9) * getSliceBitwidth(sub.getResult()) + 1;
+  if (auto sub = dyn_cast<SubIOp>(op)) {
+    int64_t width = getSliceBitwidth(sub.getResult());
+    if (auto c = limeRecipeCost(bits::getRecipeForSub(width)))
+      return *c;
+    return (prada ? 7 : 9) * width + 1;
+  }
   if (auto mul = dyn_cast<MulIOp>(op)) {
     int64_t m = getSliceBitwidth(mul.getLhs());
     int64_t n = getSliceBitwidth(mul.getRhs());
     // shift-add over the same schedule on both backends; only the per-bit AND
     // and full-adder underneath it change.
+    if (auto c = limeRecipeCost(bits::getRecipeForMul(m, n)))
+      return *c;
     return prada ? 10 * m * n + 4 * m - 5 : 13 * m * n + 4 * m - 8;
   }
   // Widening add: 1 carry init + one full adder per bit + 1 carry-out store.
   // Charging the operand width (not the result width) is the whole point --
   // it is what makes this cheaper than pre-extending both operands and using
   // a truncating bits.add_i, which would cost 8*(n+1) + 1 (SIMDRAM).
-  if (auto addFull = dyn_cast<AddIFullOp>(op))
-    return (prada ? 6 : 8) * getSliceBitwidth(addFull.getLhs()) + 2;
+  if (auto addFull = dyn_cast<AddIFullOp>(op)) {
+    int64_t width = getSliceBitwidth(addFull.getLhs());
+    if (auto c = limeRecipeCost(bits::getRecipeForAdd(width, /*widening=*/true)))
+      return *c;
+    return (prada ? 6 : 8) * width + 2;
+  }
   if (auto andOp = dyn_cast<AndOp>(op)) {
     // A ReLU-style masked AND additionally inverts the sign row once: two AAP
     // through the dual-contact cell on SIMDRAM (write DCC1, read DCC1N), a
     // single-command NOT on PRADA. gem5's expandRelu emits exactly that.
-    int64_t base = 4 * getSliceBitwidth(andOp.getResult());
-    if (!op->hasAttr("bits.masked_zero"))
+    int64_t width = getSliceBitwidth(andOp.getResult());
+    bool masked = op->hasAttr("bits.masked_zero");
+    if (auto c = limeRecipeCost(bits::getRecipeForAnd(width, masked)))
+      return *c;
+    int64_t base = 4 * width;
+    if (!masked)
       return base;
     return base + (prada ? 1 : 2);
   }
-  if (auto orOp = dyn_cast<OrOp>(op))
-    return 4 * getSliceBitwidth(orOp.getResult());
+  if (auto orOp = dyn_cast<OrOp>(op)) {
+    int64_t width = getSliceBitwidth(orOp.getResult());
+    if (auto c = limeRecipeCost(bits::getRecipeForOr(width)))
+      return *c;
+    return 4 * width;
+  }
   // XNOR (the BNN multiply) = (a|~b) & (~a|b): three majority gates either way.
   // On SIMDRAM the dual-contact cells hand back both complements for free, so
   // expandXnor needs only 7 commands per bit (5 AAP + 2 AP); PRADA spends two
@@ -388,8 +436,12 @@ static int64_t getComputeLatency(Operation *op) {
   // cost the same -- NOT the 3n an earlier draft of this comment guessed.
   // bits.xor has no record kind today, so it is deliberately left on the
   // fallback below rather than given a cost it cannot honour.
-  if (auto xnorOp = dyn_cast<XNOrOp>(op))
-    return (prada ? 10 : 7) * getSliceBitwidth(xnorOp.getResult());
+  if (auto xnorOp = dyn_cast<XNOrOp>(op)) {
+    int64_t width = getSliceBitwidth(xnorOp.getResult());
+    if (auto c = limeRecipeCost(bits::getRecipeForXnor(width)))
+      return *c;
+    return (prada ? 10 : 7) * width;
+  }
   // BitWeaving range scan: per scanned bit plane, load the plane, write one
   // branch-dependent selector row and advance each of the two comparison
   // chains by one majority -- 4 commands on SIMDRAM, 6 on PRADA (which needs
@@ -400,6 +452,8 @@ static int64_t getComputeLatency(Operation *op) {
   // command count.
   if (auto scan = dyn_cast<RangeScanOp>(op)) {
     int64_t L = getSliceBitwidth(scan.getInput());
+    if (auto c = limeRecipeCost(bits::getRecipeForRangeScan(L)))
+      return *c;
     return prada ? 6 * L + 6 : 4 * L + 5;
   }
   // Bit-serial min/max = compare then select. The comparator is one majority
@@ -407,8 +461,12 @@ static int64_t getComputeLatency(Operation *op) {
   // per bit (10), so both land on 13 per bit; they differ only in seeding the
   // verdict row. Both ops cost the same -- they differ only in which operand
   // each mux branch takes.
-  if (isa<MaxOp>(op) || isa<MinOp>(op))
-    return 13 * getSliceBitwidth(op->getResult(0)) + (prada ? 1 : 2);
+  if (isa<MaxOp>(op) || isa<MinOp>(op)) {
+    int64_t width = getSliceBitwidth(op->getResult(0));
+    if (auto c = limeRecipeCost(bits::getRecipeForMinMax(width)))
+      return *c;
+    return 13 * width + (prada ? 1 : 2);
+  }
 
   if (op->getNumResults() == 0)
     return 0;
@@ -493,8 +551,11 @@ static int64_t losslessReduceWidth(int64_t baseWidth, int64_t items) {
 // whether this combine is the one that pushes the sum into an extra bit, i.e.
 // whether it must keep its carry-out.
 static int64_t reduceAddLatencyForWidth(int64_t width, bool grows) {
+  int64_t w = std::max<int64_t>(1, width);
+  if (auto c = limeRecipeCost(bits::getRecipeForAdd(w, grows)))
+    return *c;
   int64_t perBit = (kBackend == Backend::Prada) ? 6 : 8;
-  return perBit * std::max<int64_t>(1, width) + (grows ? 2 : 1);
+  return perBit * w + (grows ? 2 : 1);
 }
 
 // Latency of ONE lossless reduction combine, the one that takes the running
@@ -2513,6 +2574,18 @@ struct BitsOptimiseMappingPass
       signalPassFailure();
       return;
     }
+    if (costSource == "lime") {
+      kCostSource = CostSource::Lime;
+    } else if (costSource == "legacy") {
+      kCostSource = CostSource::Legacy;
+    } else {
+      func.emitError("bits-opt-mapping: cost-source must be 'lime' or "
+                     "'legacy', got '")
+          << costSource << "'";
+      signalPassFailure();
+      return;
+    }
+    kEmitTrace = emitTrace;
     kWideAdd = wideAdd;
     kNumBanks = numBanks;
     DAG dag;
@@ -2879,7 +2952,8 @@ struct BitsOptimiseMappingPass
           reduceProducer->setAttr("bits.is_reduce_op", UnitAttr::get(ctx));
       });
 
-      dumpFlattenedEventSequence(func);
+      if (kEmitTrace)
+        dumpFlattenedEventSequence(func);
     } catch (GRBException &e) {
       std::cerr << "Gurobi error: " << e.getMessage() << "\n";
     } catch (std::exception &ex) {
