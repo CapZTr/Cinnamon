@@ -29,7 +29,6 @@ py_venv_path="$project_root/.venv"
 cinnamon_path="$project_root/cinnamon"
 llvm_path="$project_root/llvm"
 torch_mlir_path="$project_root/torch-mlir"
-upmem_path="$project_root/upmem"
 
 verbose=0
 reconfigure=0
@@ -135,33 +134,18 @@ if [[ $setup_python_venv -eq 1 ]]; then
     supported_python_executable=python3.12
   fi
 
-  reconfigure_python_venv=0
-  if [ ! -d "$py_venv_path" ]; then
-    status "Creating Python venv"
-    $supported_python_executable -m venv "$py_venv_path"
-    source "$py_venv_path/bin/activate"
-    reconfigure_python_venv=1
+  status "Installing Python dependencies"
+  # https://pytorch.org/get-started/locally/
+  if [[ $enable_cuda -eq 1 ]]; then
+    torch_source=https://download.pytorch.org/whl/cu124
+  elif [[ $enable_roc -eq 1 ]]; then
+    torch_source=https://download.pytorch.org/whl/rocm6.1
   else
-    status "Enabling Python venv"
-    source "$py_venv_path/bin/activate"
+    torch_source=https://download.pytorch.org/whl/cpu
   fi
 
-  if [ $reconfigure -eq 1 ] || [ $reconfigure_python_venv -eq 1 ]; then
-    status "Installing Python dependencies"
-    # https://pytorch.org/get-started/locally/
-    if [[ $enable_cuda -eq 1 ]]; then
-      torch_source=https://download.pytorch.org/whl/cu124
-    elif [[ $enable_roc -eq 1 ]]; then
-      torch_source=https://download.pytorch.org/whl/rocm6.1
-    else
-      torch_source=https://download.pytorch.org/whl/cpu
-    fi
+  verbose_cmd pip install torch torchvision torchaudio --index-url $torch_source
 
-    verbose_cmd pip install --upgrade pip
-    verbose_cmd pip install torch torchvision torchaudio --index-url $torch_source
-    verbose_cmd pip install pybind11
-    verbose_cmd pip install build
-  fi
 elif [[ $setup_python_venv -eq 0 ]]; then
   warning "Skipping Python venv setup"
   warning "Make sure to have a correct Python environment set up"
@@ -187,7 +171,7 @@ if [[ $checkout_and_build_llvm -eq 1 ]]; then
 
   if [ $reconfigure -eq 1 ] || [ $reconfigure_llvm -eq 1 ]; then
     status "Configuring LLVM"
-    cmake -S llvm -B build \
+    cmake -G Ninja -S llvm -B build \
       -Wno-dev \
       -DLLVM_ENABLE_PROJECTS="mlir;llvm;clang" \
       -DLLVM_TARGETS_TO_BUILD="host" \
@@ -203,7 +187,7 @@ if [[ $checkout_and_build_llvm -eq 1 ]]; then
   fi
 
   status "Building LLVM"
-  cmake --build build --target all llc opt
+  ninja -C build all llc opt
 
   export PATH=$llvm_path/build/bin:$PATH
 elif [[ $checkout_and_build_llvm -eq 0 ]]; then
@@ -270,20 +254,6 @@ elif [[ $checkout_and_build_torch_mlir -eq 0 ]]; then
   warning "The following steps will need TORCH_MLIR_DIR to be set in their respective <STEP>_CMAKE_OPTIONS"
 fi
 
-if [[ $checkout_upmem -eq 1 ]]; then
-  if [ ! -d "$upmem_path" ]; then
-    status "Downloading UpMem SDK"
-    upmem_archive="upmem.tar.gz"
-    curl http://sdk-releases.upmem.com/2024.1.0/ubuntu_22.04/upmem-2024.1.0-Linux-x86_64.tar.gz --output "$upmem_archive"
-    mkdir "$upmem_path"
-    tar xf "$upmem_archive" -C "$upmem_path" --strip-components=1
-    rm "$upmem_archive"
-  fi
-elif [[ $checkout_upmem -eq 0 ]]; then
-  warning "Skipping UpMem checkout"
-  warning "The following steps will need UPMEM_DIR to be set in their respective <STEP>_CMAKE_OPTIONS"
-fi
-
 cd "$cinnamon_path"
 
 if [ ! -d "build" ] || [ $reconfigure -eq 1 ]; then
@@ -302,10 +272,10 @@ if [ ! -d "build" ] || [ $reconfigure -eq 1 ]; then
   fi
 
   if [[ $checkout_upmem -eq 1 ]]; then
-    dependency_paths="$dependency_paths -DUPMEM_DIR=$upmem_path"
+    dependency_paths="$dependency_paths -DUPMEM_DIR=/opt/upmem/"
   fi
 
-  cmake -S . -B "build" \
+  cmake -G Ninja -S . -B "build" \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     $dependency_paths \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
@@ -313,7 +283,7 @@ if [ ! -d "build" ] || [ $reconfigure -eq 1 ]; then
 fi
 
 status "Building Cinnamon"
-cmake --build build --target all
+ninja -C build all
 
 if [[ $setup_python_venv -eq 1 ]] && [[ -n "$llvm_path" ]] && [[ -n "$torch_mlir_path" ]]; then
   status "Building Cinnamon Python package"

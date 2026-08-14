@@ -23,7 +23,44 @@ Emerging compute-near-memory (CNM) and compute-in-memory (CIM) architectures hav
 
 This is an example of how you can build the framework locally.
 
-### Prerequisites
+### Docker image
+
+This repository conveniently ships a `Dockerfile` with all the required system
+packages. To use it, clone the repository and, from its root,
+
+1. Build the image
+
+```
+docker build -t cinnamon-dev .
+```
+
+2. Start a container
+
+```
+docker run \
+    --rm \
+    -it \
+    -v \
+    "$PWD":/workspace/cinnamon \
+    -w /workspace/cinnamon \
+    cinnamon-dev
+```
+
+3. Build Cinnamon inside the container
+
+```
+just configure -no-torch-mlir
+```
+
+As the container is mapped to the root of the project, it can be safely exited
+without losing data.
+
+Notice that it is assumed that you have the [Gurobi Optimizer](https://www.gurobi.com/)
+installed in your machine in `/opt/gurobi1302/`.
+
+### Manual installation
+
+#### Prerequisites
 
 CINM depends on a patched version of `LLVM 19.1.3`. This is built automatically.
 Additionally, a number of software packages are required to build it:
@@ -37,7 +74,7 @@ sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 70 --slave /
 # Or use another compiler or gcc/g++ version supporting the C++ 20 standard.
 ```
 
-### Download and Build 
+#### Download and Build 
 
 The repository contains a `justfile` that installs all needed dependencies and builds the sources.
 
