@@ -333,21 +333,58 @@ FailureOr<pud::MemoryGeometry> readGeometry(func::FuncOp func) {
   return geometry;
 }
 
+/// Whether an op computes on rows, whatever this pass can currently do with it.
+bool isRowLevelOp(Operation *op) {
+  return isa<RowAddOp, RowAndOp, RowOrOp, RowXOrOp, MajOp, NotOp>(op);
+}
+
+/// Slice-level ops `bits-pattern-apply` has no row expansion for yet. They are
+/// what stands between a kernel and this pass, so they are worth naming.
+bool isUnexpandedSliceOp(Operation *op) {
+  return isa<AddIOp, AddIFullOp, SubIOp, MulIOp, AndOp, OrOp, XOrOp, XNOrOp,
+             RangeScanOp, MaxOp, MinOp, MuxOp>(op);
+}
+
 FailureOr<RowSchedule> readSchedule(func::FuncOp func) {
   SmallVector<Operation *> rowOps;
+  SmallVector<Operation *> sliceOps;
   func.walk([&](Operation *op) {
-    if (isa<RowAddOp>(op))
+    if (isRowLevelOp(op))
       rowOps.push_back(op);
+    else if (isUnexpandedSliceOp(op))
+      sliceOps.push_back(op);
   });
+
+  // Say what is actually in the way. A kernel arrives here in one of three
+  // states, and only one of them means bits-pattern-apply has not been run.
+  if (!sliceOps.empty()) {
+    llvm::SmallDenseSet<StringRef> names;
+    for (Operation *op : sliceOps)
+      names.insert(op->getName().getStringRef());
+    auto diag = sliceOps.front()->emitError()
+                << "bits-pattern-apply left slice-level ops with no row "
+                   "expansion, so there is no row-level schedule to lower:";
+    for (StringRef name : names)
+      diag << " " << name;
+    return failure();
+  }
   if (rowOps.empty()) {
     func.emitError() << "no row-level Bits ops to lower; run "
                         "bits-pattern-apply first";
     return failure();
   }
-  if (rowOps.size() != 1) {
-    rowOps.front()->emitError()
-        << "this pass currently lowers a single row op per function, found "
-        << rowOps.size();
+  if (rowOps.size() != 1 || !isa<RowAddOp>(rowOps.front())) {
+    llvm::SmallDenseSet<StringRef> names;
+    for (Operation *op : rowOps)
+      names.insert(op->getName().getStringRef());
+    auto diag = rowOps.front()->emitError()
+                << "this pass lowers a single bits.row_add per function; this "
+                   "one has " << rowOps.size() << " row ops:";
+    for (StringRef name : names)
+      diag << " " << name;
+    diag.attachNote()
+        << "lowering more needs each row-level value bound to the row it "
+           "lives in, rather than a schedule read off one op";
     return failure();
   }
 
