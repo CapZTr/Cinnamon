@@ -483,12 +483,19 @@ struct ConvertBitsRowsToPuD
     builder.setInsertionPointToEnd(entry);
     builder.create<func::ReturnOp>(loc);
 
-    // How many data rows a bank needs. Whatever realises these addresses has to
-    // provide exactly that many, so the number travels with the IR.
-    if (auto module = func->getParentOfType<ModuleOp>())
+    // The shape of the row space these addresses were handed out in. Whatever
+    // realises them has to provide exactly this many rows per bank, and has to
+    // split a flat bank index into a channel and a bank on the same boundary,
+    // so the shape travels with the IR rather than being restated downstream.
+    if (auto module = func->getParentOfType<ModuleOp>()) {
       module->setAttr("pud.data_rows_per_bank",
                       builder.getI64IntegerAttr(
                           allocator.rowsAllocated(sched->bankBase)));
+      module->setAttr("pud.banks_per_channel",
+                      builder.getI64IntegerAttr(geometry->banksPerChannel));
+      module->setAttr("pud.total_banks",
+                      builder.getI64IntegerAttr(geometry->totalBanks));
+    }
   }
 };
 

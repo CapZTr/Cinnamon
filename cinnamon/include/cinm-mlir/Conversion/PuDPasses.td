@@ -22,13 +22,13 @@ def ConvertPuDToFunc : Pass<"convert-pud-to-func", operation="func::FuncOp"> {
 }
 
 def ConvertPuDRowsToFunc
-    : Pass<"convert-pud-rows-to-func", operation="func::FuncOp"> {
-  let summary = "Lower PuD row ops to guest runtime calls";
+    : Pass<"convert-pud-rows-to-func", operation="mlir::ModuleOp"> {
+  let summary = "Lower PuD row ops onto a target's row-op interface";
   let description = [{
-    Replaces each row op with a call to the guest stub that issues it, and each
-    row address with a call into the runtime that owns the row allocation. The
-    loop structure is left alone, so the standard scf -> cf -> llvm pipeline
-    takes it the rest of the way.
+    Replaces each row op with a call to the stub that issues it, and each row
+    coordinate with a lookup in the row-address tables the runtime that owns the
+    allocation publishes. The loop structure is left alone, so the standard
+    scf -> cf -> llvm pipeline takes it the rest of the way.
   }];
   let constructor = "mlir::pud::createConvertPuDRowsToFuncPass()";
   let dependentDialects = [
