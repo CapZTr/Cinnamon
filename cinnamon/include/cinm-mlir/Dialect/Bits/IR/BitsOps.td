@@ -262,6 +262,41 @@ def RowAddOp : Bits_Op<"row_add", [Pure]> {
       "qualified(type($cout))";
 }
 
+def RowSubOp : Bits_Op<"row_sub", [Pure]> {
+  let summary = "One bit position of a bit-serial subtraction";
+  let description = [{
+    The row-level form of `bits.sub_i`, and the counterpart of `bits.row_add`:
+    difference and borrow-out from a minuend row, a subtrahend row and a
+    borrow-in row.
+
+    It is its own op rather than a `bits.not` on the subtrahend followed by a
+    `bits.row_add` because that is not what the substrate does. Complementing
+    the subtrahend is not a separate operation there -- it is which contact of a
+    dual-contact cell the adder reads -- so spelling it as not-then-add would
+    charge two commands for something that costs one, and the one it costs is
+    already inside this op's nine.
+
+    Like `bits.row_add`, whether the borrow stays resident in a dual-contact cell
+    or has to be read from and written back to a data row is a property of the
+    expansion that built it, recorded in the `bits.carry` attribute.
+  }];
+
+  let arguments = (ins
+    BitRowType:$lhs,
+    BitRowType:$rhs,
+    BitRowType:$bin
+  );
+  let results = (outs
+    BitRowType:$diff,
+    BitRowType:$bout
+  );
+
+  let assemblyFormat = "$lhs `,` $rhs `,` $bin attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) `,` "
+      "qualified(type($bin)) `->` qualified(type($diff)) `,` "
+      "qualified(type($bout))";
+}
+
 def MulIOp : Bits_Op<"mul_i", [Pure]> {
   let summary = "Bit-serial multiplication of two slice operands "
       "in integer";
@@ -496,6 +531,111 @@ def RangeScanOp : Bits_Op<"range_scan", [Pure]> {
   let hasVerifier = 1;
 }
 
+def RowGreaterStepOp : Bits_Op<"row_greater_step", [Pure]> {
+  let summary = "One bit of the comparison a bit-serial min or max starts with";
+  let description = [{
+    `g' = maj(lhs, !rhs, g)`, least significant bit upwards, so that after the
+    most significant bit `g` says whether lhs > rhs. Equal bits carry the lower
+    bits' verdict through untouched, and the first differing bit from the top
+    settles it.
+
+    The verdict stays resident in a compute row for the whole comparison, which
+    is why the chain costs nothing to keep: it is read three times a bit and
+    complemented none, so a compute row suits it where a dual-contact cell suits
+    a carry.
+  }];
+
+  let arguments = (ins
+    BitRowType:$lhs,
+    BitRowType:$rhs,
+    BitRowType:$g
+  );
+  let results = (outs BitRowType:$gOut);
+
+  let assemblyFormat = "$lhs `,` $rhs `,` $g attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) `,` "
+      "qualified(type($g)) `->` qualified(type($gOut))";
+}
+
+def RowSelectOp : Bits_Op<"row_select", [Pure]> {
+  let summary = "One bit of a bit-serial select: g ? lhs : rhs";
+  let description = [{
+    The second half of a min or a max. `g` is the verdict
+    `bits.row_greater_step` left, and this op reads both it and its complement,
+    so it wants it in a dual-contact cell -- one copy, before the first bit, not
+    one per bit.
+  }];
+
+  let arguments = (ins
+    BitRowType:$lhs,
+    BitRowType:$rhs,
+    BitRowType:$g
+  );
+  let results = (outs BitRowType:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs `,` $g attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) `,` "
+      "qualified(type($g)) `->` qualified(type($result))";
+}
+
+def RowScanStepOp : Bits_Op<"row_scan_step", [Pure]> {
+  let summary = "One bit position of a BitWeaving range scan";
+  let description = [{
+    Advances both comparison chains of `bits.range_scan` by one bit plane of the
+    scanned column.
+
+        ge' = maj(ge,  value, !lower[j])     the ">= lower" chain
+        le' = maj(le, !value,  upper[j])     the "<= upper" chain
+
+    The bound bits are attributes, not operands, because they are compile-time
+    constants that select which of four substrate sequences runs -- reading them
+    from rows would make the scan pay to load constants it already knows. That
+    is also why a range scan is expanded one bit position at a time rather than
+    as a loop: consecutive bit planes need different sequences.
+
+    Both chains stay resident in dual-contact cells for the whole scan, so
+    neither ever reaches a data row; the only copies are the two that seed them.
+  }];
+
+  let arguments = (ins
+    BitRowType:$value,
+    BitRowType:$ge,
+    BitRowType:$le,
+    BoolAttr:$lowerBit,
+    BoolAttr:$upperBit
+  );
+  let results = (outs
+    BitRowType:$geOut,
+    BitRowType:$leOut
+  );
+
+  let assemblyFormat = "$value `,` $ge `,` $le attr-dict `:` "
+      "qualified(type($value)) `,` qualified(type($ge)) `,` "
+      "qualified(type($le)) `->` qualified(type($geOut)) `,` "
+      "qualified(type($leOut))";
+}
+
+def RowScanFoldOp : Bits_Op<"row_scan_fold", [Pure]> {
+  let summary = "Combine a range scan's two chains into its match mask";
+  let description = [{
+    `mask = ge AND le`. Its own op rather than a `bits.maj` against a zero row
+    because both operands are already resident in dual-contact cells: a general
+    majority would be given three rows to stage, and this needs to stage one.
+  }];
+
+  let arguments = (ins
+    BitRowType:$ge,
+    BitRowType:$le
+  );
+  let results = (outs
+    BitRowType:$mask
+  );
+
+  let assemblyFormat = "$ge `,` $le attr-dict `:` "
+      "qualified(type($ge)) `,` qualified(type($le)) "
+      "`->` qualified(type($mask))";
+}
+
 def MajOp : Bits_Op<"maj", [Pure]> {
   let summary = "Majority gate over three row operands";
   let description = [{}];
@@ -686,6 +826,23 @@ def CreateRowOp : Bits_Op<"create_row", [Pure]> {
 }
 
 def CreateAllZeroRowOp : Bits_Op<"create_all_zero_row", [Pure]> {
+  let arguments = (ins I64:$vectorLength);
+  let results = (outs BitRowType:$row);
+  let assemblyFormat = "$vectorLength attr-dict `:` "
+      "type($vectorLength) `->` qualified(type($row))";
+}
+
+def CreateAllOneRowOp : Bits_Op<"create_all_one_row", [Pure]> {
+  let summary = "A row of ones";
+  let description = [{
+    The counterpart of `bits.create_all_zero_row`. Both name a row the subarray
+    holds at a constant, so neither costs anything to produce; what they cost is
+    the command that reads them.
+
+    A subtraction needs this one: two's complement is `lhs + ~rhs + 1`, so its
+    borrow chain starts at one where an addition's carry starts at zero.
+  }];
+
   let arguments = (ins I64:$vectorLength);
   let results = (outs BitRowType:$row);
   let assemblyFormat = "$vectorLength attr-dict `:` "

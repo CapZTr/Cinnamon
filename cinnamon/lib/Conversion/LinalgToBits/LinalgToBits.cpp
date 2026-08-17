@@ -367,6 +367,8 @@ struct ConvertLinalgGenericToBits
     Value newResult;
     if (isa<arith::AddIOp>(yieldedOp)) {
       newResult = rewriter.create<AddIOp>(loc, sliceType, lhsSlice, rhsSlice);
+    } else if (isa<arith::SubIOp>(yieldedOp)) {
+      newResult = rewriter.create<SubIOp>(loc, sliceType, lhsSlice, rhsSlice);
     } else if (isa<arith::MulIOp>(yieldedOp)) {
       auto lhsSliceType = cast<SliceType>(lhsSlice.getType());
       auto rhsSliceType = cast<SliceType>(rhsSlice.getType());
@@ -784,6 +786,8 @@ struct ConvertLinalgElementwiseToBits : public ConversionPattern {
         computed = andOp;
       } else if (name == "linalg.add") {
         computed = rewriter.create<AddIOp>(loc, tileSliceTy, lhsSlice, rhsSlice);
+      } else if (name == "linalg.sub") {
+        computed = rewriter.create<SubIOp>(loc, tileSliceTy, lhsSlice, rhsSlice);
       } else if (name == "linalg.mul") {
         // bits.mul_i yields the full 2n-bit product; the named op's result is
         // n bits, so the high half is dropped. The FULL multiply is still
@@ -2235,6 +2239,7 @@ struct ConvertLinalgToBits
                  ConvertLinalgGenericToBits, EraseDeadLinalgGeneric>(&ctx);
     patterns.add<ConvertLinalgConv2DNchwFchwToBits>(&ctx, laneDim);
     patterns.add<ConvertLinalgElementwiseToBits>(&ctx, "linalg.add");
+    patterns.add<ConvertLinalgElementwiseToBits>(&ctx, "linalg.sub");
     patterns.add<ConvertLinalgElementwiseToBits>(&ctx, "linalg.mul");
     patterns.add<ConvertLinalgElementwiseToBits>(&ctx, "linalg.max");
     patterns.add<ConvertLinalgPopcountToBits>(&ctx);

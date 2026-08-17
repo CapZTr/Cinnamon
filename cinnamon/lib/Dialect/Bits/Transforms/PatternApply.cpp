@@ -158,6 +158,78 @@ struct AddIPattern : public OpRewritePattern<AddIOp> {
   }
 };
 
+/// Subtraction: the same shape as AddIPattern, starting its chain at one.
+///
+/// `lhs - rhs = lhs + ~rhs + 1`, and on this substrate that +1 is the whole
+/// difference in the loop's setup: the borrow row is seeded from the row held at
+/// one instead of the row held at zero. Complementing the subtrahend is not
+/// spelled here at all, because it is not a step -- `bits.row_sub` reads the
+/// other contact of the cell it parks the subtrahend in. 9n + 1, as
+/// getRecipeForSub prices it.
+struct SubIPattern : public OpRewritePattern<SubIOp> {
+  using OpRewritePattern<SubIOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(SubIOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto ctx = rewriter.getContext();
+    Value lhsSlice = op.getLhs();
+    Value rhsSlice = op.getRhs();
+
+    auto sliceType = dyn_cast<SliceType>(lhsSlice.getType());
+    if (!sliceType)
+      return failure();
+
+    auto bitwidth = sliceType.getBitWidth();
+    auto vecLen = sliceType.getVectorLength();
+
+    Value c0Index = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value c1Index = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value bitwidthIndex =
+        rewriter.create<arith::ConstantIndexOp>(loc, bitwidth);
+
+    Value bitwidthVal =
+        rewriter.create<arith::ConstantIntOp>(loc, bitwidth, 64);
+    Value vecLenVal = rewriter.create<arith::ConstantIntOp>(loc, vecLen, 64);
+
+    auto rowType = BitRowType::get(ctx, vecLen);
+    // The +1 of ~rhs + 1.
+    Value borrowRow =
+        rewriter.create<CreateAllOneRowOp>(loc, rowType, vecLenVal);
+    Value resSlice =
+        rewriter.create<CreateSliceOp>(loc, sliceType, bitwidthVal, vecLenVal);
+
+    auto loop = rewriter.create<scf::ForOp>(
+        loc, c0Index, bitwidthIndex, c1Index, ValueRange{resSlice, borrowRow},
+        [&](OpBuilder &builder, Location bodyLoc, Value iv,
+            ValueRange iterArgs) {
+          Value curSlice = iterArgs[0];
+          Value binRow = iterArgs[1];
+          Value ivI64 = builder.create<arith::IndexCastOp>(
+              bodyLoc, builder.getI64Type(), iv);
+
+          Value lhsRow =
+              builder.create<ExtractRowOp>(bodyLoc, rowType, lhsSlice, ivI64);
+          Value rhsRow =
+              builder.create<ExtractRowOp>(bodyLoc, rowType, rhsSlice, ivI64);
+          auto rowSub = builder.create<RowSubOp>(bodyLoc, rowType, rowType,
+                                                 lhsRow, rhsRow, binRow);
+          // Same reasoning as the adder: the borrow is the loop's only carried
+          // row and starts from a constant, so it never leaves the dual-contact
+          // cell it is computed in.
+          rowSub->setAttr(kCarryAttrName, builder.getStringAttr(kCarryResident));
+
+          Value updatedSlice = builder.create<InsertRowOp>(
+              bodyLoc, sliceType, curSlice, rowSub.getDiff(), ivI64);
+          builder.create<scf::YieldOp>(
+              bodyLoc, ValueRange{updatedSlice, rowSub.getBout()});
+        });
+
+    rewriter.replaceOp(op, loop.getResult(0));
+    return success();
+  }
+};
+
 /// Widening add: the same adder, keeping the carry-out instead of dropping it.
 ///
 /// A truncating add throws away the carry that falls off the top. This one is
@@ -571,6 +643,166 @@ struct MulIReadablePattern : public OpRewritePattern<MulIOp> {
   }
 };
 
+/// Min and max: compare the whole operand, then select from it.
+///
+/// Two rolled loops rather than one, because a comparison has to finish before a
+/// select can start -- the verdict is a property of the whole operand, and the
+/// most significant bit is what settles it. 13n + 2, which is 3n for the
+/// comparison, 10n for the select, one command to seed the verdict and one to
+/// move it into the cell the select reads it and its complement from.
+///
+/// This deliberately does not use the MinMax row-op template, which emits a min
+/// and a max together from a verdict handed to it: `bits.min` is one output, so
+/// the fused form would produce a result nothing asked for and, more to the
+/// point, would still need the comparison it does not contain.
+template <typename Op, bool IsMax>
+struct MinMaxPattern : public OpRewritePattern<Op> {
+  using OpRewritePattern<Op>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(Op op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto ctx = rewriter.getContext();
+    Value lhsSlice = op.getLhs();
+    Value rhsSlice = op.getRhs();
+
+    auto sliceType = dyn_cast<SliceType>(lhsSlice.getType());
+    auto resType = dyn_cast<SliceType>(op.getResult().getType());
+    if (!sliceType || !resType)
+      return failure();
+
+    int64_t bitwidth = sliceType.getBitWidth();
+    int64_t vecLen = sliceType.getVectorLength();
+
+    Value c0Index = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value c1Index = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value bitwidthIndex =
+        rewriter.create<arith::ConstantIndexOp>(loc, bitwidth);
+    Value bitwidthVal =
+        rewriter.create<arith::ConstantIntOp>(loc, bitwidth, 64);
+    Value vecLenVal = rewriter.create<arith::ConstantIntOp>(loc, vecLen, 64);
+
+    auto rowType = BitRowType::get(ctx, vecLen);
+    // Seeded false, so operands that compare equal all the way up select the
+    // right-hand one -- which is what makes min and max agree on ties.
+    Value verdict =
+        rewriter.create<CreateAllZeroRowOp>(loc, rowType, vecLenVal);
+
+    auto compare = rewriter.create<scf::ForOp>(
+        loc, c0Index, bitwidthIndex, c1Index, ValueRange{verdict},
+        [&](OpBuilder &builder, Location bodyLoc, Value iv,
+            ValueRange iterArgs) {
+          Value ivI64 = builder.create<arith::IndexCastOp>(
+              bodyLoc, builder.getI64Type(), iv);
+          Value lhsRow =
+              builder.create<ExtractRowOp>(bodyLoc, rowType, lhsSlice, ivI64);
+          Value rhsRow =
+              builder.create<ExtractRowOp>(bodyLoc, rowType, rhsSlice, ivI64);
+          auto step = builder.create<RowGreaterStepOp>(bodyLoc, rowType, lhsRow,
+                                                       rhsRow, iterArgs[0]);
+          step->setAttr(kCarryAttrName, builder.getStringAttr(kCarryResident));
+          builder.create<scf::YieldOp>(bodyLoc, step.getGOut());
+        });
+
+    Value resSlice =
+        rewriter.create<CreateSliceOp>(loc, resType, bitwidthVal, vecLenVal);
+    // max picks the left operand when it is the greater one, min the right.
+    Value takeIfGreater = IsMax ? lhsSlice : rhsSlice;
+    Value takeOtherwise = IsMax ? rhsSlice : lhsSlice;
+
+    auto select = rewriter.create<scf::ForOp>(
+        loc, c0Index, bitwidthIndex, c1Index, ValueRange{resSlice},
+        [&](OpBuilder &builder, Location bodyLoc, Value iv,
+            ValueRange iterArgs) {
+          Value ivI64 = builder.create<arith::IndexCastOp>(
+              bodyLoc, builder.getI64Type(), iv);
+          Value xRow = builder.create<ExtractRowOp>(bodyLoc, rowType,
+                                                    takeIfGreater, ivI64);
+          Value yRow = builder.create<ExtractRowOp>(bodyLoc, rowType,
+                                                    takeOtherwise, ivI64);
+          Value picked = builder.create<RowSelectOp>(
+              bodyLoc, rowType, xRow, yRow, compare.getResult(0));
+          Value updated = builder.create<InsertRowOp>(
+              bodyLoc, resType, iterArgs[0], picked, ivI64);
+          builder.create<scf::YieldOp>(bodyLoc, updated);
+        });
+
+    rewriter.replaceOp(op, select.getResult(0));
+    return success();
+  }
+};
+
+/// Range scan: one step per bit plane, unrolled, then one fold.
+///
+/// Unrolled rather than looped because the bound bits pick which of the four
+/// substrate sequences a bit position runs, and consecutive positions rarely
+/// agree. The bit widths this op is written for are 8 to 32, so the unrolled
+/// body is a few hundred commands -- and the loop it replaces would have had to
+/// carry the bounds in rows to stay rolled, which is exactly the cost the
+/// four-variant design exists to avoid.
+///
+/// Both chains are seeded to one: the scan is inclusive at both ends, which is
+/// what the two chains are defined as (">= lower" and "<= upper"). The seeds do
+/// not reach a data row; the lowering turns them into the two copies that put
+/// them in their cells.
+struct RangeScanPattern : public OpRewritePattern<RangeScanOp> {
+  using OpRewritePattern<RangeScanOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(RangeScanOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto ctx = rewriter.getContext();
+
+    auto inputType = dyn_cast<SliceType>(op.getInput().getType());
+    auto resultType = dyn_cast<SliceType>(op.getResult().getType());
+    if (!inputType || !resultType)
+      return failure();
+
+    int64_t bitwidth = inputType.getBitWidth();
+    int64_t vecLen = inputType.getVectorLength();
+    if (bitwidth <= 0 || bitwidth > 64)
+      return failure();
+
+    uint64_t lower = static_cast<uint64_t>(op.getLower());
+    uint64_t upper = static_cast<uint64_t>(op.getUpper());
+
+    Value vecLenVal = rewriter.create<arith::ConstantIntOp>(loc, vecLen, 64);
+    Value resWidthVal = rewriter.create<arith::ConstantIntOp>(
+        loc, resultType.getBitWidth(), 64);
+    auto rowType = BitRowType::get(ctx, vecLen);
+
+    // The mask's slice is created before the fold that writes into it: row
+    // placement reads a result's home off the consumer that names it, and a
+    // consumer whose slice is not bound yet cannot name one, which would send
+    // the mask through a scratch row and cost a copy.
+    Value maskSlice =
+        rewriter.create<CreateSliceOp>(loc, resultType, resWidthVal, vecLenVal);
+
+    Value ge = rewriter.create<CreateAllOneRowOp>(loc, rowType, vecLenVal);
+    Value le = rewriter.create<CreateAllOneRowOp>(loc, rowType, vecLenVal);
+
+    for (int64_t j = 0; j < bitwidth; j++) {
+      Value idx = rewriter.create<arith::ConstantIntOp>(loc, j, 64);
+      Value valueRow =
+          rewriter.create<ExtractRowOp>(loc, rowType, op.getInput(), idx);
+      auto step = rewriter.create<RowScanStepOp>(
+          loc, rowType, rowType, valueRow, ge, le,
+          rewriter.getBoolAttr((lower >> j) & 1),
+          rewriter.getBoolAttr((upper >> j) & 1));
+      ge = step.getGeOut();
+      le = step.getLeOut();
+    }
+
+    Value mask = rewriter.create<RowScanFoldOp>(loc, rowType, ge, le);
+    Value zeroIdx = rewriter.create<arith::ConstantIntOp>(loc, 0, 64);
+    Value result = rewriter.create<InsertRowOp>(loc, resultType, maskSlice,
+                                                mask, zeroIdx);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
 struct BitsPatternApplyPass
     : public impl::BitsPatternApplyPassBase<BitsPatternApplyPass> {
   void runOnOperation() final {
@@ -579,13 +811,17 @@ struct BitsPatternApplyPass
     constexpr bool useReadableMulIPattern = false;
     if (useReadableMulIPattern) {
       patterns
-          .add<AddIPattern, AddIFullPattern, MulIReadablePattern,
+          .add<AddIPattern, AddIFullPattern, SubIPattern, RangeScanPattern,
+               MinMaxPattern<MaxOp, true>, MinMaxPattern<MinOp, false>,
+               MulIReadablePattern,
                RowWiseLogicPattern<AndOp, RowAndOp>,
                RowWiseLogicPattern<OrOp, RowOrOp>,
                RowWiseLogicPattern<XOrOp, RowXOrOp>,
                RowWiseLogicPattern<XNOrOp, RowXNorOp>>(ctx);
     } else {
-      patterns.add<AddIPattern, AddIFullPattern, MulIPattern,
+      patterns.add<AddIPattern, AddIFullPattern, SubIPattern, RangeScanPattern,
+                   MinMaxPattern<MaxOp, true>, MinMaxPattern<MinOp, false>,
+                   MulIPattern,
                    RowWiseLogicPattern<AndOp, RowAndOp>,
                    RowWiseLogicPattern<OrOp, RowOrOp>,
                    RowWiseLogicPattern<XOrOp, RowXOrOp>,

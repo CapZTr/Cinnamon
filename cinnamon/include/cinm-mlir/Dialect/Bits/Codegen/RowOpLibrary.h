@@ -215,6 +215,15 @@ enum class RowOpKind {
   Relu,
   /// {min, max} = compare-and-select given an "a greater" flag
   MinMax,
+  /// One bit of the comparison a min or a max starts with: g' = maj(a, !b, g),
+  /// the whole comparator being a single majority per bit. The verdict stays
+  /// resident in a compute row, not a dual-contact cell -- it is read three
+  /// times a bit and complemented none.
+  GreaterStep,
+  /// One bit of the select a min or a max ends with: out = g ? x : y, with the
+  /// verdict resident in a dual-contact cell so that both it and its complement
+  /// are readable without a command.
+  Select,
   /// One BitWeaving range-scan bit step, advancing both comparison chains.
   /// The scan bounds are compile-time constants, so this comes in four
   /// variants; see getRangeScanKind.
@@ -222,6 +231,11 @@ enum class RowOpKind {
   RangeScan01,
   RangeScan10,
   RangeScan11,
+  /// Combines the two range-scan chains into the match mask. Its own primitive
+  /// because both operands are already resident in dual-contact cells, which a
+  /// general three-input majority does not know and would pay a command to
+  /// restate.
+  ScanFold,
 
   NUM_KINDS,
 };

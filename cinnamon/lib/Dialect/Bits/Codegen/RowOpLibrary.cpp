@@ -130,9 +130,51 @@ MIG buildMinMax() {
   return n;
 }
 
+/// One bit of the comparison `a > b`, least significant bit upwards:
+///
+///     g' = maj(a, !b, g)
+///
+///   a and b equal  -> maj(x, !x, g) = g, the lower bits' verdict carries
+///   a=1, b=0       -> maj(1, 1, g)  = 1
+///   a=0, b=1       -> maj(0, 0, g)  = 0
+///
+/// The whole comparator is that one majority gate per bit.
+MIG buildGreaterStep() {
+  MIG n;
+  auto a = n.create_pi(), b = n.create_pi(), g = n.create_pi();
+  n.create_po(n.create_maj(a, !b, g));
+  return n;
+}
+
+/// One bit of `g ? x : y`, the select a min or a max ends with.
+MIG buildSelect() {
+  MIG n;
+  auto x = n.create_pi(), y = n.create_pi(), g = n.create_pi();
+  auto f = n.get_constant(false), t = n.get_constant(true);
+  n.create_po(n.create_maj(n.create_maj(g, x, f), n.create_maj(!g, y, f), t));
+  return n;
+}
+
 /// One BitWeaving range-scan bit step:
-///   R' = maj(R, v,  lower[j])     ">= lower" chain
-///   S' = maj(S, !v, upper[j])     "<= upper" chain
+///   R' = maj(R,  v, !lower[j])    ">= lower" chain
+///   S' = maj(S, !v,  upper[j])    "<= upper" chain
+///
+/// `maj(acc, x, k)` is OR when k is one and AND when k is zero, so k is the
+/// selector, and the two chains do not read it the same way round. Going from
+/// the least significant bit up:
+///
+///   lower[j] == 0: a one in the value settles ">= lower" whatever lies below,
+///                  a zero leaves the verdict to the lower bits -- so OR,
+///                  selector one, the bound's bit INVERTED.
+///   lower[j] == 1: a zero in the value settles it the other way -- AND.
+///   upper[j] == 1: OR, and the chain reads !v, which puts its selector the
+///                  same way round as the bound's bit.
+///
+/// The lower chain's selector was the bound's bit uninverted here until
+/// 2026-08-17, which made the ">= lower" half of every scan compute the
+/// complement of the intended comparison. Nothing had caught it because nothing
+/// consumed these templates yet -- `getRangeScanKind` had no callers -- and it
+/// costs no commands either way, both selectors being constant rows.
 ///
 /// The scan bounds are compile-time constants, so each (lower[j], upper[j]) pair
 /// is its own template -- modelling them as runtime inputs would make lime load
@@ -143,7 +185,7 @@ MIG buildRangeScan(bool lowerBit, bool upperBit) {
   auto v = n.create_pi(); // 0
   auto r = n.create_pi(); // 1: R accumulator
   auto s = n.create_pi(); // 2: S accumulator
-  n.create_po(n.create_maj(r, v, n.get_constant(lowerBit)));
+  n.create_po(n.create_maj(r, v, n.get_constant(!lowerBit)));
   n.create_po(n.create_maj(s, !v, n.get_constant(upperBit)));
   return n;
 }
@@ -171,6 +213,10 @@ MIG buildMig(RowOpKind kind) {
     return buildRelu();
   case RowOpKind::MinMax:
     return buildMinMax();
+  case RowOpKind::GreaterStep:
+    return buildGreaterStep();
+  case RowOpKind::Select:
+    return buildSelect();
   case RowOpKind::RangeScan00:
     return buildRangeScan(false, false);
   case RowOpKind::RangeScan01:
@@ -179,6 +225,8 @@ MIG buildMig(RowOpKind kind) {
     return buildRangeScan(true, false);
   case RowOpKind::RangeScan11:
     return buildRangeScan(true, true);
+  case RowOpKind::ScanFold:
+    return buildAnd();
   case RowOpKind::NUM_KINDS:
     break;
   }
@@ -581,8 +629,14 @@ llvm::SmallVector<bool, 2> expectedOutputs(RowOpKind kind,
   case RowOpKind::RangeScan11: {
     bool lower = kind == RowOpKind::RangeScan10 || kind == RowOpKind::RangeScan11;
     bool upper = kind == RowOpKind::RangeScan01 || kind == RowOpKind::RangeScan11;
-    return {maj(in[1], in[0], lower), maj(in[2], !in[0], upper)};
+    return {maj(in[1], in[0], !lower), maj(in[2], !in[0], upper)};
   }
+  case RowOpKind::ScanFold:
+    return {maj(in[0], in[1], false)};
+  case RowOpKind::GreaterStep:
+    return {maj(in[0], !in[1], in[2])};
+  case RowOpKind::Select:
+    return {maj(maj(in[2], in[0], false), maj(!in[2], in[1], false), true)};
   case RowOpKind::NUM_KINDS:
     break;
   }
@@ -693,6 +747,145 @@ RowOpTemplate buildEquality(bool negated) {
   return tmpl;
 }
 
+/// Full subtractor, nine commands, carry-in and carry-out resident in cell 1.
+///
+/// The subtractor is the adder with the subtrahend complemented throughout:
+///
+///   adder       cout = maj(a,  b, c)   m = maj(a, !b, c)   sum  = maj( b, !cout, m)
+///   subtractor  cout = maj(a, !b, c)   m = maj(a,  b, c)   diff = maj(!b, !cout, m)
+///
+/// so it is lime's eight-command adder with b and !b exchanged at every read. The
+/// exchange is what costs the ninth command: the adder gets b for free from the
+/// row it loads it into and !b from the cell it parks it in, and needs each once;
+/// the subtractor needs !b before the cell has been written and b after, so the
+/// cell has to be turned over (step 6) instead of loaded once.
+///
+///   1. AAP(DCC0N <- b)      cell 0 holds !b, so row DCC0 reads !b
+///   2. AAP(T0_T3 <- a)
+///   3. AAP(T2 <- DCC0)      T2 = !b
+///   4. AAP(T1 <- DCC1)      T1 = the carry-in
+///   5. AP (DCC1_T0_T2)      maj(c, a, !b) = carry-out -> DCC1, T0, T2
+///   6. AAP(DCC0N_T0 <- DCC0)  turn the cell over: DCC0 now reads b, T0 = !b
+///   7. AP (DCC0_T1_T3)      maj(b, c, a) = m -> DCC0, T1, T3
+///   8. AAP(T2 <- DCC1N)     T2 = !carry-out
+///   9. AAP(out0 <- T0_T1_T2)  maj(!b, m, !carry-out) = the difference
+///
+/// lime schedules ten. Nine is also what the simulator's expandSubSimdram costs,
+/// down to the same seven-AAP two-AP split, though it reaches it over Ambit's row
+/// groups rather than these.
+RowOpTemplate buildSubtractor() {
+  RowOpTemplate tmpl;
+  tmpl.instrs = {
+      aap(ctrl(ControlRow::DCC0N), RowOperand::input(1)),
+      aap(ctrl(ControlRow::T0_T3), RowOperand::input(0)),
+      aap(ctrl(ControlRow::T2), ctrl(ControlRow::DCC0)),
+      aap(ctrl(ControlRow::T1), ctrl(ControlRow::DCC1)),
+      ap(ControlRow::DCC1_T0_T2),
+      aap(ctrl(ControlRow::DCC0N_T0), ctrl(ControlRow::DCC0)),
+      ap(ControlRow::DCC0_T1_T3),
+      aap(ctrl(ControlRow::T2), ctrl(ControlRow::DCC1N)),
+      aap(RowOperand::output(0), ctrl(ControlRow::T0_T1_T2)),
+  };
+  tmpl.numInputs = 3;
+  tmpl.numOutputs = 2;
+  // The carry-in is read from cell 1 and the carry-out is left there, which is
+  // what makes the borrow chain free to keep across bit positions.
+  tmpl.inputBindings = {RowOperand::input(0), RowOperand::input(1),
+                        ctrl(ControlRow::DCC1)};
+  tmpl.outputBindings = {RowOperand::output(0), ctrl(ControlRow::DCC1)};
+  return tmpl;
+}
+
+/// Folds the two range-scan chains into the match mask: `mask = R AND S`.
+///
+///   1. AAP(T3 <- DCC1)             T3 = the "<= upper" chain
+///   2. AAP(T1 <- C_0)
+///   3. AAP(out0 <- DCC0_T1_T3)     maj(R, 0, S) = R AND S
+///
+/// Three commands, and three is the floor: the group this reads the "<= lower"
+/// chain out of needs T1 and T3 set, and no row pair the substrate wires covers
+/// both. Written out because lime would be given a three-input majority with no
+/// way to know two of its operands are already sitting in cells, and would pay a
+/// command restating one of them.
+RowOpTemplate buildScanFold() {
+  RowOpTemplate tmpl;
+  tmpl.instrs = {
+      aap(ctrl(ControlRow::T3), ctrl(ControlRow::DCC1)),
+      aap(ctrl(ControlRow::T1), ctrl(ControlRow::C_0)),
+      aap(RowOperand::output(0), ctrl(ControlRow::DCC0_T1_T3)),
+  };
+  tmpl.numInputs = 2;
+  tmpl.numOutputs = 1;
+  tmpl.inputBindings = {ctrl(ControlRow::DCC0), ctrl(ControlRow::DCC1)};
+  tmpl.outputBindings = {RowOperand::output(0)};
+  return tmpl;
+}
+
+/// One bit of the comparison a min or a max starts with, three commands.
+///
+///   1. AAP(T0 <- a)
+///   2. AAP(DCC1N_T1 <- b)   cell 1 holds !b, so row DCC1 reads !b
+///   3. AP (DCC1_T0_T2)      maj(!b, a, g) -> DCC1, T0, T2
+///
+/// The verdict lives in T2 and is never written by steps 1 and 2, so the chain
+/// costs nothing to keep across bit positions -- a compute row does here what a
+/// dual-contact cell does for a carry. It is in a compute row rather than a cell
+/// because it is read three times per bit and complemented none, which is the
+/// opposite of what a cell is for; the complement is wanted once, later, and the
+/// select pays a single command to move it into a cell for that.
+RowOpTemplate buildGreater() {
+  RowOpTemplate tmpl;
+  tmpl.instrs = {
+      aap(ctrl(ControlRow::T0), RowOperand::input(0)),
+      aap(ctrl(ControlRow::DCC1N_T1), RowOperand::input(1)),
+      ap(ControlRow::DCC1_T0_T2),
+  };
+  tmpl.numInputs = 3;
+  tmpl.numOutputs = 1;
+  tmpl.inputBindings = {RowOperand::input(0), RowOperand::input(1),
+                        ctrl(ControlRow::T2)};
+  tmpl.outputBindings = {ctrl(ControlRow::T2)};
+  return tmpl;
+}
+
+/// One bit of `g ? x : y`, ten commands, with g resident in cell 0.
+///
+///   1. AAP(T1 <- DCC0)          T1 = g
+///   2. AAP(T0 <- x)
+///   3. AAP(T2 <- C_0)
+///   4. AAP(T3 <- T0_T1_T2)      T3 = maj(x, g, 0) = g AND x
+///   5. AAP(T1 <- DCC0N)         T1 = !g, free from the same cell
+///   6. AAP(T0 <- y)
+///   7. AAP(T2 <- C_0)
+///   8. AP (T0_T1_T2)            maj(y, !g, 0) = !g AND y
+///   9. AAP(T1 <- C_1)
+///  10. AAP(out0 <- T0_T1_T3)    maj(!g AND y, 1, g AND x) = the selection
+///
+/// Nothing in the sequence writes cell 0, so one select follows another over a
+/// whole operand on a single copy of g. That is what makes the pair of chains
+/// cost 13n + 2 rather than 13n + 2 per bit.
+RowOpTemplate buildSelectProgram() {
+  RowOpTemplate tmpl;
+  tmpl.instrs = {
+      aap(ctrl(ControlRow::T1), ctrl(ControlRow::DCC0)),
+      aap(ctrl(ControlRow::T0), RowOperand::input(0)),
+      aap(ctrl(ControlRow::T2), ctrl(ControlRow::C_0)),
+      aap(ctrl(ControlRow::T3), ctrl(ControlRow::T0_T1_T2)),
+      aap(ctrl(ControlRow::T1), ctrl(ControlRow::DCC0N)),
+      aap(ctrl(ControlRow::T0), RowOperand::input(1)),
+      aap(ctrl(ControlRow::T2), ctrl(ControlRow::C_0)),
+      ap(ControlRow::T0_T1_T2),
+      aap(ctrl(ControlRow::T1), ctrl(ControlRow::C_1)),
+      aap(RowOperand::output(0), ctrl(ControlRow::T0_T1_T3)),
+  };
+  tmpl.numInputs = 3;
+  tmpl.numOutputs = 1;
+  tmpl.inputBindings = {RowOperand::input(0), RowOperand::input(1),
+                        ctrl(ControlRow::DCC0)};
+  tmpl.outputBindings = {RowOperand::output(0)};
+  return tmpl;
+}
+
 /// The primitives lime's scheduler does not compile to the shortest known
 /// program. Everything absent from here is lime's.
 std::optional<RowOpTemplate> getHandWrittenTemplate(PudBackend backend,
@@ -704,6 +897,14 @@ std::optional<RowOpTemplate> getHandWrittenTemplate(PudBackend backend,
     return buildEquality(/*negated=*/false);
   case RowOpKind::Xnor:
     return buildEquality(/*negated=*/true);
+  case RowOpKind::FullSub:
+    return buildSubtractor();
+  case RowOpKind::ScanFold:
+    return buildScanFold();
+  case RowOpKind::GreaterStep:
+    return buildGreater();
+  case RowOpKind::Select:
+    return buildSelectProgram();
   default:
     return std::nullopt;
   }
@@ -848,10 +1049,13 @@ llvm::StringRef mlir::bits::getRowOpName(RowOpKind kind) {
   case RowOpKind::FullSub: return "row_sub";
   case RowOpKind::Relu: return "row_relu";
   case RowOpKind::MinMax: return "row_minmax";
+  case RowOpKind::GreaterStep: return "row_greater";
+  case RowOpKind::Select: return "row_select";
   case RowOpKind::RangeScan00: return "row_scan_00";
   case RowOpKind::RangeScan01: return "row_scan_01";
   case RowOpKind::RangeScan10: return "row_scan_10";
   case RowOpKind::RangeScan11: return "row_scan_11";
+  case RowOpKind::ScanFold: return "row_scan_fold";
   case RowOpKind::NUM_KINDS: break;
   }
   llvm_unreachable("unhandled row-op kind");
@@ -913,11 +1117,18 @@ unsigned mlir::bits::getReferenceCommands(PudBackend backend, RowOpKind kind) {
   case RowOpKind::FullSub: return 9;      // expandSubSimdram, per bit
   case RowOpKind::Relu: return 4;         // expandRelu reuses emitRowAnd
   case RowOpKind::MinMax: return 13;      // expandMin / expandMax, per bit
+  // expandMinMax runs as two passes rather than one fused step: a comparison
+  // costing 3 a bit, then a select costing 10. Its 13n + 2 is those two plus
+  // the seed and the park, which is how this pair is priced too.
+  case RowOpKind::GreaterStep: return 3;
+  case RowOpKind::Select: return 10;
   case RowOpKind::RangeScan00:
   case RowOpKind::RangeScan01:
   case RowOpKind::RangeScan10:
   case RowOpKind::RangeScan11:
     return 4;                             // timing skeleton, see above
+  case RowOpKind::ScanFold:
+    return 0;   // the simulator folds over its own row groups, not as a step
   default:
     return 0;
   }
@@ -1172,17 +1383,24 @@ std::optional<RowOpRecipe> mlir::bits::getRecipeForRangeScan(int64_t width) {
   // the cost -- only the choice of which of the four templates runs.
   RowOpRecipe recipe;
   recipe.steps.push_back({RowOpKind::RangeScan11, width});
-  // three commands seed both chains, two fold them into the output mask
-  recipe.fixedAAP = 5;
+  recipe.steps.push_back({RowOpKind::ScanFold, 1});
+  // two commands seed the chains, one per cell
+  recipe.fixedAAP = 2;
   return recipe;
 }
 
 std::optional<RowOpRecipe> mlir::bits::getRecipeForMinMax(int64_t width) {
   if (width <= 0)
     return std::nullopt;
+  // Compare, then select -- the same two passes the simulator's expandMinMax
+  // runs, and the reason this is not built on the MinMax template: that one
+  // emits BOTH the min and the max from a verdict it is handed, where a
+  // `bits.min` is one output and has to compute the verdict itself.
   RowOpRecipe recipe;
-  recipe.steps.push_back({RowOpKind::MinMax, width});
-  // seeding the verdict row
+  recipe.steps.push_back({RowOpKind::GreaterStep, width});
+  recipe.steps.push_back({RowOpKind::Select, width});
+  // one command seeds the verdict, one moves it into the cell the select reads
+  // it and its complement from
   recipe.fixedAAP = 2;
   return recipe;
 }

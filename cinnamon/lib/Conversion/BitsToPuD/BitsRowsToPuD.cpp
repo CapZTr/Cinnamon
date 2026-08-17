@@ -236,13 +236,33 @@ private:
 
 /// Whether an op computes on rows, i.e. becomes a template instantiation.
 bool isRowOp(Operation *op) {
-  return isa<RowAddOp, RowAndOp, RowOrOp, RowXOrOp, RowXNorOp, MajOp,
-             NotOp>(op);
+  return isa<RowAddOp, RowSubOp, RowAndOp, RowOrOp, RowXOrOp, RowXNorOp,
+             RowScanStepOp, RowScanFoldOp, RowGreaterStepOp, RowSelectOp,
+             MajOp, NotOp>(op);
 }
 
 bool hasResidentCarry(Operation *op) {
   auto attr = op->getAttrOfType<StringAttr>(kCarryAttrName);
   return attr && attr.getValue() == kCarryResident;
+}
+
+/// The row a template keeps its loop-carried value in, and which of the op's
+/// results is that value.
+///
+/// A carry and a borrow live in a dual-contact cell because the adder wants the
+/// complement; a comparison's verdict lives in a compute row because the
+/// comparator does not. Both are "the thing the loop hands to its next
+/// iteration without a command", so both are described the same way here.
+std::optional<std::pair<ControlRow, Value>> residentResult(Operation *op) {
+  if (!hasResidentCarry(op))
+    return std::nullopt;
+  if (auto add = dyn_cast<RowAddOp>(op))
+    return std::make_pair(ControlRow::DCC1, add.getCout());
+  if (auto sub = dyn_cast<RowSubOp>(op))
+    return std::make_pair(ControlRow::DCC1, sub.getBout());
+  if (auto greater = dyn_cast<RowGreaterStepOp>(op))
+    return std::make_pair(ControlRow::T2, greater.getGOut());
+  return std::nullopt;
 }
 
 RowLoc RowBinder::homeFor(Value result) {
@@ -298,18 +318,44 @@ LogicalResult RowBinder::bindLoop(scf::ForOp loop) {
     // row at all: the chain is the cell, and the value it starts from is copied
     // in once, ahead of the loop.
     Value carried = yield.getOperand(i);
-    auto *producer = carried.getDefiningOp();
-    bool resident = producer && isa<RowAddOp>(producer) &&
-                    hasResidentCarry(producer) &&
-                    carried == cast<RowAddOp>(producer).getCout();
+    Operation *producer = carried.getDefiningOp();
+    std::optional<ControlRow> residentIn;
+    if (producer) {
+      if (auto resident = residentResult(producer))
+        if (carried == resident->second)
+          residentIn = resident->first;
+    }
 
-    RowLoc home = resident ? RowLoc::controlRow(ControlRow::DCC1)
-                           : (from->isControl ? scratchRow() : *from);
+    RowLoc home = residentIn ? RowLoc::controlRow(*residentIn)
+                             : (from->isControl ? scratchRow() : *from);
     if (!home.sameAs(*from))
       seeds[loop.getOperation()].push_back({home, *from});
 
     rows[arg] = home;
     rows[result] = home;
+  }
+
+  // A select reads the comparison's verdict, and its complement, out of a
+  // dual-contact cell; the comparison left it in a compute row. Moving it is one
+  // command for the whole loop, so it belongs here beside the carry seeds rather
+  // than inside the body, where it would cost one per bit.
+  for (Operation &inner : *loop.getBody()) {
+    auto select = dyn_cast<RowSelectOp>(&inner);
+    if (!select)
+      continue;
+    Value verdict = select.getG();
+    if (loop.getBody()->getParent()->isAncestor(
+            verdict.getParentRegion()) &&
+        verdict.getParentRegion() == loop.getBody()->getParent())
+      continue; // defined in this loop: nothing to hoist
+    const RowLoc *from = rowFor(verdict);
+    if (!from)
+      return select.emitError()
+             << "a select whose verdict is not bound to any row";
+    RowLoc dst = RowLoc::controlRow(ControlRow::DCC0);
+    if (!from->sameAs(dst))
+      seeds[loop.getOperation()].push_back({dst, *from});
+    break;
   }
   return success();
 }
@@ -369,6 +415,10 @@ LogicalResult RowBinder::bindOp(Operation *op) {
     rows[zero.getRow()] = RowLoc::controlRow(ControlRow::C_0);
     return success();
   }
+  if (auto one = dyn_cast<CreateAllOneRowOp>(op)) {
+    rows[one.getRow()] = RowLoc::controlRow(ControlRow::C_1);
+    return success();
+  }
   if (auto create = dyn_cast<CreateRowOp>(op)) {
     rows[create.getRow()] = scratchRow();
     return success();
@@ -383,6 +433,26 @@ LogicalResult RowBinder::bindOp(Operation *op) {
 
   // --- row ops --------------------------------------------------------------
   if (isRowOp(op)) {
+    if (auto greater = dyn_cast<RowGreaterStepOp>(op)) {
+      rows[greater.getGOut()] = hasResidentCarry(op)
+                                    ? RowLoc::controlRow(ControlRow::T2)
+                                    : homeFor(greater.getGOut());
+      return success();
+    }
+    if (auto step = dyn_cast<RowScanStepOp>(op)) {
+      // Both chains stay in their cells for the whole scan; the template names
+      // them, so neither result is ever placed anywhere else.
+      rows[step.getGeOut()] = RowLoc::controlRow(ControlRow::DCC0);
+      rows[step.getLeOut()] = RowLoc::controlRow(ControlRow::DCC1);
+      return success();
+    }
+    if (auto sub = dyn_cast<RowSubOp>(op)) {
+      rows[sub.getDiff()] = homeFor(sub.getDiff());
+      rows[sub.getBout()] = hasResidentCarry(op)
+                                ? RowLoc::controlRow(ControlRow::DCC1)
+                                : homeFor(sub.getBout());
+      return success();
+    }
     if (auto add = dyn_cast<RowAddOp>(op)) {
       rows[add.getSum()] = homeFor(add.getSum());
       rows[add.getCout()] = hasResidentCarry(op)
@@ -620,6 +690,67 @@ FailureOr<TemplateUse> describeRowOp(Operation *op, const RowBinder &binder) {
     return use;
   }
 
+  if (auto sub = dyn_cast<RowSubOp>(op)) {
+    // The subtractor exists only in the form that keeps its borrow in the cell.
+    // A loaded-borrow variant would be a different template, and nothing builds
+    // one, so say so rather than silently pricing this as the resident one.
+    if (!hasResidentCarry(op))
+      return op->emitError()
+             << "a subtraction whose borrow comes from a data row has no "
+                "template; only the resident-borrow form is expanded";
+    use.kind = RowOpKind::FullSub;
+    auto lhs = rowOf(sub.getLhs()), rhs = rowOf(sub.getRhs());
+    auto diff = rowOf(sub.getDiff());
+    if (failed(lhs) || failed(rhs) || failed(diff))
+      return failure();
+    use.inputs = {*lhs, *rhs};
+    use.outputs = {*diff};
+    return use;
+  }
+
+  if (auto greater = dyn_cast<RowGreaterStepOp>(op)) {
+    if (!hasResidentCarry(op))
+      return op->emitError()
+             << "a comparison whose verdict comes from a data row has no "
+                "template; only the resident-verdict form is expanded";
+    use.kind = RowOpKind::GreaterStep;
+    auto lhs = rowOf(greater.getLhs()), rhs = rowOf(greater.getRhs());
+    if (failed(lhs) || failed(rhs))
+      return failure();
+    use.inputs = {*lhs, *rhs};
+    return use;
+  }
+  if (auto select = dyn_cast<RowSelectOp>(op)) {
+    use.kind = RowOpKind::Select;
+    auto lhs = rowOf(select.getLhs()), rhs = rowOf(select.getRhs());
+    auto result = rowOf(select.getResult());
+    if (failed(lhs) || failed(rhs) || failed(result))
+      return failure();
+    // The verdict is read out of the cell the select's template names, so it is
+    // not one of the operands the template is told about.
+    use.inputs = {*lhs, *rhs};
+    use.outputs = {*result};
+    return use;
+  }
+  if (auto step = dyn_cast<RowScanStepOp>(op)) {
+    use.kind = getRangeScanKind(step.getLowerBit(), step.getUpperBit());
+    auto value = rowOf(step.getValue());
+    if (failed(value))
+      return failure();
+    // The chains are in the cells the template reads directly, so the only
+    // operand it needs told about is the column's bit plane.
+    use.inputs = {*value};
+    return use;
+  }
+  if (isa<RowScanFoldOp>(op)) {
+    use.kind = RowOpKind::ScanFold;
+    auto mask = rowOf(op->getResult(0));
+    if (failed(mask))
+      return failure();
+    use.outputs = {*mask};
+    return use;
+  }
+
   if (isa<RowAndOp>(op))
     use.kind = RowOpKind::And;
   else if (isa<RowOrOp>(op))
@@ -677,6 +808,27 @@ public:
   LogicalResult emit(Block &src, OpBuilder &builder, IRMapping &map);
 
 private:
+  /// Puts a value the template is going to read from a named control row into
+  /// that row, unless it is already there.
+  ///
+  /// This is what seeds a range scan's two chains: the first step's operands are
+  /// the constant-one row, so it costs one copy each, and every step after reads
+  /// what the previous one left in the cell, so it costs nothing. The count
+  /// falls out of the schedule rather than being asserted.
+  LogicalResult stageInto(OpBuilder &builder, Location loc, Value value,
+                          ControlRow target, IRMapping &map) {
+    const RowLoc *from = binder.rowFor(value);
+    if (!from)
+      return failure();
+    RowLoc dst = RowLoc::controlRow(target);
+    if (from->sameAs(dst))
+      return success();
+    if (from->index && failed(materialiseIndex(builder, from->index, map)))
+      return failure();
+    emitter.emitAcrossBanks(builder, loc, /*isAp=*/false, dst, *from, map);
+    return success();
+  }
+
   RowOpEmitter &emitter;
   RowBinder &binder;
   PudBackend backend;
@@ -734,6 +886,21 @@ LogicalResult ScheduleEmitter::emit(Block &src, OpBuilder &builder,
     }
 
     if (isRowOp(&op)) {
+      // A scan's chains are read straight out of the cells, so they have to be
+      // in them before the sequence runs.
+      Value ge, le;
+      if (auto step = dyn_cast<RowScanStepOp>(&op)) {
+        ge = step.getGe();
+        le = step.getLe();
+      } else if (auto fold = dyn_cast<RowScanFoldOp>(&op)) {
+        ge = fold.getGe();
+        le = fold.getLe();
+      }
+      if (ge && (failed(stageInto(builder, loc, ge, ControlRow::DCC0, map)) ||
+                 failed(stageInto(builder, loc, le, ControlRow::DCC1, map))))
+        return op.emitError() << "a range scan's chain is not in a row the "
+                                 "scan step can be given it from";
+
       FailureOr<TemplateUse> use = describeRowOp(&op, binder);
       if (failed(use))
         return failure();
@@ -821,8 +988,8 @@ FailureOr<pud::MemoryGeometry> readGeometry(func::FuncOp func) {
 /// Slice-level ops `bits-pattern-apply` has no row expansion for yet. They are
 /// what stands between a kernel and this pass, so they are worth naming.
 bool isUnexpandedSliceOp(Operation *op) {
-  return isa<AddIOp, AddIFullOp, SubIOp, MulIOp, AndOp, OrOp, XOrOp, XNOrOp,
-             RangeScanOp, MaxOp, MinOp, MuxOp>(op);
+  return isa<AddIOp, AddIFullOp, MulIOp, AndOp, OrOp, XOrOp, XNOrOp, MaxOp,
+             MinOp, MuxOp>(op);
 }
 
 FailureOr<MappedLoop> readMappedLoop(func::FuncOp func) {
