@@ -582,12 +582,14 @@ struct BitsPatternApplyPass
           .add<AddIPattern, AddIFullPattern, MulIReadablePattern,
                RowWiseLogicPattern<AndOp, RowAndOp>,
                RowWiseLogicPattern<OrOp, RowOrOp>,
-               RowWiseLogicPattern<XOrOp, RowXOrOp>>(ctx);
+               RowWiseLogicPattern<XOrOp, RowXOrOp>,
+               RowWiseLogicPattern<XNOrOp, RowXNorOp>>(ctx);
     } else {
       patterns.add<AddIPattern, AddIFullPattern, MulIPattern,
                    RowWiseLogicPattern<AndOp, RowAndOp>,
                    RowWiseLogicPattern<OrOp, RowOrOp>,
-                   RowWiseLogicPattern<XOrOp, RowXOrOp>>(ctx);
+                   RowWiseLogicPattern<XOrOp, RowXOrOp>,
+               RowWiseLogicPattern<XNOrOp, RowXNorOp>>(ctx);
     }
     if (failed(applyPatternsAndFoldGreedily(getOperation(),
                                             std::move(patterns)))) {

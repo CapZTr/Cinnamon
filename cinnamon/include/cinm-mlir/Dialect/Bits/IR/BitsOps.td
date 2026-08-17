@@ -427,6 +427,29 @@ def RowXOrOp : Bits_Op<"row_xor", [Pure]> {
       "`->` qualified(type($result))";
 }
 
+def RowXNorOp : Bits_Op<"row_xnor", [Pure]> {
+  let summary = "Bit-row XNOR: the equality of two rows";
+  let description = [{
+    The row-level form of `bits.xnor`. It is its own op rather than a row XOR
+    followed by a `bits.not` for the same reason the slice-level op is: on the
+    substrate both are three majority gates over the control rows and differ
+    only in which constant row is read, so spelling it as xor-then-complement
+    would charge for an inversion the hardware never performs.
+  }];
+
+  let arguments = (ins
+    BitRowType:$lhs,
+    BitRowType:$rhs
+  );
+  let results = (outs
+    BitRowType:$result
+  );
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) "
+      "`->` qualified(type($result))";
+}
+
 def RangeScanOp : Bits_Op<"range_scan", [Pure]> {
   let summary = "BitWeaving/V BETWEEN range-scan predicate over a bit-sliced column";
   let description = [{

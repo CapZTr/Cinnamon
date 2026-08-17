@@ -236,7 +236,8 @@ private:
 
 /// Whether an op computes on rows, i.e. becomes a template instantiation.
 bool isRowOp(Operation *op) {
-  return isa<RowAddOp, RowAndOp, RowOrOp, RowXOrOp, MajOp, NotOp>(op);
+  return isa<RowAddOp, RowAndOp, RowOrOp, RowXOrOp, RowXNorOp, MajOp,
+             NotOp>(op);
 }
 
 bool hasResidentCarry(Operation *op) {
@@ -625,6 +626,8 @@ FailureOr<TemplateUse> describeRowOp(Operation *op, const RowBinder &binder) {
     use.kind = RowOpKind::Or;
   else if (isa<RowXOrOp>(op))
     use.kind = RowOpKind::Xor;
+  else if (isa<RowXNorOp>(op))
+    use.kind = RowOpKind::Xnor;
   else if (isa<NotOp>(op))
     use.kind = RowOpKind::Not;
   else if (isa<MajOp>(op))
