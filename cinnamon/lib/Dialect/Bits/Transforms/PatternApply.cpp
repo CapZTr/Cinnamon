@@ -836,6 +836,10 @@ struct MinMaxPattern : public OpRewritePattern<Op> {
           builder.create<scf::YieldOp>(bodyLoc, updated);
         });
 
+    // Both loops are the fold: the comparison decides and the select carries it
+    // out, and a reduction that runs this again across banks runs both.
+    carryReduceMark(op, {compare.getOperation(), select.getOperation()});
+
     rewriter.replaceOp(op, select.getResult(0));
     return success();
   }

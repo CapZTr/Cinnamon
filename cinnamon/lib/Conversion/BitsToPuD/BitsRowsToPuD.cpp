@@ -997,6 +997,9 @@ public:
       : emitter(emitter), binder(binder), backend(backend) {}
 
   LogicalResult emit(Block &src, OpBuilder &builder, IRMapping &map);
+  /// Just these ops, wherever the builder is -- one piece of a body.
+  LogicalResult emit(ArrayRef<Operation *> ops, OpBuilder &builder,
+                     IRMapping &map);
 
   /// Ops to walk past without issuing anything.
   ///
@@ -1039,7 +1042,16 @@ private:
 
 LogicalResult ScheduleEmitter::emit(Block &src, OpBuilder &builder,
                                     IRMapping &map) {
-  for (Operation &op : src) {
+  SmallVector<Operation *> ops;
+  for (Operation &op : src)
+    ops.push_back(&op);
+  return emit(ops, builder, map);
+}
+
+LogicalResult ScheduleEmitter::emit(ArrayRef<Operation *> ops,
+                                    OpBuilder &builder, IRMapping &map) {
+  for (Operation *opPtr : ops) {
+    Operation &op = *opPtr;
     Location loc = op.getLoc();
     if (suppressed.contains(&op))
       continue;
@@ -1055,6 +1067,13 @@ LogicalResult ScheduleEmitter::emit(Block &src, OpBuilder &builder,
                                 seed.src, map);
       }
 
+      // The bounds may not have been brought across yet: a piece of the body
+      // can be emitted on its own, away from where the rest of it cloned its
+      // constants, and then they have to come with it.
+      for (Value bound : {loop.getLowerBound(), loop.getUpperBound(),
+                          loop.getStep()})
+        if (failed(materialiseIndex(builder, bound, map)))
+          return op.emitError() << "a loop bound cannot be computed here";
       Value lb = map.lookupOrDefault(loop.getLowerBound());
       Value ub = map.lookupOrDefault(loop.getUpperBound());
       Value step = map.lookupOrDefault(loop.getStep());
@@ -1235,7 +1254,15 @@ bool isUnexpandedSliceOp(Operation *op) {
              MinOp, MuxOp>(op);
 }
 
-FailureOr<MappedLoop> readMappedLoop(func::FuncOp func) {
+FailureOr<MappedLoop> readMappedLoop(scf::ForOp loop);
+
+/// Everything a function asks the machine to do, in the order it asks.
+///
+/// A function can hold more than one nest. They are chained rather than run
+/// together -- a ReLU consumes the convolution before it, a selection consumes
+/// the distances before it -- which is how the mapping schedules them too, one
+/// after another on a cursor that runs through the whole function.
+FailureOr<SmallVector<MappedLoop>> readMappedLoops(func::FuncOp func) {
   SmallVector<Operation *> rowOps;
   SmallVector<Operation *> sliceOps;
   func.walk([&](Operation *op) {
@@ -1264,24 +1291,41 @@ FailureOr<MappedLoop> readMappedLoop(func::FuncOp func) {
     return failure();
   }
 
-  // The mapping sits on an enclosing loop; take the INNERMOST one that has it.
-  // That is the loop whose body is one wave. An annotated loop further out is
-  // not a loop here at all: its iterations are independent, so the mapping gave
-  // each of them its own group of banks to run this schedule on at the same
-  // time, and what it contributes is banks, not iterations.
-  scf::ForOp loop;
-  for (Operation *parent = rowOps.front(); parent && !loop;
-       parent = parent->getParentOp()) {
-    auto candidate = dyn_cast<scf::ForOp>(parent);
-    if (candidate && candidate->hasAttr("bits.parallel_factor"))
-      loop = candidate;
-  }
-  if (!loop) {
-    rowOps.front()->emitError() << "no bank mapping on any enclosing loop; run "
-                                  "bits-opt-mapping first";
-    return failure();
+  // The mapping sits on an enclosing loop; for each row op take the INNERMOST
+  // one that has it. That is the loop whose body is one wave. An annotated loop
+  // further out is not a loop here at all: its iterations are independent, so
+  // the mapping gave each of them its own group of banks to run this schedule
+  // on at the same time, and what it contributes is banks, not iterations.
+  SmallVector<scf::ForOp> loops;
+  llvm::SmallDenseSet<Operation *> seen;
+  for (Operation *rowOp : rowOps) {
+    scf::ForOp loop;
+    for (Operation *parent = rowOp; parent && !loop;
+         parent = parent->getParentOp()) {
+      auto candidate = dyn_cast<scf::ForOp>(parent);
+      if (candidate && candidate->hasAttr("bits.parallel_factor"))
+        loop = candidate;
+    }
+    if (!loop) {
+      rowOp->emitError() << "no bank mapping on any enclosing loop; run "
+                            "bits-opt-mapping first";
+      return failure();
+    }
+    if (seen.insert(loop.getOperation()).second)
+      loops.push_back(loop);
   }
 
+  SmallVector<MappedLoop> mappedLoops;
+  for (scf::ForOp loop : loops) {
+    auto mapped = readMappedLoop(loop);
+    if (failed(mapped))
+      return failure();
+    mappedLoops.push_back(std::move(*mapped));
+  }
+  return mappedLoops;
+}
+
+FailureOr<MappedLoop> readMappedLoop(scf::ForOp loop) {
   auto readAttr = [&](StringRef name, int64_t fallback) {
     auto attr = loop->getAttrOfType<IntegerAttr>(name);
     return attr ? std::max<int64_t>(1, attr.getInt()) : fallback;
@@ -1293,8 +1337,6 @@ FailureOr<MappedLoop> readMappedLoop(func::FuncOp func) {
   mapped.groupStride = readAttr("bits.bank_group_stride", mapped.banksPerGroup);
   mapped.packFactor = readAttr("bits.pack_factor", 1);
   mapped.repeat = readAttr("bits.wave_repeat", 1);
-  int64_t itersPerBank = readAttr("bits.iters_per_bank", 1);
-  mapped.waves = (itersPerBank + mapped.packFactor - 1) / mapped.packFactor;
 
   // The tree names the banks of one group, and having named them it is also
   // what says which banks the group is: a reduction's group is the banks its
@@ -1340,6 +1382,26 @@ FailureOr<MappedLoop> readMappedLoop(func::FuncOp func) {
     for (int64_t bank : group)
       mapped.banks.push_back(bank + g * mapped.groupStride);
 
+  // How many waves a bank runs: its share of the loop's iterations, and one
+  // wave per group of them that shares a row. The share is taken from the trip
+  // count rather than from `iters_per_bank`, which is the same number except
+  // when the banks do not divide the iterations -- the annotation rounds that
+  // down and would leave a wave's worth of work undone, where the cost model
+  // rounds it up. 15 candidates over 4 banks is 4 waves, not 3.
+  int64_t itersPerBank = readAttr("bits.iters_per_bank", 1);
+  APInt lower, upper, step;
+  if (matchPattern(loop.getLowerBound(), m_ConstantInt(&lower)) &&
+      matchPattern(loop.getUpperBound(), m_ConstantInt(&upper)) &&
+      matchPattern(loop.getStep(), m_ConstantInt(&step)) &&
+      step.getSExtValue() > 0) {
+    int64_t trip = (upper.getSExtValue() - lower.getSExtValue() +
+                    step.getSExtValue() - 1) /
+                   step.getSExtValue();
+    if (trip > 0)
+      itersPerBank = (trip + mapped.banksPerGroup - 1) / mapped.banksPerGroup;
+  }
+  mapped.waves = (itersPerBank + mapped.packFactor - 1) / mapped.packFactor;
+
   mapped.foldLevels =
       mapped.packFactor > 1 ? (int64_t)llvm::Log2_64_Ceil(mapped.packFactor) : 0;
   // A reduction normally spends its first wave producing what the rest fold
@@ -1372,8 +1434,9 @@ struct Reduction {
   int64_t accBase = 0;
   int64_t accRows = 0;
   /// The run the wave leaves its contribution in, which the seeding wave writes
-  /// straight into the accumulator instead.
+  /// straight into the accumulator instead, and how many rows of it there are.
   int64_t addendBase = -1;
+  int64_t addendRows = 0;
   /// Where a copy puts the partial sum being folded in.
   int64_t stageBase = 0;
   bool isAdd = false;
@@ -1411,6 +1474,8 @@ FailureOr<Reduction> readReduction(MappedLoop &mapped, RowBinder &binder) {
       if (!from || from->broadcast || from->base == reduction.accBase)
         return;
       reduction.addendBase = from->base;
+      if (auto slice = dyn_cast<SliceType>(extract.getSlice().getType()))
+        reduction.addendRows = slice.getBitWidth();
     });
     op->walk([&](RowAddOp) { reduction.isAdd = true; });
   }
@@ -1433,8 +1498,16 @@ FailureOr<Reduction> readReduction(MappedLoop &mapped, RowBinder &binder) {
 /// width throughout. Same command count, different rows, which is exactly why
 /// it is built here rather than borrowed.
 LogicalResult emitFold(OpBuilder &builder, Location loc, RowOpEmitter &emitter,
-                       const Reduction &reduction, PudBackend backend,
-                       IRMapping &map, Operation *diagOp) {
+                       ScheduleEmitter &schedule, const Reduction &reduction,
+                       PudBackend backend, IRMapping &map, Operation *diagOp) {
+  // When the body's fold already reads every row of the accumulator, it IS this
+  // fold -- the addend arrives in the staging run instead of the run a wave
+  // produced, which the alias around this says, and nothing else differs. That
+  // is the usual case, and it is how a fold that is not a sum -- a running
+  // minimum, say -- gets across banks at all.
+  if (reduction.addendRows == reduction.accRows)
+    return schedule.emit(reduction.ops, builder, map);
+
   if (!reduction.isAdd)
     return diagOp->emitError()
            << "only a sum folds across banks so far; this reduction folds with "
@@ -1467,9 +1540,9 @@ LogicalResult emitFold(OpBuilder &builder, Location loc, RowOpEmitter &emitter,
 /// one another along the tree the mapping chose. Every level is the same two
 /// steps -- copy, then add -- and differs only in where the copy comes from.
 LogicalResult emitReduceTree(OpBuilder &builder, Location loc,
-                             RowOpEmitter &emitter, MappedLoop &mapped,
-                             const Reduction &reduction, PudBackend backend,
-                             IRMapping &map) {
+                             RowOpEmitter &emitter, ScheduleEmitter &schedule,
+                             MappedLoop &mapped, const Reduction &reduction,
+                             PudBackend backend, IRMapping &map) {
   auto copyAlong = [&](ArrayRef<std::pair<int64_t, int64_t>> edges) {
     emitter.emitCopies(builder, loc, edges, reduction.accBase,
                        reduction.stageBase, reduction.accRows);
@@ -1483,8 +1556,8 @@ LogicalResult emitReduceTree(OpBuilder &builder, Location loc,
     withinBank.push_back({bank, bank});
   for (int64_t level = 0; level < mapped.foldLevels; ++level) {
     copyAlong(withinBank);
-    if (failed(emitFold(builder, loc, emitter, reduction, backend, map,
-                        mapped.loop)))
+    if (failed(emitFold(builder, loc, emitter, schedule, reduction, backend,
+                        map, mapped.loop)))
       return failure();
   }
 
@@ -1504,8 +1577,8 @@ LogicalResult emitReduceTree(OpBuilder &builder, Location loc,
     // Only the banks that were copied into have anything to add, and they all
     // do it at once.
     RowOpEmitter::BankScope scope(emitter, destinations);
-    if (failed(emitFold(builder, loc, emitter, reduction, backend, map,
-                        mapped.loop)))
+    if (failed(emitFold(builder, loc, emitter, schedule, reduction, backend,
+                        map, mapped.loop)))
       return failure();
   }
   return success();
@@ -1538,21 +1611,23 @@ struct ConvertBitsRowsToPuD
     if (failed(geometry))
       return signalPassFailure();
 
-    auto mapped = readMappedLoop(func);
-    if (failed(mapped))
+    auto mappedLoops = readMappedLoops(func);
+    if (failed(mappedLoops))
       return signalPassFailure();
 
-    // Every bank running this computation holds its operands in the same rows,
-    // so the layout is decided once and the bank left open.
-    int64_t layoutBank = mapped->banks.empty() ? 0 : mapped->banks.front();
+    // Every bank running a computation holds its operands in the same rows, so
+    // the layout is decided once and the bank left open. One allocator for the
+    // whole function: the nests run one after another but their operands are all
+    // in the machine at once.
+    int64_t layoutBank = mappedLoops->front().banks.empty()
+                             ? 0
+                             : mappedLoops->front().banks.front();
     pud::AddressAllocator allocator(*geometry);
     RowBinder binder(allocator, layoutBank);
-    if (failed(binder.bindCarried(mapped->loop)) ||
-        failed(binder.bind(*mapped->loop.getBody())))
-      return signalPassFailure();
-
-    RowOpEmitter emitter(*geometry, binder, mapped->banks);
-    ScheduleEmitter schedule(emitter, binder, target);
+    for (MappedLoop &mapped : *mappedLoops)
+      if (failed(binder.bindCarried(mapped.loop)) ||
+          failed(binder.bind(*mapped.loop.getBody())))
+        return signalPassFailure();
 
     // The new body is built beside the old one and swapped in at the end. It is
     // built from the old one -- the loop nest, the index arithmetic, the order
@@ -1562,92 +1637,98 @@ struct ConvertBitsRowsToPuD
     OpBuilder builder(func.getContext());
     builder.setInsertionPointToStart(entry.get());
 
-    IRMapping map;
-    // Row indices are built from constants defined outside the mapped loop, so
-    // bring those across before anything asks for them -- from every block the
-    // loop is nested in, outermost first, since a constant may sit anywhere
-    // above it.
-    SmallVector<Block *> enclosing;
-    for (Operation *parent = mapped->loop; parent;
-         parent = parent->getParentOp())
-      if (Block *block = parent->getBlock())
-        enclosing.push_back(block);
-    for (Block *block : llvm::reverse(enclosing))
-      for (Operation &op : *block) {
-        if (!isa<arith::ArithDialect>(op.getDialect()))
-          continue;
-        // Only what can stand on its own out here. An enclosing loop's index
-        // arithmetic is about which tile that loop is on, and this schedule has
-        // no such iteration to be on -- bringing it across would leave the new
-        // body pointing at the old one.
-        if (llvm::any_of(op.getOperands(),
-                         [&](Value v) { return !map.contains(v); }))
-          continue;
-        builder.clone(op, map);
-      }
+    for (MappedLoop &mapped : *mappedLoops) {
+      RowOpEmitter emitter(*geometry, binder, mapped.banks);
+      ScheduleEmitter schedule(emitter, binder, target);
 
-    auto reduction = readReduction(*mapped, binder);
-    if (failed(reduction))
-      return signalPassFailure();
+      IRMapping map;
+      // Row indices are built from constants defined outside the mapped loop, so
+      // bring those across before anything asks for them -- from every block the
+      // loop is nested in, outermost first, since a constant may sit anywhere
+      // above it.
+      SmallVector<Block *> enclosing;
+      for (Operation *parent = mapped.loop; parent;
+           parent = parent->getParentOp())
+        if (Block *block = parent->getBlock())
+          enclosing.push_back(block);
+      for (Block *block : llvm::reverse(enclosing))
+        for (Operation &op : *block) {
+          if (!isa<arith::ArithDialect>(op.getDialect()))
+            continue;
+          // Only what can stand on its own out here. An enclosing loop's index
+          // arithmetic is about which tile that loop is on, and this schedule
+          // has no such iteration to be on -- bringing it across would leave the
+          // new body pointing at the old one.
+          if (llvm::any_of(op.getOperands(),
+                           [&](Value v) { return !map.contains(v); }))
+            continue;
+          builder.clone(op, map);
+        }
 
-    Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
-    Value one = builder.create<arith::ConstantIndexOp>(loc, 1);
-    Value repeats = builder.create<arith::ConstantIndexOp>(loc, mapped->repeat);
-    int64_t seedWaves = reduction->valid() ? mapped->seedWaves : 0;
-    Value seeds = builder.create<arith::ConstantIndexOp>(loc, seedWaves);
-    Value tiles =
-        builder.create<arith::ConstantIndexOp>(loc, mapped->waves - seedWaves);
+      auto reduction = readReduction(mapped, binder);
+      if (failed(reduction))
+        return signalPassFailure();
 
-    // Enclosing loops whose iterations did not all fit in the machine at once
-    // run the whole schedule again for the ones that were left.
-    auto repeatLoop = builder.create<scf::ForOp>(loc, zero, repeats, one);
-    {
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(repeatLoop.getBody());
+      Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+      Value one = builder.create<arith::ConstantIndexOp>(loc, 1);
+      Value repeats = builder.create<arith::ConstantIndexOp>(loc, mapped.repeat);
+      int64_t seedWaves = reduction->valid() ? mapped.seedWaves : 0;
+      Value seeds = builder.create<arith::ConstantIndexOp>(loc, seedWaves);
+      Value tiles =
+          builder.create<arith::ConstantIndexOp>(loc, mapped.waves - seedWaves);
 
-      // What the tree can refer to: everything already in scope out here. The
-      // waves clone their index arithmetic inside the loops that run them, and
-      // the tree comes after those loops, so it cannot use any of it.
-      IRMapping outerScope = map;
-
-      // A reduction has nothing to fold into until something has been produced,
-      // so its first wave produces and stops. Writing that first contribution
-      // where the accumulator lives is what makes it the accumulator's initial
-      // value, and it costs nothing: the same commands, addressed one run over.
-      if (seedWaves > 0) {
-        auto seedLoop = builder.create<scf::ForOp>(loc, zero, seeds, one);
-        OpBuilder::InsertionGuard seedGuard(builder);
-        builder.setInsertionPointToStart(seedLoop.getBody());
-        emitter.aliasRun(reduction->addendBase, reduction->accBase);
-        schedule.suppress(reduction->ops);
-        // On its own map: what this wave brings across lands inside its loop,
-        // where the waves that follow it cannot see it.
-        IRMapping seedScope = map;
-        if (failed(schedule.emit(*mapped->loop.getBody(), builder, seedScope)))
-          return signalPassFailure();
-        schedule.emitEverything();
-        emitter.clearAliases();
-      }
-
-      // The mapped loop ran once per tile of the whole operand; each bank takes
-      // its own share of them, the tiles sharing a bank row run as one wave, and
-      // the banks run at the same time.
-      auto tileLoop = builder.create<scf::ForOp>(loc, zero, tiles, one);
+      // Enclosing loops whose iterations did not all fit in the machine at once
+      // run the whole schedule again for the ones that were left.
+      auto repeatLoop = builder.create<scf::ForOp>(loc, zero, repeats, one);
       {
-        OpBuilder::InsertionGuard tileGuard(builder);
-        builder.setInsertionPointToStart(tileLoop.getBody());
-        if (failed(schedule.emit(*mapped->loop.getBody(), builder, map)))
-          return signalPassFailure();
-      }
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(repeatLoop.getBody());
 
-      // Now every bank holds a partial result, and they have to become one.
-      if (reduction->valid() &&
-          (mapped->foldLevels > 0 || !mapped->tree.empty())) {
-        emitter.aliasRun(reduction->addendBase, reduction->stageBase);
-        if (failed(emitReduceTree(builder, loc, emitter, *mapped, *reduction,
-                                  target, outerScope)))
-          return signalPassFailure();
-        emitter.clearAliases();
+        // What the tree can refer to: everything already in scope out here. The
+        // waves clone their index arithmetic inside the loops that run them, and
+        // the tree comes after those loops, so it cannot use any of it.
+        IRMapping outerScope = map;
+
+        // A reduction has nothing to fold into until something has been
+        // produced, so its first wave produces and stops. Writing that first
+        // contribution where the accumulator lives is what makes it the
+        // accumulator's initial value, and it costs nothing: the same commands,
+        // addressed one run over.
+        if (seedWaves > 0) {
+          auto seedLoop = builder.create<scf::ForOp>(loc, zero, seeds, one);
+          OpBuilder::InsertionGuard seedGuard(builder);
+          builder.setInsertionPointToStart(seedLoop.getBody());
+          emitter.aliasRun(reduction->addendBase, reduction->accBase);
+          schedule.suppress(reduction->ops);
+          // On its own map: what this wave brings across lands inside its loop,
+          // where the waves that follow it cannot see it.
+          IRMapping seedScope = map;
+          if (failed(schedule.emit(*mapped.loop.getBody(), builder, seedScope)))
+            return signalPassFailure();
+          schedule.emitEverything();
+          emitter.clearAliases();
+        }
+
+        // The mapped loop ran once per tile of the whole operand; each bank
+        // takes its own share of them, the tiles sharing a bank row run as one
+        // wave, and the banks run at the same time.
+        auto tileLoop = builder.create<scf::ForOp>(loc, zero, tiles, one);
+        {
+          OpBuilder::InsertionGuard tileGuard(builder);
+          builder.setInsertionPointToStart(tileLoop.getBody());
+          if (failed(schedule.emit(*mapped.loop.getBody(), builder, map)))
+            return signalPassFailure();
+        }
+
+        // Now every bank holds a partial result, and they have to become one.
+        if (reduction->valid() &&
+            (mapped.foldLevels > 0 || !mapped.tree.empty())) {
+          emitter.aliasRun(reduction->addendBase, reduction->stageBase);
+          if (failed(emitReduceTree(builder, loc, emitter, schedule, mapped,
+                                    *reduction, target, outerScope)))
+            return signalPassFailure();
+          emitter.clearAliases();
+        }
       }
     }
 
