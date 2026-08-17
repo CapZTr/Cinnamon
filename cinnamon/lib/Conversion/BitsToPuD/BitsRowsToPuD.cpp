@@ -173,6 +173,36 @@ public:
 
   LogicalResult bind(Block &block);
 
+  /// Binds what the mapped loop carries from one tile to the next.
+  ///
+  /// Its iter args are the values that outlive a tile -- the accumulator a
+  /// reduction folds into. They are defined outside the body this pass rebuilds,
+  /// so the walk over that body never reaches them and nothing else would give
+  /// them a home. Every tile a bank runs folds into the same rows, which is what
+  /// makes the accumulator an accumulator, so one run per bank is all it needs.
+  LogicalResult bindCarried(scf::ForOp loop) {
+    for (auto [i, init] : llvm::enumerate(loop.getInits())) {
+      Value arg = loop.getRegionIterArg(i);
+      Value result = loop.getResult(i);
+      if (auto slice = dyn_cast<SliceType>(arg.getType())) {
+        SliceLoc loc = newRun(slice.getBitWidth());
+        slices[init] = loc;
+        slices[arg] = loc;
+        slices[result] = loc;
+        continue;
+      }
+      if (isa<BitRowType>(arg.getType())) {
+        RowLoc loc = scratchRow();
+        rows[init] = loc;
+        rows[arg] = loc;
+        rows[result] = loc;
+      }
+      // Anything else -- a tensor of slices, say -- carries no rows of its own:
+      // the slices it holds are bound where they are created.
+    }
+    return success();
+  }
+
   const RowLoc *rowFor(Value v) const {
     auto it = rows.find(v);
     return it == rows.end() ? nullptr : &it->second;
@@ -426,7 +456,12 @@ LogicalResult RowBinder::bindOp(Operation *op) {
   if (auto extract = dyn_cast<ExtractRowOp>(op)) {
     const SliceLoc *from = sliceFor(extract.getSlice());
     if (!from)
-      return op->emitError() << "extract from a slice that is not bound";
+      return op->emitError()
+             << "extract from a slice that is not bound to any rows; it comes "
+                "from "
+             << (extract.getSlice().getDefiningOp()
+                     ? extract.getSlice().getDefiningOp()->getName().getStringRef()
+                     : llvm::StringRef("a block argument"));
     rows[extract.getRow()] = from->at(extract.getRowIdx());
     return success();
   }
@@ -951,6 +986,14 @@ struct MappedLoop {
   int64_t bankBase = 0;
   int64_t bankCount = 1;
   int64_t itersPerBank = 1;
+  /// How many of those iterations share one bank row.
+  ///
+  /// A row is wider than one operand, so several tiles sit side by side in it.
+  /// Nothing addresses a lane -- an activation drives the whole row -- so the
+  /// commands for the tiles sharing a row are the SAME commands, and a bank runs
+  /// one wave of them per group rather than one per tile. That is the difference
+  /// between issuing the schedule and issuing it `pack_factor` times over.
+  int64_t packFactor = 1;
 };
 
 /// How the memory the mapping chose banks in is organised, as it recorded it.
@@ -1041,6 +1084,9 @@ FailureOr<MappedLoop> readMappedLoop(func::FuncOp func) {
       mapped.bankBase = bid.getInt();
     if (auto ipb = loop->getAttrOfType<IntegerAttr>("bits.iters_per_bank"))
       mapped.itersPerBank = ipb.getInt();
+    mapped.packFactor = 1;
+    if (auto pf2 = loop->getAttrOfType<IntegerAttr>("bits.pack_factor"))
+      mapped.packFactor = std::max<int64_t>(1, pf2.getInt());
     found = true;
   }
   if (!found) {
@@ -1086,7 +1132,8 @@ struct ConvertBitsRowsToPuD
     // so the layout is decided once and the bank left open.
     pud::AddressAllocator allocator(*geometry);
     RowBinder binder(allocator, mapped->bankBase);
-    if (failed(binder.bind(*mapped->loop.getBody())))
+    if (failed(binder.bindCarried(mapped->loop)) ||
+        failed(binder.bind(*mapped->loop.getBody())))
       return signalPassFailure();
 
     RowOpEmitter emitter(*geometry, binder, mapped->bankBase,
@@ -1110,11 +1157,13 @@ struct ConvertBitsRowsToPuD
 
     Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
     Value one = builder.create<arith::ConstantIndexOp>(loc, 1);
-    Value tiles =
-        builder.create<arith::ConstantIndexOp>(loc, mapped->itersPerBank);
+    int64_t waves = (mapped->itersPerBank + mapped->packFactor - 1) /
+                    mapped->packFactor;
+    Value tiles = builder.create<arith::ConstantIndexOp>(loc, waves);
 
     // The mapped loop ran once per tile of the whole operand; each bank takes
-    // its own share of them, and the banks run at the same time.
+    // its own share of them, the tiles sharing a bank row run as one wave, and
+    // the banks run at the same time.
     auto tileLoop = builder.create<scf::ForOp>(loc, zero, tiles, one);
     {
       OpBuilder::InsertionGuard guard(builder);
