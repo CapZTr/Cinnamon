@@ -314,8 +314,9 @@ struct ConvertLinalgGenericToBits
       auto extResultType = SliceType::get(ctx, outputBitWidth, vectorLen);
       auto rowNumToExt = rewriter.create<arith::ConstantIntOp>(
           loc, outputBitWidth - inputBitWidth, 64);
-      Value newResult = rewriter.create<ExtensionIOp>(loc, extResultType,
-                                                      inputSlice, rowNumToExt);
+      // The body was an arith.extsi, so the rows above the input are its sign.
+      Value newResult = rewriter.create<ExtensionIOp>(
+          loc, extResultType, inputSlice, rowNumToExt, /*isSigned=*/true);
 
       sliceCache[op] = newResult;
       auto assembledType = inferTensorTypeFromBitsValue(newResult, ctx);
@@ -1263,6 +1264,12 @@ struct ConvertLinalgSquaredDistanceToBits
     auto sqElem = dyn_cast<IntegerType>(mul.getType());
     if (!diffElem || !sqElem)
       return failure();
+    // How the body widened the inputs before subtracting decides what the rows
+    // above them hold: the sign of the feature, or zero. Both operands go
+    // through the same widening, so one answer covers them.
+    const bool signedInputs =
+        isa_and_nonnull<arith::ExtSIOp>(sub.getLhs().getDefiningOp());
+
     const int64_t inW = aElem.getWidth();
     const int64_t diffW = diffElem.getWidth();
     const int64_t sqW = sqElem.getWidth();
@@ -1338,14 +1345,16 @@ struct ConvertLinalgSquaredDistanceToBits
         Value aWide = aSlice, bWide = bSlice;
         if (diffW != inW) {
           aWide = rewriter.create<ExtensionIOp>(loc, diffSliceTy, aSlice,
-                                               extRows);
+                                               extRows, signedInputs);
           bWide = rewriter.create<ExtensionIOp>(loc, diffSliceTy, bSlice,
-                                               extRows);
+                                               extRows, signedInputs);
         }
         Value diff =
             rewriter.create<SubIOp>(loc, diffSliceTy, aWide, bWide);
         Value sq = rewriter.create<MulIOp>(loc, sqSliceTy, diff, diff);
         Value sqAcc = sq;
+        // A square is non-negative, so the rows above it are zero whichever way
+        // the inputs were extended.
         if (accW != sqW)
           sqAcc = rewriter.create<ExtensionIOp>(
               loc, accSliceTy, sq,
@@ -1611,7 +1620,9 @@ struct ConvertLinalgBinaryDotToBits
 
         // Chain the blocks. This add is the reduction combiner the mapper
         // distributes over banks; it is carried at chainBits so the sum of all
-        // numBlocks partial counts is exact.
+        // numBlocks partial counts is exact. A count is non-negative, so the
+        // rows above it are the reserved zero row and the accumulate reads that
+        // row for those bits instead of storing them.
         Value wide = rewriter.create<ExtensionIOp>(
             loc, chainSliceTy, partial,
             rewriter.create<arith::ConstantIntOp>(loc, chainBits - blockBits,

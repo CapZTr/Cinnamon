@@ -32,6 +32,150 @@ constexpr llvm::StringLiteral kCarryResident = "resident";
 constexpr llvm::StringLiteral kCarryLoaded = "loaded";
 
 //===----------------------------------------------------------------------===//
+// Operands that are wider than the rows behind them
+//===----------------------------------------------------------------------===//
+
+/// One operand of a bit-serial expansion, and where each of its rows is.
+///
+/// `bits.ext_i` computes nothing. The rows above the operand's own width are a
+/// row the substrate already holds -- the reserved zero row for an unsigned
+/// extension, the operand's own top row for a signed one -- so an expansion
+/// never materialises an extended operand: it reads the real rows while the bit
+/// index is inside them, and that one row above. Which of the two a given bit
+/// reads is known here, so the bit loop is cut where the operand under the
+/// extension ends rather than choosing a row per iteration, and the command
+/// count is untouched: K additions then W - K, never W plus a widening.
+struct ExtOperand {
+  /// The slice that actually holds rows.
+  Value slice;
+  /// Rows [0, realRows) live in `slice`; everything above is one row.
+  int64_t realRows = 0;
+  bool isSigned = false;
+};
+
+static int64_t sliceRows(Value v) {
+  return cast<SliceType>(v.getType()).getBitWidth();
+}
+
+/// Looks through the extensions on an operand.
+///
+/// A chain of them collapses into one description as long as they agree on
+/// signedness, because above the innermost operand every row is then the same
+/// row. A chain that disagrees is peeled only as far as it agrees, which is
+/// correct and costs a segment more.
+static ExtOperand peelExtensions(Value v) {
+  ExtOperand operand{v, sliceRows(v), false};
+  bool signednessKnown = false;
+  while (auto ext = operand.slice.getDefiningOp<ExtensionIOp>()) {
+    bool isSigned = ext.getIsSigned();
+    if (signednessKnown && isSigned != operand.isSigned)
+      break;
+    operand.isSigned = isSigned;
+    signednessKnown = true;
+    operand.slice = ext.getSlice();
+    operand.realRows = sliceRows(operand.slice);
+  }
+  return operand;
+}
+
+/// The bit indices at which a loop over `width` bits has to be cut so that
+/// within each piece every operand reads from one place.
+///
+/// An operand with nothing extended contributes no cut, so an expansion whose
+/// operands are all stored gets exactly the one loop it always got.
+static SmallVector<int64_t> segmentBounds(ArrayRef<ExtOperand> operands,
+                                          int64_t width) {
+  SmallVector<int64_t> bounds{0, width};
+  for (const ExtOperand &operand : operands)
+    if (operand.realRows > 0 && operand.realRows < width)
+      bounds.push_back(operand.realRows);
+  llvm::sort(bounds);
+  bounds.erase(llvm::unique(bounds), bounds.end());
+  return bounds;
+}
+
+/// The row an extended operand presents for every bit above its own width.
+///
+/// One row for all of them, so it is read once ahead of the loops rather than
+/// per bit -- and it is a read, not a copy: the zero row is a row the substrate
+/// reserves, and the sign row is the operand's own top row.
+static Value padRow(OpBuilder &builder, Location loc, Type rowType,
+                    const ExtOperand &operand, Value vecLenVal) {
+  if (!operand.isSigned)
+    return builder.create<CreateAllZeroRowOp>(loc, rowType, vecLenVal);
+  Value top =
+      builder.create<arith::ConstantIntOp>(loc, operand.realRows - 1, 64);
+  return builder.create<ExtractRowOp>(loc, rowType, operand.slice, top);
+}
+
+/// The row an operand presents at bit `iv`, inside a segment starting at `lo`.
+static Value rowAt(OpBuilder &builder, Location loc, Type rowType,
+                   const ExtOperand &operand, Value ivI64, int64_t lo,
+                   Value pad) {
+  if (lo < operand.realRows)
+    return builder.create<ExtractRowOp>(loc, rowType, operand.slice, ivI64);
+  return pad;
+}
+
+/// Builds the bit loop of a two-operand carry chain, cut into as many pieces as
+/// the operands' extensions call for.
+///
+/// `emitStep` is given one bit's rows and the carry in, and hands back the sum
+/// row and the carry out. Cutting the loop is free: the carry each piece hands
+/// to the next is already in the cell the next one reads it from, so only the
+/// first piece pays a seed, exactly as an uncut loop does.
+///
+/// Returns the result slice and the carry that fell out of the top.
+template <typename EmitStep>
+static std::pair<Value, Value>
+buildCarryChain(PatternRewriter &rewriter, Location loc, SliceType resType,
+                Value lhsSlice, Value rhsSlice, int64_t width, Value initSlice,
+                Value initCarry, EmitStep emitStep) {
+  auto rowType =
+      BitRowType::get(rewriter.getContext(), resType.getVectorLength());
+  Value vecLenVal = rewriter.create<arith::ConstantIntOp>(
+      loc, resType.getVectorLength(), 64);
+
+  ExtOperand lhs = peelExtensions(lhsSlice);
+  ExtOperand rhs = peelExtensions(rhsSlice);
+  SmallVector<int64_t> bounds = segmentBounds({lhs, rhs}, width);
+
+  Value lhsPad, rhsPad;
+  if (lhs.realRows < width)
+    lhsPad = padRow(rewriter, loc, rowType, lhs, vecLenVal);
+  if (rhs.realRows < width)
+    rhsPad = padRow(rewriter, loc, rowType, rhs, vecLenVal);
+
+  Value c1Index = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+  Value slice = initSlice, carry = initCarry;
+  for (size_t s = 0; s + 1 < bounds.size(); ++s) {
+    const int64_t lo = bounds[s];
+    Value lbIndex = rewriter.create<arith::ConstantIndexOp>(loc, lo);
+    Value ubIndex = rewriter.create<arith::ConstantIndexOp>(loc, bounds[s + 1]);
+    auto loop = rewriter.create<scf::ForOp>(
+        loc, lbIndex, ubIndex, c1Index, ValueRange{slice, carry},
+        [&](OpBuilder &builder, Location bodyLoc, Value iv,
+            ValueRange iterArgs) {
+          Value ivI64 = builder.create<arith::IndexCastOp>(
+              bodyLoc, builder.getI64Type(), iv);
+          Value lhsRow =
+              rowAt(builder, bodyLoc, rowType, lhs, ivI64, lo, lhsPad);
+          Value rhsRow =
+              rowAt(builder, bodyLoc, rowType, rhs, ivI64, lo, rhsPad);
+          auto [sumRow, coutRow] =
+              emitStep(builder, bodyLoc, lhsRow, rhsRow, iterArgs[1]);
+          Value updated = builder.create<InsertRowOp>(
+              bodyLoc, resType, iterArgs[0], sumRow, ivI64);
+          builder.create<scf::YieldOp>(bodyLoc,
+                                       ValueRange{updated, coutRow});
+        });
+    slice = loop.getResult(0);
+    carry = loop.getResult(1);
+  }
+  return {slice, carry};
+}
+
+//===----------------------------------------------------------------------===//
 
 template <typename SliceOp, typename RowOp>
 struct RowWiseLogicPattern : public OpRewritePattern<SliceOp> {
@@ -107,11 +251,6 @@ struct AddIPattern : public OpRewritePattern<AddIOp> {
     auto bitwidth = sliceType.getBitWidth();
     auto vecLen = sliceType.getVectorLength();
 
-    Value c0Val = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value bitwidthIndex =
-        rewriter.create<arith::ConstantIndexOp>(loc, bitwidth);
-    Value c1Val = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-
     Value bitwidthVal =
         rewriter.create<arith::ConstantIntOp>(loc, bitwidth, 64);
     Value vecLenVal = rewriter.create<arith::ConstantIntOp>(loc, vecLen, 64);
@@ -121,38 +260,23 @@ struct AddIPattern : public OpRewritePattern<AddIOp> {
     Value resSlice =
         rewriter.create<CreateSliceOp>(loc, sliceType, bitwidthVal, vecLenVal);
 
-    auto loop = rewriter.create<scf::ForOp>(
-        loc, c0Val, bitwidthIndex, c1Val, ValueRange{resSlice, carryRow},
-        [&](OpBuilder &builder, Location bodyLoc, Value iv,
-            ValueRange iterArgs) {
-          Value curSlice = iterArgs[0];
-          Value cinRow = iterArgs[1];
-          Value ivI64 = builder.create<arith::IndexCastOp>(
-              bodyLoc, builder.getI64Type(), iv);
-
-          Value lhsRow =
-              builder.create<ExtractRowOp>(bodyLoc, rowType, lhsSlice, ivI64);
-          Value rhsRow =
-              builder.create<ExtractRowOp>(bodyLoc, rowType, rhsSlice, ivI64);
+    auto [sum, carry] = buildCarryChain(
+        rewriter, loc, sliceType, lhsSlice, rhsSlice, bitwidth, resSlice,
+        carryRow,
+        [&](OpBuilder &builder, Location bodyLoc, Value lhsRow, Value rhsRow,
+            Value cinRow) {
           auto rowAdd = builder.create<RowAddOp>(bodyLoc, rowType, rowType,
                                                  lhsRow, rhsRow, cinRow);
-          // The carry is this loop's only loop-carried row and starts at zero,
-          // so it never has to reach a data row: it stays in the dual-contact
-          // cell the adder computes it in, seeded once ahead of the loop. That
-          // is the whole difference between 8 commands a bit and 9.
+          // The carry is the chain's only carried row and starts at zero, so it
+          // never has to reach a data row: it stays in the dual-contact cell the
+          // adder computes it in, seeded once ahead of the loop. That is the
+          // whole difference between 8 commands a bit and 9.
           rowAdd->setAttr(kCarryAttrName, builder.getStringAttr(kCarryResident));
-
-          Value sumRow = rowAdd.getSum();
-          Value coutRow = rowAdd.getCout();
-
-          Value updatedSlice = builder.create<InsertRowOp>(
-              bodyLoc, sliceType, curSlice, sumRow, ivI64);
-
-          builder.create<scf::YieldOp>(bodyLoc,
-                                       ValueRange{updatedSlice, coutRow});
+          return std::make_pair(rowAdd.getSum(), rowAdd.getCout());
         });
+    (void)carry; // a truncating add drops what fell off the top
 
-    rewriter.replaceOp(op, loop.getResult(0));
+    rewriter.replaceOp(op, sum);
 
     return success();
   }
@@ -183,11 +307,6 @@ struct SubIPattern : public OpRewritePattern<SubIOp> {
     auto bitwidth = sliceType.getBitWidth();
     auto vecLen = sliceType.getVectorLength();
 
-    Value c0Index = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value c1Index = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    Value bitwidthIndex =
-        rewriter.create<arith::ConstantIndexOp>(loc, bitwidth);
-
     Value bitwidthVal =
         rewriter.create<arith::ConstantIntOp>(loc, bitwidth, 64);
     Value vecLenVal = rewriter.create<arith::ConstantIntOp>(loc, vecLen, 64);
@@ -199,33 +318,22 @@ struct SubIPattern : public OpRewritePattern<SubIOp> {
     Value resSlice =
         rewriter.create<CreateSliceOp>(loc, sliceType, bitwidthVal, vecLenVal);
 
-    auto loop = rewriter.create<scf::ForOp>(
-        loc, c0Index, bitwidthIndex, c1Index, ValueRange{resSlice, borrowRow},
-        [&](OpBuilder &builder, Location bodyLoc, Value iv,
-            ValueRange iterArgs) {
-          Value curSlice = iterArgs[0];
-          Value binRow = iterArgs[1];
-          Value ivI64 = builder.create<arith::IndexCastOp>(
-              bodyLoc, builder.getI64Type(), iv);
-
-          Value lhsRow =
-              builder.create<ExtractRowOp>(bodyLoc, rowType, lhsSlice, ivI64);
-          Value rhsRow =
-              builder.create<ExtractRowOp>(bodyLoc, rowType, rhsSlice, ivI64);
+    auto [diff, borrow] = buildCarryChain(
+        rewriter, loc, sliceType, lhsSlice, rhsSlice, bitwidth, resSlice,
+        borrowRow,
+        [&](OpBuilder &builder, Location bodyLoc, Value lhsRow, Value rhsRow,
+            Value binRow) {
           auto rowSub = builder.create<RowSubOp>(bodyLoc, rowType, rowType,
                                                  lhsRow, rhsRow, binRow);
-          // Same reasoning as the adder: the borrow is the loop's only carried
+          // Same reasoning as the adder: the borrow is the chain's only carried
           // row and starts from a constant, so it never leaves the dual-contact
           // cell it is computed in.
           rowSub->setAttr(kCarryAttrName, builder.getStringAttr(kCarryResident));
-
-          Value updatedSlice = builder.create<InsertRowOp>(
-              bodyLoc, sliceType, curSlice, rowSub.getDiff(), ivI64);
-          builder.create<scf::YieldOp>(
-              bodyLoc, ValueRange{updatedSlice, rowSub.getBout()});
+          return std::make_pair(rowSub.getDiff(), rowSub.getBout());
         });
+    (void)borrow; // the borrow out of the top is the sign, which is in the diff
 
-    rewriter.replaceOp(op, loop.getResult(0));
+    rewriter.replaceOp(op, diff);
     return success();
   }
 };
@@ -255,10 +363,6 @@ struct AddIFullPattern : public OpRewritePattern<AddIFullOp> {
     auto bitwidth = operandType.getBitWidth();
     auto vecLen = operandType.getVectorLength();
 
-    Value c0Index = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value c1Index = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    Value bitwidthIndex =
-        rewriter.create<arith::ConstantIndexOp>(loc, bitwidth);
     Value carryRowIdx =
         rewriter.create<arith::ConstantIntOp>(loc, bitwidth, 64);
 
@@ -272,32 +376,20 @@ struct AddIFullPattern : public OpRewritePattern<AddIFullOp> {
     Value resSlice =
         rewriter.create<CreateSliceOp>(loc, resType, resBitwidthVal, vecLenVal);
 
-    auto loop = rewriter.create<scf::ForOp>(
-        loc, c0Index, bitwidthIndex, c1Index, ValueRange{resSlice, carryRow},
-        [&](OpBuilder &builder, Location bodyLoc, Value iv,
-            ValueRange iterArgs) {
-          Value curSlice = iterArgs[0];
-          Value cinRow = iterArgs[1];
-          Value ivI64 = builder.create<arith::IndexCastOp>(
-              bodyLoc, builder.getI64Type(), iv);
-
-          Value lhsRow =
-              builder.create<ExtractRowOp>(bodyLoc, rowType, lhsSlice, ivI64);
-          Value rhsRow =
-              builder.create<ExtractRowOp>(bodyLoc, rowType, rhsSlice, ivI64);
+    auto [sum, carry] = buildCarryChain(
+        rewriter, loc, resType, lhsSlice, rhsSlice, bitwidth, resSlice,
+        carryRow,
+        [&](OpBuilder &builder, Location bodyLoc, Value lhsRow, Value rhsRow,
+            Value cinRow) {
           auto rowAdd = builder.create<RowAddOp>(bodyLoc, rowType, rowType,
                                                  lhsRow, rhsRow, cinRow);
           rowAdd->setAttr(kCarryAttrName, builder.getStringAttr(kCarryResident));
-
-          Value updatedSlice = builder.create<InsertRowOp>(
-              bodyLoc, resType, curSlice, rowAdd.getSum(), ivI64);
-          builder.create<scf::YieldOp>(
-              bodyLoc, ValueRange{updatedSlice, rowAdd.getCout()});
+          return std::make_pair(rowAdd.getSum(), rowAdd.getCout());
         });
 
     // The carry that fell off the top is the result's top row.
-    Value withCarry = rewriter.create<InsertRowOp>(
-        loc, resType, loop.getResult(0), loop.getResult(1), carryRowIdx);
+    Value withCarry =
+        rewriter.create<InsertRowOp>(loc, resType, sum, carry, carryRowIdx);
 
     rewriter.replaceOp(op, withCarry);
     return success();

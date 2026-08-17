@@ -112,12 +112,22 @@ def ExtractAndReplicateColumnOp : Bits_Op<"extract_and_replicate", [Pure]> {
 }
 
 def ExtensionIOp : Bits_Op<"ext_i", [Pure]> {
-  let summary = "";
-  let description = [{}];
+  let summary = "Widen a slice by rows it does not have to store";
+  let description = [{
+    The rows above the operand's own width are a row the substrate already
+    holds: the reserved zero row for an unsigned extension, the operand's own
+    top row for a signed one. `isSigned` says which, so that the expansion that
+    consumes the extended slice knows which row to read for those bits. Nothing
+    is computed here and nothing is copied, which is why an extension is priced
+    at zero -- but that only holds because whatever reads it reads a row that is
+    already there, so an `ext_i` that survives to row level is an error rather
+    than a free op.
+  }];
 
   let arguments = (ins
     SliceType:$slice,
-    I64:$rowNumToExt
+    I64:$rowNumToExt,
+    UnitAttr:$isSigned
   );
   let results = (outs
     SliceType:$result

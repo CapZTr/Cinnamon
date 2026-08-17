@@ -431,6 +431,23 @@ LogicalResult RowBinder::bindOp(Operation *op) {
         SliceLoc::run(from->base + offset.getSExtValue());
     return success();
   }
+  if (auto ext = dyn_cast<ExtensionIOp>(op)) {
+    // An extension has no rows of its own. bits-pattern-apply folds it into the
+    // bit loop of whatever computes on it -- the rows above the operand are a
+    // row the substrate already holds -- so one that is still here and gets read
+    // a row at a time is an expansion that was never written, and binding it to
+    // the run underneath would quietly read the wrong rows past the operand's
+    // width. One whose result only ever leaves the kernel as a value is fine and
+    // is what the popcount and BNN kernels do with their final widening.
+    for (OpOperand &use : ext.getResult().getUses())
+      if (isa<ExtractRowOp, ExtractSubSliceOp, InsertRowOp>(use.getOwner()))
+        return op->emitError()
+               << "bits.ext_i reached row level and is read by '"
+               << use.getOwner()->getName().getStringRef()
+               << "'; the expansion that consumes it has to read the rows under "
+                  "the extension itself";
+    return success();
+  }
   if (auto insert = dyn_cast<InsertRowOp>(op)) {
     const SliceLoc *from = sliceFor(insert.getSlice());
     if (!from)
