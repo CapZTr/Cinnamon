@@ -14,6 +14,15 @@
 // Keeping both on the same templates is the point: an op's modelled cost and
 // the code emitted for it cannot drift apart.
 //
+// A few primitives carry a hand-written sequence instead. lime's scheduler is
+// not always shortest: for XNOR it schedules the complement of an XOR and pays
+// two commands for the inversion, where a seven-command program exists. Where a
+// shorter sequence is known, it is written out here and lime's is not used --
+// but never on trust. Every template, compiled or written, is run against a
+// model of the substrate over all input assignments and all initial states of
+// the compute rows; agreement across the templates lime has already proved
+// equivalent is what makes that model worth checking the hand-written ones with.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef CINM_MLIR_DIALECT_BITS_CODEGEN_ROWOPLIBRARY_H
@@ -154,7 +163,21 @@ struct RowOpTemplate {
   llvm::SmallVector<RowOperand, 4> outputBindings;
 
   /// Whether lime proved the compiled program equivalent to the source MIG.
+  /// Always false for a hand-written template: lime proves what it compiles, and
+  /// a sequence it did not compile is outside what it can speak about.
   bool validated = false;
+
+  /// Set when this sequence was written by hand rather than compiled, because
+  /// lime's scheduler does not find the shortest program for this primitive. A
+  /// hand-written template is only ever accepted when `simulated` holds.
+  bool handWritten = false;
+
+  /// Whether running the sequence on a model of the substrate reproduced the
+  /// primitive's truth table over every input assignment. This is what a
+  /// hand-written template stands on; it is also run over lime's templates,
+  /// where agreeing with fifteen programs lime has already proved is what makes
+  /// the model itself trustworthy.
+  bool simulated = false;
 
   unsigned totalCommands() const { return numAAP + numAP; }
 };

@@ -11,9 +11,13 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include "llvm/ADT/STLExtras.h"
+
 #include <array>
 #include <cstring>
+#include <map>
 #include <string>
+#include <utility>
 
 using namespace mlir::bits;
 using MIG = mockturtle::mig_network;
@@ -371,6 +375,341 @@ private:
 };
 
 //===----------------------------------------------------------------------===//
+// A model of the substrate
+//===----------------------------------------------------------------------===//
+
+/// One physical row an activation drives.
+struct RowMember {
+  enum class Kind { Compute, Cell, Constant } kind;
+  /// Compute row number, dual-contact cell number, or constant value.
+  int index;
+  /// Set for a cell's complementing wordline, which reads and writes inverted.
+  bool inverted;
+};
+
+/// The rows a control-row name activates. The compound names come from the one
+/// table the lime translation also reads, so the two cannot disagree about what
+/// a group is.
+llvm::SmallVector<RowMember, 3> membersOf(ControlRow row) {
+  switch (row) {
+  case ControlRow::T0:
+  case ControlRow::T1:
+  case ControlRow::T2:
+  case ControlRow::T3:
+    return {{RowMember::Kind::Compute,
+             static_cast<int>(row) - static_cast<int>(ControlRow::T0), false}};
+  case ControlRow::DCC0:
+    return {{RowMember::Kind::Cell, 0, false}};
+  case ControlRow::DCC0N:
+    return {{RowMember::Kind::Cell, 0, true}};
+  case ControlRow::DCC1:
+    return {{RowMember::Kind::Cell, 1, false}};
+  case ControlRow::DCC1N:
+    return {{RowMember::Kind::Cell, 1, true}};
+  case ControlRow::C_0:
+    return {{RowMember::Kind::Constant, 0, false}};
+  case ControlRow::C_1:
+    return {{RowMember::Kind::Constant, 1, false}};
+  default:
+    break;
+  }
+  for (const GroupPattern &group : getSimdramGroups()) {
+    if (group.row != row)
+      continue;
+    llvm::SmallVector<RowMember, 3> members;
+    for (auto [i, cell] : llvm::enumerate(group.cells))
+      members.push_back({llvm::StringRef(cell.first) == "DCC"
+                             ? RowMember::Kind::Cell
+                             : RowMember::Kind::Compute,
+                         static_cast<int>(cell.second), group.inverted[i]});
+    return members;
+  }
+  llvm::report_fatal_error("control row is not in the substrate's group table");
+}
+
+/// The state a row-op sequence runs against: the four compute rows, the two
+/// dual-contact cells, and the data rows a template's operands name.
+///
+/// A dual-contact cell holds one value and presents it on two wordlines, so
+/// reading or writing through the complementing one inverts. That is the whole
+/// of why an inversion costs no command on this substrate, and getting it right
+/// is most of what this model is for.
+class Substrate {
+public:
+  Substrate(bool computeInit[4], bool cellInit[2], bool dataInit) {
+    for (int i = 0; i < 4; i++)
+      compute[i] = computeInit[i];
+    for (int i = 0; i < 2; i++)
+      cell[i] = cellInit[i];
+    dataDefault = dataInit;
+  }
+
+  /// Runs one instruction. Returns failure if it names something this substrate
+  /// cannot do, which is a bug in the template rather than a wrong answer.
+  bool run(const RowOpInstr &instr) {
+    if (instr.isAp)
+      return activate(instr.dst).has_value();
+    std::optional<bool> value = read(instr.src);
+    if (!value)
+      return false;
+    return write(instr.dst, *value);
+  }
+
+  std::optional<bool> read(const RowOperand &operand) {
+    if (!operand.isControl())
+      return dataRow(operand);
+    auto members = membersOf(operand.getControlRow());
+    if (members.size() == 3)
+      return activate(operand); // a triple-row activation, read as its majority
+    if (members.size() != 1)
+      return std::nullopt;      // a row pair has no value of its own
+    return readMember(members[0]);
+  }
+
+private:
+  /// Activates a row group: the three rows drive the bitline together, the
+  /// majority wins, and every one of them is left holding it.
+  std::optional<bool> activate(const RowOperand &operand) {
+    if (!operand.isControl())
+      return std::nullopt;
+    auto members = membersOf(operand.getControlRow());
+    if (members.size() != 3)
+      return std::nullopt;
+    int ones = 0;
+    for (const RowMember &member : members) {
+      std::optional<bool> bit = readMember(member);
+      if (!bit)
+        return std::nullopt;
+      ones += *bit;
+    }
+    bool majority = ones >= 2;
+    for (const RowMember &member : members)
+      if (!writeMember(member, majority))
+        return std::nullopt;
+    return majority;
+  }
+
+  bool write(const RowOperand &operand, bool value) {
+    if (!operand.isControl()) {
+      dataRow(operand) = value;
+      return true;
+    }
+    for (const RowMember &member : membersOf(operand.getControlRow()))
+      if (!writeMember(member, value))
+        return false;
+    return true;
+  }
+
+  std::optional<bool> readMember(const RowMember &member) {
+    switch (member.kind) {
+    case RowMember::Kind::Compute:
+      return compute[member.index];
+    case RowMember::Kind::Cell:
+      return member.inverted ? !cell[member.index] : cell[member.index];
+    case RowMember::Kind::Constant:
+      return member.index != 0;
+    }
+    return std::nullopt;
+  }
+
+  bool writeMember(const RowMember &member, bool value) {
+    switch (member.kind) {
+    case RowMember::Kind::Compute:
+      compute[member.index] = value;
+      return true;
+    case RowMember::Kind::Cell:
+      cell[member.index] = member.inverted ? !value : value;
+      return true;
+    case RowMember::Kind::Constant:
+      return false; // a row held at a constant is not a destination
+    }
+    return false;
+  }
+
+  bool &dataRow(const RowOperand &operand) {
+    auto key = std::make_pair(static_cast<int>(operand.kind), operand.index);
+    auto [it, inserted] = data.try_emplace(key, dataDefault);
+    return it->second;
+  }
+
+  bool compute[4];
+  bool cell[2];
+  bool dataDefault;
+  std::map<std::pair<int, int>, bool> data;
+};
+
+/// What each primitive computes, spelled the same way its MIG builder above
+/// spells it. This is the reference the model checks a sequence against, so it
+/// deliberately restates the majority expressions rather than the arithmetic
+/// they add up to.
+llvm::SmallVector<bool, 2> expectedOutputs(RowOpKind kind,
+                                           llvm::ArrayRef<bool> in) {
+  auto maj = [](bool a, bool b, bool c) { return (a && b) || (a && c) || (b && c); };
+  switch (kind) {
+  case RowOpKind::And:
+    return {maj(in[0], in[1], false)};
+  case RowOpKind::Or:
+    return {maj(in[0], in[1], true)};
+  case RowOpKind::Not:
+    return {!in[0]};
+  case RowOpKind::Maj3:
+    return {maj(in[0], in[1], in[2])};
+  case RowOpKind::Xor:
+    return {maj(maj(in[0], in[1], true), !maj(in[0], in[1], false), false)};
+  case RowOpKind::Xnor:
+    return {maj(maj(in[0], !in[1], true), maj(!in[0], in[1], true), false)};
+  case RowOpKind::FullAdd:
+  case RowOpKind::FullAddLoaded: {
+    bool cout = maj(in[0], in[1], in[2]);
+    return {maj(in[1], !cout, maj(in[0], !in[1], in[2])), cout};
+  }
+  case RowOpKind::FullSub: {
+    bool cout = maj(in[0], !in[1], in[2]);
+    return {maj(!in[1], !cout, maj(in[0], in[1], in[2])), cout};
+  }
+  case RowOpKind::Relu:
+    return {maj(in[0], !in[1], false)};
+  case RowOpKind::MinMax: {
+    auto ite = [&](bool s, bool x, bool y) {
+      return maj(maj(s, x, false), maj(!s, y, false), true);
+    };
+    return {ite(in[2], in[1], in[0]), ite(in[2], in[0], in[1])};
+  }
+  case RowOpKind::RangeScan00:
+  case RowOpKind::RangeScan01:
+  case RowOpKind::RangeScan10:
+  case RowOpKind::RangeScan11: {
+    bool lower = kind == RowOpKind::RangeScan10 || kind == RowOpKind::RangeScan11;
+    bool upper = kind == RowOpKind::RangeScan01 || kind == RowOpKind::RangeScan11;
+    return {maj(in[1], in[0], lower), maj(in[2], !in[0], upper)};
+  }
+  case RowOpKind::NUM_KINDS:
+    break;
+  }
+  llvm_unreachable("unhandled row-op kind");
+}
+
+/// Runs `tmpl` over every input assignment and every initial state of the
+/// compute rows and cells, checking it reproduces the primitive.
+///
+/// Sweeping the initial state is the part that matters: a sequence that happens
+/// to work because a compute row was left at zero would pass a single-state
+/// check and then fail on the second bit of the first operand.
+bool simulate(RowOpKind kind, const RowOpTemplate &tmpl) {
+  if (tmpl.inputBindings.size() != tmpl.numInputs ||
+      tmpl.outputBindings.size() != tmpl.numOutputs)
+    return false;
+
+  unsigned numInputs = tmpl.numInputs;
+  for (unsigned assignment = 0; assignment < (1u << numInputs); assignment++) {
+    llvm::SmallVector<bool, 3> inputs;
+    for (unsigned i = 0; i < numInputs; i++)
+      inputs.push_back((assignment >> i) & 1);
+    auto expected = expectedOutputs(kind, inputs);
+    if (expected.size() != tmpl.numOutputs)
+      return false;
+
+    for (unsigned state = 0; state < 64; state++) {
+      for (bool dataInit : {false, true}) {
+        bool compute[4], cell[2];
+        for (int i = 0; i < 4; i++)
+          compute[i] = (state >> i) & 1;
+        for (int i = 0; i < 2; i++)
+          cell[i] = (state >> (4 + i)) & 1;
+
+        Substrate substrate(compute, cell, dataInit);
+        // The caller's job before the sequence runs: every input is in the row
+        // the template says it reads it from.
+        for (unsigned i = 0; i < numInputs; i++) {
+          RowOpInstr load;
+          load.src = RowOperand::control(inputs[i] ? ControlRow::C_1
+                                                  : ControlRow::C_0);
+          load.dst = tmpl.inputBindings[i];
+          if (!substrate.run(load))
+            return false;
+        }
+        for (const RowOpInstr &instr : tmpl.instrs)
+          if (!substrate.run(instr))
+            return false;
+        for (unsigned i = 0; i < tmpl.numOutputs; i++) {
+          std::optional<bool> got = substrate.read(tmpl.outputBindings[i]);
+          if (!got || *got != expected[i])
+            return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+//===----------------------------------------------------------------------===//
+// Hand-written templates
+//===----------------------------------------------------------------------===//
+
+/// Shorthands for spelling a sequence out.
+RowOpInstr aap(RowOperand dst, RowOperand src) { return {false, src, dst}; }
+RowOpInstr ap(ControlRow group) {
+  return {true, RowOperand(), RowOperand::control(group)};
+}
+RowOperand ctrl(ControlRow row) { return RowOperand::control(row); }
+
+/// XOR and XNOR share one seven-command shape, differing only in which constant
+/// seeds the pair of majorities and which one closes them:
+///
+///   XNOR = (a | !b) & (!a | b)      XOR = (a & !b) | (!a & b)
+///
+/// Both complements come out of the dual-contact cells for free, and the two
+/// inner majorities read disjoint rows, so they run back to back without either
+/// clobbering what the other still needs:
+///
+///   1. AAP(DCC0N_T0 <- a)   cell 0 holds !a, so row DCC0 reads !a;  T0 = a
+///   2. AAP(DCC1N_T1 <- b)   cell 1 holds !b, so row DCC1 reads !b;  T1 = b
+///   3. AAP(T2_T3    <- seed)
+///   4. AP (DCC0_T1_T3)      maj(!a, b, seed)   -> DCC0, T1, T3
+///   5. AP (DCC1_T0_T2)      maj(!b, a, seed)   -> DCC1, T0, T2
+///   6. AAP(T2 <- close)     T0 still holds step 5's result
+///   7. AAP(out <- T0_T1_T2) maj(step 5, step 4, close)
+///
+/// lime schedules XNOR instead as the complement of an XOR, which costs two more
+/// commands, and XOR one more; on a BNN layer that is 128 commands per tile per
+/// bank of pure inversion. Hence writing them out.
+RowOpTemplate buildEquality(bool negated) {
+  ControlRow seed = negated ? ControlRow::C_1 : ControlRow::C_0;
+  ControlRow close = negated ? ControlRow::C_0 : ControlRow::C_1;
+  RowOpTemplate tmpl;
+  tmpl.instrs = {
+      aap(ctrl(ControlRow::DCC0N_T0), RowOperand::input(0)),
+      aap(ctrl(ControlRow::DCC1N_T1), RowOperand::input(1)),
+      aap(ctrl(ControlRow::T2_T3), ctrl(seed)),
+      ap(ControlRow::DCC0_T1_T3),
+      ap(ControlRow::DCC1_T0_T2),
+      aap(ctrl(ControlRow::T2), ctrl(close)),
+      aap(RowOperand::output(0), ctrl(ControlRow::T0_T1_T2)),
+  };
+  tmpl.numInputs = 2;
+  tmpl.numOutputs = 1;
+  tmpl.inputBindings = {RowOperand::input(0), RowOperand::input(1)};
+  tmpl.outputBindings = {RowOperand::output(0)};
+  return tmpl;
+}
+
+/// The primitives lime's scheduler does not compile to the shortest known
+/// program. Everything absent from here is lime's.
+std::optional<RowOpTemplate> getHandWrittenTemplate(PudBackend backend,
+                                                    RowOpKind kind) {
+  if (backend != PudBackend::Simdram)
+    return std::nullopt;
+  switch (kind) {
+  case RowOpKind::Xor:
+    return buildEquality(/*negated=*/false);
+  case RowOpKind::Xnor:
+    return buildEquality(/*negated=*/true);
+  default:
+    return std::nullopt;
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // Compilation
 //===----------------------------------------------------------------------===//
 
@@ -608,13 +947,38 @@ const RowOpTemplate *RowOpLibrary::getTemplate(PudBackend backend,
   Entry &entry = entryFor(backend, kind);
   if (entry.failed)
     return nullptr;
-  if (!entry.compiled) {
-    entry.compiled = true;
-    if (!compileTemplate(kind, entry.tmpl)) {
-      entry.failed = true;
-      return nullptr;
+  if (entry.compiled)
+    return &entry.tmpl;
+  entry.compiled = true;
+
+  if (auto handWritten = getHandWrittenTemplate(backend, kind)) {
+    entry.tmpl = std::move(*handWritten);
+    entry.tmpl.handWritten = true;
+    for (const RowOpInstr &instr : entry.tmpl.instrs)
+      (instr.isAp ? entry.tmpl.numAP : entry.tmpl.numAAP)++;
+    entry.tmpl.simulated = simulate(kind, entry.tmpl);
+    // A hand-written sequence has nothing but this check behind it, and every
+    // kernel compiled from here on would carry the mistake. Refusing to run is
+    // the only honest response.
+    if (!entry.tmpl.simulated) {
+      std::string msg;
+      llvm::raw_string_ostream os(msg);
+      os << "hand-written row-op template '" << getRowOpName(kind)
+         << "' does not compute the primitive on a model of the substrate; it "
+            "must not be used";
+      llvm::report_fatal_error(llvm::StringRef(msg));
     }
+    return &entry.tmpl;
   }
+
+  if (!compileTemplate(kind, entry.tmpl)) {
+    entry.failed = true;
+    return nullptr;
+  }
+  // lime has already proved this one equivalent to its MIG. Running it through
+  // the model too is what earns the model the right to vouch for a sequence lime
+  // did not compile, so a disagreement here is reported rather than acted on.
+  entry.tmpl.simulated = simulate(kind, entry.tmpl);
   return &entry.tmpl;
 }
 
@@ -650,12 +1014,13 @@ std::string RowOpLibrary::renderSanityTable(PudBackend backend) {
   llvm::raw_string_ostream os(out);
   os << "row-op templates for backend '" << getBackendName(backend) << "'\n";
   pad(os, "primitive", 17);
-  pad(os, "lime", 7, false);
+  pad(os, "cmds", 7, false);
   pad(os, "AAP", 7, false);
   pad(os, "AP", 7, false);
   pad(os, "ref", 7, false);
-  pad(os, "delta", 10, false);
-  os << "  validated\n";
+  pad(os, "delta", 8, false);
+  pad(os, "source", 9, false);
+  os << "  proof\n";
   for (unsigned i = 0; i < static_cast<unsigned>(RowOpKind::NUM_KINDS); i++) {
     auto kind = static_cast<RowOpKind>(i);
     const RowOpTemplate *tmpl = getTemplate(backend, kind);
@@ -679,8 +1044,16 @@ std::string RowOpLibrary::renderSanityTable(PudBackend backend) {
       int diff = static_cast<int>(tmpl->totalCommands()) - static_cast<int>(ref);
       delta = (diff > 0 ? "+" : "") + std::to_string(diff);
     }
-    pad(os, delta, 10, false);
-    os << "  " << (tmpl->validated ? "yes" : "NO") << "\n";
+    pad(os, delta, 8, false);
+    pad(os, tmpl->handWritten ? "hand" : "lime", 9, false);
+    // What actually stands behind the sequence: lime's SAT equivalence check, the
+    // exhaustive run on the substrate model, or both.
+    std::string proof;
+    if (tmpl->validated)
+      proof = tmpl->simulated ? "lime+sim" : "lime (sim DISAGREES)";
+    else
+      proof = tmpl->simulated ? "sim" : "NONE";
+    os << "  " << proof << "\n";
   }
   // the instruction streams themselves, so a reader can check a template
   // against the hand-written expansion command by command
