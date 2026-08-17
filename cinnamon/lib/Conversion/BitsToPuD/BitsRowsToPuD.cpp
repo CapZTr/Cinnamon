@@ -552,24 +552,25 @@ public:
   /// that independence into overlapped activations.
   void emitAcrossBanks(OpBuilder &builder, Location loc, bool isAp,
                        const RowLoc &dst, const RowLoc &src, IRMapping &map) {
-    Value lb = builder.create<arith::ConstantIndexOp>(loc, bankBase);
-    Value ub =
-        builder.create<arith::ConstantIndexOp>(loc, bankBase + bankCount);
     Value step = builder.create<arith::ConstantIndexOp>(loc, 1);
-    builder.create<scf::ForOp>(
-        loc, lb, ub, step, ValueRange{},
-        [&](OpBuilder &b, Location bodyLoc, Value iv, ValueRange) {
-          BankCoord coord = decomposeBank(b, bodyLoc, iv);
-          Value dstAddr = materialise(b, bodyLoc, dst, coord, map);
-          if (isAp) {
-            b.create<pud::APOp>(bodyLoc, dstAddr, pud::Backend::Simdram);
-          } else {
-            Value srcAddr = materialise(b, bodyLoc, src, coord, map);
-            b.create<pud::AAPOp>(bodyLoc, srcAddr, dstAddr,
-                                 pud::Backend::Simdram);
-          }
-          b.create<scf::YieldOp>(bodyLoc);
-        });
+    for (auto [from, to] : bankRanges()) {
+      Value lb = builder.create<arith::ConstantIndexOp>(loc, from);
+      Value ub = builder.create<arith::ConstantIndexOp>(loc, to);
+      builder.create<scf::ForOp>(
+          loc, lb, ub, step, ValueRange{},
+          [&](OpBuilder &b, Location bodyLoc, Value iv, ValueRange) {
+            BankCoord coord = decomposeBank(b, bodyLoc, iv);
+            Value dstAddr = materialise(b, bodyLoc, dst, coord, map);
+            if (isAp) {
+              b.create<pud::APOp>(bodyLoc, dstAddr, pud::Backend::Simdram);
+            } else {
+              Value srcAddr = materialise(b, bodyLoc, src, coord, map);
+              b.create<pud::AAPOp>(bodyLoc, srcAddr, dstAddr,
+                                   pud::Backend::Simdram);
+            }
+            b.create<scf::YieldOp>(bodyLoc);
+          });
+    }
   }
 
   /// Instantiates `tmpl` with its data operands bound to `inputs` / `outputs`.
@@ -595,6 +596,22 @@ private:
     Value bank;
     Value subarray;
   };
+
+  /// The mapped banks, as ranges of flat bank indices.
+  ///
+  /// A bank group starts wherever the ILP put the loop and wraps at the end of
+  /// the machine, exactly as the mapping's own `buildBankGroup` numbers it, so a
+  /// group based near the top does not address banks that are not there. The
+  /// wrap is known here, so it is two ranges rather than a remainder per
+  /// command: a group that does not wrap emits the one loop it always did.
+  SmallVector<std::pair<int64_t, int64_t>> bankRanges() const {
+    int64_t total = std::max<int64_t>(1, geometry.totalBanks);
+    int64_t begin = bankBase % total;
+    int64_t count = std::min(bankCount, total);
+    if (begin + count <= total)
+      return {{begin, begin + count}};
+    return {{begin, total}, {0, begin + count - total}};
+  }
 
   /// Splits a flat bank index into that coordinate. The mapping numbers banks
   /// flatly and a channel holds a fixed number of them, so the index divides on
