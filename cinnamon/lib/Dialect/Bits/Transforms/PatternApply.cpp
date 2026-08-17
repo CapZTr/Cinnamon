@@ -565,9 +565,17 @@ struct MulIPattern : public OpRewritePattern<MulIOp> {
           auto outerAdd = builder.create<RowAddOp>(bodyLoc, rowType, rowType,
                                                    outerAnd, carry, finalCin);
           outerAdd->setAttr(kCarryAttrName, builder.getStringAttr(kCarryLoaded));
+          // The top row of the partial sum, which is the last row it has: the
+          // inner loop shifted everything below it down by one, so what the
+          // outer addition produces belongs at partialAddBitwidth - 1. It used
+          // to be written one row past the end of the run, which cost no
+          // command and read back nothing, but wrote into whatever was
+          // allocated next.
+          Value partialTopIndex =
+              rewriter.create<arith::ConstantIntOp>(loc, partialAddBitwidth - 1, 64);
           Value updatedPartialSlice = builder.create<InsertRowOp>(
               bodyLoc, partialAddSliceType, partialSlice, outerAdd.getSum(),
-              partialAddBitwidthVal);
+              partialTopIndex);
           builder.create<scf::YieldOp>(bodyLoc, ValueRange{updatedResSlice2,
                                                            updatedPartialSlice,
                                                            outerAdd.getCout()});
