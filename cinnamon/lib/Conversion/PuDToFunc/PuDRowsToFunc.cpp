@@ -225,6 +225,7 @@ struct GetCtrlRowLowering : public OpConversionPattern<GetCtrlRowOp> {
 enum RowOpcode : unsigned {
   kAP = 0x60,
   kAAP = 0x61,
+  kRowCopy = 0x62,
 };
 
 struct AAPLowering : public OpConversionPattern<AAPOp> {
@@ -235,6 +236,22 @@ struct AAPLowering : public OpConversionPattern<AAPOp> {
                   ConversionPatternRewriter &rewriter) const override {
     // the instruction takes (dst, src); the op names them the other way round
     emitRowOp(rewriter, op.getLoc(), kAAP,
+              ValueRange{adaptor.getDstAddr(), adaptor.getSrcAddr()});
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+/// A copy is its own instruction rather than an AAP, because its two rows can be
+/// in different banks: an AAP activates one bank twice, and the substrate has to
+/// know that this one does not.
+struct RowCopyLowering : public OpConversionPattern<RowCopyOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(RowCopyOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    emitRowOp(rewriter, op.getLoc(), kRowCopy,
               ValueRange{adaptor.getDstAddr(), adaptor.getSrcAddr()});
     rewriter.eraseOp(op);
     return success();
@@ -292,7 +309,7 @@ struct ConvertPuDRowsToFunc
 
     RewritePatternSet patterns(ctx);
     patterns.add<GetRowLowering, GetCtrlRowLowering>(converter, ctx, space);
-    patterns.add<AAPLowering, APLowering>(converter, ctx);
+    patterns.add<AAPLowering, APLowering, RowCopyLowering>(converter, ctx);
 
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
       signalPassFailure();

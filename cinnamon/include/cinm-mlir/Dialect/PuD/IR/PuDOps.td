@@ -38,6 +38,33 @@ def AAPOp : PuD_Op<"AAP", [Pure]> {
   let hasVerifier = 1;
 }
 
+def RowCopyOp : PuD_Op<"row_copy", [Pure]> {
+  let summary = "Copy a row into another bank's row";
+  let description = [{
+    Moves one row of data from where it is to where the next computation on it
+    has to be, which is what a reduction across banks is made of: the banks a
+    reduction was spread over cannot read each other's rows, so a value crosses
+    before it is folded in.
+
+    Unlike `pud.AAP`, the two rows need not be in the same subarray, bank or
+    rank, and what it costs depends on how far apart they are: rows sharing
+    sense amplifiers move through them, rows in different banks of one channel
+    move over that channel's data bus, and rows in different channels have to be
+    read out of one and written into the other. That is the substrate's business
+    -- here it is one command naming two rows.
+  }];
+
+  let arguments = (ins
+    RowType:$srcAddr,
+    RowType:$dstAddr,
+    PuD_BackendAttr:$backend
+  );
+
+  let assemblyFormat = "$srcAddr `,` $dstAddr attr-dict `:` "
+      "qualified(type($srcAddr)) `,` qualified(type($dstAddr))";
+  let hasVerifier = 1;
+}
+
 def APOp : PuD_Op<"AP", [Pure]> {
   let summary = "Activate ; Precharge";
   let description = [{

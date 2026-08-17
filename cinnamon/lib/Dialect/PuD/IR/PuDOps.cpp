@@ -55,6 +55,22 @@ LogicalResult AAPOp::verify() {
   return emitOpError("Invalid group of operands");
 }
 
+LogicalResult RowCopyOp::verify() {
+  auto srcAddrT = cast<RowType>(getSrcAddr().getType());
+  auto dstAddrT = cast<RowType>(getDstAddr().getType());
+
+  if (!srcAddrT || !dstAddrT)
+    return emitOpError("Operands must be RowType");
+
+  // A copy moves data between rows that hold it. Neither end may be a control
+  // row: a compute row is not somewhere a value waits, and a constant row is
+  // not somewhere anything is written.
+  if (srcAddrT.getGroup() == 1 || dstAddrT.getGroup() == 1)
+    return emitOpError("a row copy moves data rows, not control rows");
+
+  return success();
+}
+
 LogicalResult APOp::verify() {
   auto addrT = cast<RowType>(getAddr().getType());
 
