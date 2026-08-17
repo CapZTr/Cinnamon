@@ -1712,9 +1712,11 @@ struct ConvertLinalgMinMaxReduceToBits
     Value acc = rewriter.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{tiles},
                                                  sliceTy);
     Value lb = getOrCreateIndexConstant(rewriter, loc, 0);
+    Value lb1 = getOrCreateIndexConstant(rewriter, loc, 1);
     Value ubT = getOrCreateIndexConstant(rewriter, loc, tiles);
     Value ubC = getOrCreateIndexConstant(rewriter, loc, cols);
     Value step = getOrCreateIndexConstant(rewriter, loc, 1);
+    OpFoldResult lbAttr = rewriter.getIndexAttr(0);
 
     auto tileLoop = rewriter.create<scf::ForOp>(loc, lb, ubT, step, acc);
     {
@@ -1722,19 +1724,26 @@ struct ConvertLinalgMinMaxReduceToBits
       rewriter.setInsertionPointToStart(tileLoop.getBody());
       Value t = tileLoop.getInductionVar();
 
-      // Identity for the running best: 0 for unsigned max, all-ones for min.
-      auto widthConst = rewriter.create<arith::ConstantIntOp>(
-          loc, elemTy.getWidth(), 64);
-      auto lanesConst = rewriter.create<arith::ConstantIntOp>(loc, lanes, 64);
-      Value seed =
-          isMax ? rewriter.create<CreateSliceOp>(loc, sliceTy, widthConst,
-                                                 lanesConst)
-                      .getResult()
-                : rewriter.create<CreateAllOneSliceOp>(loc, sliceTy, widthConst,
-                                                       lanesConst)
-                      .getResult();
+      // The running best starts as the first candidate, not as an identity.
+      //
+      // Folding from an identity would cost one more compare-and-select per
+      // tile than reducing N values needs, and the mapping prices the number
+      // that is needed. It was also wrong for max: the identity used there was
+      // an uninitialised slice rather than a row of zeros, so the extra compare
+      // ran against whatever those rows held.
+      Value firstCol = rewriter.create<tensor::ExtractSliceOp>(
+          loc, tileTensorTy, src, SmallVector<OpFoldResult>{t, lbAttr},
+          SmallVector<OpFoldResult>{rewriter.getIndexAttr(lanes),
+                                    rewriter.getIndexAttr(1)},
+          SmallVector<OpFoldResult>{rewriter.getIndexAttr(tiles),
+                                    rewriter.getIndexAttr(1)});
+      Value seed = rewriter.create<TransposeOp>(loc, sliceTy, firstCol);
 
-      auto dbLoop = rewriter.create<scf::ForOp>(loc, lb, ubC, step, seed);
+      auto dbLoop = rewriter.create<scf::ForOp>(loc, lb1, ubC, step, seed);
+      // Peeled, so every iteration is a real combine and the trip count no
+      // longer says so on its own.
+      dbLoop->setAttr("bits.reduce_combines",
+                      rewriter.getI64IntegerAttr(cols - 1));
       {
         OpBuilder::InsertionGuard g2(rewriter);
         rewriter.setInsertionPointToStart(dbLoop.getBody());

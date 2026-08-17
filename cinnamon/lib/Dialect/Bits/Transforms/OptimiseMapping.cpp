@@ -973,6 +973,16 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
     int64_t wavesPerBank = (itersPerBank + packFactor - 1) / packFactor;
     int64_t foldLevels =
         packFactor > 1 ? (int64_t)llvm::Log2_64_Ceil(packFactor) : 0;
+    // How many of the waves combine rather than seed. A reduction loop normally
+    // starts from an identity, so its first wave seeds and the rest combine; an
+    // expansion that has peeled the seed out combines on every wave, and says
+    // so, because the trip count cannot be read both ways.
+    int64_t reduceCombines = std::max<int64_t>(0, wavesPerBank - 1);
+    if (auto attr = forOp->getAttrOfType<IntegerAttr>("bits.reduce_combines"))
+      reduceCombines = std::max<int64_t>(0, attr.getInt());
+    int64_t seedWaves = std::max<int64_t>(0, wavesPerBank - reduceCombines);
+    // Items each bank ends up folding: one per wave, plus the peeled seed.
+    int64_t itemsPerBank = wavesPerBank + (1 - seedWaves);
 
     Operation *reduceProducer = nullptr;
     if (auto yield = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator())) {
@@ -1099,11 +1109,12 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
           }
           cursor = end;
         }
-        if (reduceProducer && wave > 0) {
+        if (reduceProducer && wave >= seedWaves) {
           // Wave `wave` folds its products into a partial sum that now holds
-          // `wave + 1` of them, so the lossless width is taken at that count.
-          int64_t wIn = losslessReduceWidth(reduceBase, wave);
-          int64_t wOut = losslessReduceWidth(reduceBase, wave + 1);
+          // `folded + 1` of them, so the lossless width is taken at that count.
+          int64_t folded = wave + (1 - seedWaves);
+          int64_t wIn = losslessReduceWidth(reduceBase, folded);
+          int64_t wOut = losslessReduceWidth(reduceBase, folded + 1);
           bool grows = wOut > wIn;
           int64_t start = cursor;
           int64_t end = start + (kWideAdd && isa<AddIOp>(reduceProducer)
@@ -1149,7 +1160,7 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
           // Folding the packed lanes doubles the item count each level; the
           // copy that stages the other half moves a partial sum, so it is as
           // wide as the sum is.
-          int64_t foldItems = wavesPerBank << level;
+          int64_t foldItems = itemsPerBank << level;
           int64_t wIn = losslessReduceWidth(reduceBase, foldItems);
           int64_t wOut = losslessReduceWidth(reduceBase, foldItems * 2);
           bool grows = wOut > wIn;
@@ -1598,8 +1609,14 @@ static int64_t estimateForLatency(scf::ForOp forOp) {
   if (failed(maybeTripCount))
     return 0;
   int64_t tripCount = *maybeTripCount;
-  if (!llvm::isPowerOf2_64(static_cast<uint64_t>(tripCount)))
+  if (tripCount <= 0)
     return 0;
+  // A trip count that is not a power of two used to price the whole loop at
+  // zero. That was harmless while every loop the frontends built had one, and
+  // stopped being harmless when a reduction started peeling its seed: sixteen
+  // values reduce in fifteen steps, and fifteen is not a power of two, so the
+  // kernel priced as free. Nothing below needs the property -- the sweep that
+  // does is over bank counts, not iterations.
 
   int64_t bodyLatency = estimateLoopBodyLatency(forOp);
   if (bodyLatency == 0)
@@ -2843,13 +2860,23 @@ struct BitsOptimiseMappingPass
         // Intra-bank SIMD packing: P iterations per bank row run as one wave,
         // so each bank does ceil(itersPerBank/P) waves with (waves-1) intra-bank
         // reductions, plus a ceil(log2 P) lane fold.
+        //
+        // The (waves - 1) is the assumption that a reduction loop's first
+        // iteration seeds the accumulator rather than combining into it. An
+        // expansion that has already peeled that iteration -- taking the first
+        // value as the accumulator and looping over the rest -- performs one
+        // combine per iteration instead, and says so, because the trip count no
+        // longer tells this apart from an unpeeled loop one shorter.
         int64_t packFactor = getLoopPackFactor(lp);
         int64_t wavesPerBank = (itersPerBank + packFactor - 1) / packFactor;
+        int64_t intraReduce = std::max<int64_t>(0, wavesPerBank - 1);
+        if (auto combines =
+                lp->getAttrOfType<IntegerAttr>("bits.reduce_combines"))
+          intraReduce = combines.getInt();
         lp->setAttr("bits.pack_factor",
                     attrBuilder.getI64IntegerAttr(packFactor));
         lp->setAttr("bits.intra_reduce_count",
-                    attrBuilder.getI64IntegerAttr(
-                        std::max<int64_t>(0, wavesPerBank - 1)));
+                    attrBuilder.getI64IntegerAttr(intraReduce));
         if (packFactor > 1)
           lp->setAttr("bits.fold_levels",
                       attrBuilder.getI64IntegerAttr(
