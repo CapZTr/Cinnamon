@@ -690,6 +690,28 @@ LogicalResult ScheduleEmitter::emit(Block &src, OpBuilder &builder,
       continue;
     }
 
+    // A value that is not already where the slice wants it has to be put
+    // there. Most of the time it already is, because a template writes its
+    // result straight into the slot its consumer names; what is left is the
+    // cases where it cannot, such as a carry that lives in a dual-contact cell
+    // and has to be kept as a result row before the next addition clobbers it.
+    if (auto insert = dyn_cast<InsertRowOp>(&op)) {
+      const RowLoc *row = binder.rowFor(insert.getRow());
+      const SliceLoc *slice = binder.sliceFor(insert.getSlice());
+      if (!row || !slice)
+        return op.emitError() << "insert of a row into a slice, one of which "
+                                 "is not bound to any row";
+      const RowLoc dst = slice->at(insert.getIndex());
+      if (!row->sameAs(dst)) {
+        for (const RowLoc *r : {&dst, row})
+          if (r->index && failed(materialiseIndex(builder, r->index, map)))
+            return op.emitError() << "the row this insert names is at an index "
+                                     "that cannot be computed here";
+        emitter.emitAcrossBanks(builder, loc, /*isAp=*/false, dst, *row, map);
+      }
+      continue;
+    }
+
     if (isRowOp(&op)) {
       FailureOr<TemplateUse> use = describeRowOp(&op, binder);
       if (failed(use))

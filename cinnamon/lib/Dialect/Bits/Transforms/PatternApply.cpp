@@ -158,6 +158,80 @@ struct AddIPattern : public OpRewritePattern<AddIOp> {
   }
 };
 
+/// Widening add: the same adder, keeping the carry-out instead of dropping it.
+///
+/// A truncating add throws away the carry that falls off the top. This one is
+/// what a reduction tree wants, so it keeps it as one more result row -- and
+/// that store is a command, because the carry lives in a dual-contact cell that
+/// the next addition's carry-init would overwrite. 8n + 2, as getRecipeForAdd
+/// prices a widening add.
+struct AddIFullPattern : public OpRewritePattern<AddIFullOp> {
+  using OpRewritePattern<AddIFullOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(AddIFullOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto ctx = rewriter.getContext();
+    Value lhsSlice = op.getLhs();
+    Value rhsSlice = op.getRhs();
+
+    auto operandType = dyn_cast<SliceType>(lhsSlice.getType());
+    auto resType = dyn_cast<SliceType>(op.getResult().getType());
+    if (!operandType || !resType)
+      return failure();
+
+    auto bitwidth = operandType.getBitWidth();
+    auto vecLen = operandType.getVectorLength();
+
+    Value c0Index = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value c1Index = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value bitwidthIndex =
+        rewriter.create<arith::ConstantIndexOp>(loc, bitwidth);
+    Value carryRowIdx =
+        rewriter.create<arith::ConstantIntOp>(loc, bitwidth, 64);
+
+    Value resBitwidthVal =
+        rewriter.create<arith::ConstantIntOp>(loc, resType.getBitWidth(), 64);
+    Value vecLenVal = rewriter.create<arith::ConstantIntOp>(loc, vecLen, 64);
+
+    auto rowType = BitRowType::get(ctx, vecLen);
+    Value carryRow =
+        rewriter.create<CreateAllZeroRowOp>(loc, rowType, vecLenVal);
+    Value resSlice =
+        rewriter.create<CreateSliceOp>(loc, resType, resBitwidthVal, vecLenVal);
+
+    auto loop = rewriter.create<scf::ForOp>(
+        loc, c0Index, bitwidthIndex, c1Index, ValueRange{resSlice, carryRow},
+        [&](OpBuilder &builder, Location bodyLoc, Value iv,
+            ValueRange iterArgs) {
+          Value curSlice = iterArgs[0];
+          Value cinRow = iterArgs[1];
+          Value ivI64 = builder.create<arith::IndexCastOp>(
+              bodyLoc, builder.getI64Type(), iv);
+
+          Value lhsRow =
+              builder.create<ExtractRowOp>(bodyLoc, rowType, lhsSlice, ivI64);
+          Value rhsRow =
+              builder.create<ExtractRowOp>(bodyLoc, rowType, rhsSlice, ivI64);
+          auto rowAdd = builder.create<RowAddOp>(bodyLoc, rowType, rowType,
+                                                 lhsRow, rhsRow, cinRow);
+          rowAdd->setAttr(kCarryAttrName, builder.getStringAttr(kCarryResident));
+
+          Value updatedSlice = builder.create<InsertRowOp>(
+              bodyLoc, resType, curSlice, rowAdd.getSum(), ivI64);
+          builder.create<scf::YieldOp>(
+              bodyLoc, ValueRange{updatedSlice, rowAdd.getCout()});
+        });
+
+    // The carry that fell off the top is the result's top row.
+    Value withCarry = rewriter.create<InsertRowOp>(
+        loc, resType, loop.getResult(0), loop.getResult(1), carryRowIdx);
+
+    rewriter.replaceOp(op, withCarry);
+    return success();
+  }
+};
+
 struct MulIPattern : public OpRewritePattern<MulIOp> {
   using OpRewritePattern<MulIOp>::OpRewritePattern;
 
@@ -505,11 +579,12 @@ struct BitsPatternApplyPass
     constexpr bool useReadableMulIPattern = false;
     if (useReadableMulIPattern) {
       patterns
-          .add<AddIPattern, MulIReadablePattern, RowWiseLogicPattern<AndOp, RowAndOp>,
+          .add<AddIPattern, AddIFullPattern, MulIReadablePattern,
+               RowWiseLogicPattern<AndOp, RowAndOp>,
                RowWiseLogicPattern<OrOp, RowOrOp>,
                RowWiseLogicPattern<XOrOp, RowXOrOp>>(ctx);
     } else {
-      patterns.add<AddIPattern, MulIPattern,
+      patterns.add<AddIPattern, AddIFullPattern, MulIPattern,
                    RowWiseLogicPattern<AndOp, RowAndOp>,
                    RowWiseLogicPattern<OrOp, RowOrOp>,
                    RowWiseLogicPattern<XOrOp, RowXOrOp>>(ctx);
