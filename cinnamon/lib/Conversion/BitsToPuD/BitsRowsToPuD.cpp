@@ -541,9 +541,39 @@ LogicalResult RowBinder::bind(Block &block) {
 class RowOpEmitter {
 public:
   RowOpEmitter(const pud::MemoryGeometry &geometry, RowBinder &binder,
-               int64_t bankBase, int64_t bankCount)
-      : geometry(geometry), binder(binder), bankBase(bankBase),
-        bankCount(bankCount) {}
+               ArrayRef<int64_t> banks)
+      : geometry(geometry), binder(binder), allBanks(banks.begin(), banks.end()),
+        banks(this->allBanks) {}
+
+  /// Runs the rest of this scope's commands on `subset` of the mapped banks.
+  ///
+  /// A tree level folds into some of them and not others, and the level's
+  /// reduce is one wave over exactly those.
+  class BankScope {
+  public:
+    BankScope(RowOpEmitter &emitter, ArrayRef<int64_t> subset)
+        : emitter(emitter), saved(emitter.banks) {
+      emitter.banks.assign(subset.begin(), subset.end());
+    }
+    ~BankScope() { emitter.banks = saved; }
+
+  private:
+    RowOpEmitter &emitter;
+    SmallVector<int64_t> saved;
+  };
+
+  /// Rows that stand in for others while a piece of the schedule is emitted.
+  ///
+  /// The same commands mean different rows in different places: the wave that
+  /// seeds a reduction writes its product where the accumulator lives rather
+  /// than into a run of its own, and a fold reads its addend from where the copy
+  /// that feeds it put it. Both are the schedule saying which rows a command
+  /// names, so both are a substitution over the binding rather than a second
+  /// binding.
+  void aliasRun(int64_t from, int64_t to) { runAlias[from] = to; }
+  void clearAliases() { runAlias.clear(); }
+
+  ArrayRef<int64_t> mappedBanks() const { return allBanks; }
 
   /// Issues one command to every mapped bank.
   ///
@@ -573,6 +603,37 @@ public:
     }
   }
 
+  /// Copies a run of rows from one bank into another.
+  ///
+  /// This is the one command that names two banks, and the only way a value a
+  /// reduction spread over banks reaches the bank that folds it in. The rows are
+  /// a run at each end, so the copy is a loop over them rather than one command
+  /// per row in the program text.
+  void emitCopy(OpBuilder &builder, Location loc, int64_t srcBank,
+                int64_t dstBank, int64_t srcRun, int64_t dstRun, int64_t rows) {
+    Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+    Value count = builder.create<arith::ConstantIndexOp>(loc, rows);
+    Value step = builder.create<arith::ConstantIndexOp>(loc, 1);
+    builder.create<scf::ForOp>(
+        loc, zero, count, step, ValueRange{},
+        [&](OpBuilder &b, Location bodyLoc, Value iv, ValueRange) {
+          Value row =
+              b.create<arith::IndexCastOp>(bodyLoc, b.getI64Type(), iv);
+          auto rowIn = [&](int64_t bank, int64_t run) {
+            BankCoord coord = decomposeBank(b, bodyLoc, bank);
+            Value base = b.create<arith::ConstantIntOp>(bodyLoc, run, 64);
+            return b.create<pud::GetRowOp>(
+                bodyLoc, pud::RowType::get(b.getContext(), kDataGroup),
+                coord.channel, coord.rank, coord.bank, coord.subarray,
+                b.create<arith::AddIOp>(bodyLoc, base, row));
+          };
+          Value src = rowIn(srcBank, srcRun);
+          Value dst = rowIn(dstBank, dstRun);
+          b.create<pud::RowCopyOp>(bodyLoc, src, dst, pud::Backend::Simdram);
+          b.create<scf::YieldOp>(bodyLoc);
+        });
+  }
+
   /// Instantiates `tmpl` with its data operands bound to `inputs` / `outputs`.
   LogicalResult emitTemplate(OpBuilder &builder, Location loc,
                              const RowOpTemplate &tmpl, ArrayRef<RowLoc> inputs,
@@ -597,20 +658,30 @@ private:
     Value subarray;
   };
 
-  /// The mapped banks, as ranges of flat bank indices.
+  /// The banks in scope, as ranges of flat bank indices.
   ///
-  /// A bank group starts wherever the ILP put the loop and wraps at the end of
-  /// the machine, exactly as the mapping's own `buildBankGroup` numbers it, so a
-  /// group based near the top does not address banks that are not there. The
-  /// wrap is known here, so it is two ranges rather than a remainder per
-  /// command: a group that does not wrap emits the one loop it always did.
+  /// The mapping hands out one contiguous group per concurrent instance of the
+  /// schedule, wrapping at the end of the machine exactly as its own
+  /// `buildBankGroup` numbers them, so consecutive banks collapse back into the
+  /// loops they came from: one range is one loop, and the common case of a
+  /// single unwrapped group is the one loop it always was.
   SmallVector<std::pair<int64_t, int64_t>> bankRanges() const {
     int64_t total = std::max<int64_t>(1, geometry.totalBanks);
-    int64_t begin = bankBase % total;
-    int64_t count = std::min(bankCount, total);
-    if (begin + count <= total)
-      return {{begin, begin + count}};
-    return {{begin, total}, {0, begin + count - total}};
+    SmallVector<int64_t> flat;
+    flat.reserve(banks.size());
+    for (int64_t bank : banks)
+      flat.push_back(((bank % total) + total) % total);
+    llvm::sort(flat);
+    flat.erase(llvm::unique(flat), flat.end());
+
+    SmallVector<std::pair<int64_t, int64_t>> ranges;
+    for (int64_t bank : flat) {
+      if (!ranges.empty() && ranges.back().second == bank)
+        ranges.back().second = bank + 1;
+      else
+        ranges.push_back({bank, bank + 1});
+    }
+    return ranges;
   }
 
   /// Splits a flat bank index into that coordinate. The mapping numbers banks
@@ -630,6 +701,21 @@ private:
     return coord;
   }
 
+  /// The same split for a bank that is known here rather than counted out by a
+  /// loop -- the ends of a copy, which name one bank each.
+  BankCoord decomposeBank(OpBuilder &b, Location loc, int64_t bank) {
+    int64_t total = std::max<int64_t>(1, geometry.totalBanks);
+    int64_t flat = ((bank % total) + total) % total;
+    BankCoord coord;
+    coord.channel = b.create<arith::ConstantIntOp>(
+        loc, flat / geometry.banksPerChannel, 64);
+    coord.bank = b.create<arith::ConstantIntOp>(
+        loc, flat % geometry.banksPerChannel, 64);
+    coord.rank = b.create<arith::ConstantIntOp>(loc, 0, 64);
+    coord.subarray = b.create<arith::ConstantIntOp>(loc, 0, 64);
+    return coord;
+  }
+
   Value materialise(OpBuilder &b, Location loc, const RowLoc &ref,
                     const BankCoord &coord, IRMapping &map) {
     if (ref.isControl)
@@ -638,7 +724,9 @@ private:
           coord.channel, coord.rank, coord.bank, coord.subarray,
           toDialect(ref.control));
 
-    Value row = b.create<arith::ConstantIntOp>(loc, ref.base + ref.offset, 64);
+    auto alias = runAlias.find(ref.base);
+    int64_t base = alias == runAlias.end() ? ref.base : alias->second;
+    Value row = b.create<arith::ConstantIntOp>(loc, base + ref.offset, 64);
     if (ref.index) {
       // The index has to have been brought across already: what is being built
       // replaces the IR the original index belongs to, so referring to it would
@@ -709,8 +797,11 @@ private:
 
   pud::MemoryGeometry geometry;
   RowBinder &binder;
-  int64_t bankBase;
-  int64_t bankCount;
+  /// Every bank the schedule was mapped onto, and the ones a command reaches
+  /// right now -- the same thing outside a tree level.
+  SmallVector<int64_t> allBanks;
+  SmallVector<int64_t> banks;
+  DenseMap<int64_t, int64_t> runAlias;
 
 public:
   /// Set when a row index named a value that was never brought across, which
@@ -1002,8 +1093,17 @@ LogicalResult ScheduleEmitter::emit(Block &src, OpBuilder &builder,
     // The index arithmetic a row address is built from has to come along; the
     // dataflow that described which rows to touch does not, because the
     // addresses now say it.
+    //
+    // Not all of it can: arithmetic on the mapped loop's own induction variable
+    // says which tile the loop was on, and there is no such variable here -- the
+    // waves are the tiles and every one of them uses the same rows. If a row
+    // address turns out to need it after all, materialising that address says
+    // so; what must not happen is bringing the arithmetic across still pointing
+    // at the body being replaced.
     if (isa<arith::ArithDialect>(op.getDialect())) {
-      builder.clone(op, map);
+      if (llvm::none_of(op.getOperands(),
+                        [&](Value v) { return !map.contains(v); }))
+        builder.clone(op, map);
       continue;
     }
   }
@@ -1014,20 +1114,41 @@ LogicalResult ScheduleEmitter::emit(Block &src, OpBuilder &builder,
 // Reading the mapping off the IR
 //===----------------------------------------------------------------------===//
 
-/// The loop the mapping annotated, and what it said.
+/// The loop the mapping placed, and where it put it.
+///
+/// The loop is the innermost one carrying a mapping, because that is the one
+/// whose body is a wave: an enclosing annotated loop does not run its body in
+/// sequence here, it hands out banks for this one to run its waves on at the
+/// same time.
 struct MappedLoop {
   scf::ForOp loop;
-  int64_t bankBase = 0;
-  int64_t bankCount = 1;
-  int64_t itersPerBank = 1;
-  /// How many of those iterations share one bank row.
+  /// Every bank the schedule runs on, in group order.
   ///
-  /// A row is wider than one operand, so several tiles sit side by side in it.
-  /// Nothing addresses a lane -- an activation drives the whole row -- so the
-  /// commands for the tiles sharing a row are the SAME commands, and a bank runs
-  /// one wave of them per group rather than one per tile. That is the difference
-  /// between issuing the schedule and issuing it `pack_factor` times over.
+  /// One group of `parallel_factor` banks holds one instance of the schedule,
+  /// and the enclosing loop's iterations put `concurrent_groups` of them side by
+  /// side, `bank_group_stride` banks apart, wrapping at the end of the machine.
+  SmallVector<int64_t> banks;
+  /// Banks in one group: the tree's indices are within a group, and every group
+  /// runs the same tree.
+  int64_t banksPerGroup = 1;
+  int64_t groupStride = 1;
+  /// How many waves of the schedule each bank runs.
+  ///
+  /// A bank row is wider than one operand, so several tiles sit side by side in
+  /// it. Nothing addresses a lane -- an activation drives the whole row -- so
+  /// the commands for the tiles sharing a row are the SAME commands, and a bank
+  /// runs one wave per group of them rather than one per tile.
+  int64_t waves = 1;
   int64_t packFactor = 1;
+  /// How many times over the enclosing loops make the whole thing run.
+  int64_t repeat = 1;
+  /// Waves that only produce, before the first one that folds into the
+  /// accumulator. Zero when the expansion peeled the seed itself.
+  int64_t seedWaves = 0;
+  /// Levels of intra-bank folding of the packed lanes, then the cross-bank tree
+  /// as lists of (source, destination) banks within a group.
+  int64_t foldLevels = 0;
+  SmallVector<SmallVector<std::pair<int64_t, int64_t>>> tree;
 };
 
 /// How the memory the mapping chose banks in is organised, as it recorded it.
@@ -1098,36 +1219,91 @@ FailureOr<MappedLoop> readMappedLoop(func::FuncOp func) {
     return failure();
   }
 
-  // The bank mapping sits on an enclosing loop; take the outermost that has it,
-  // because that is the one whose iterations are the tiles.
-  MappedLoop mapped;
-  bool found = false;
-  for (Operation *parent = rowOps.front(); parent;
+  // The mapping sits on an enclosing loop; take the INNERMOST one that has it.
+  // That is the loop whose body is one wave. An annotated loop further out is
+  // not a loop here at all: its iterations are independent, so the mapping gave
+  // each of them its own group of banks to run this schedule on at the same
+  // time, and what it contributes is banks, not iterations.
+  scf::ForOp loop;
+  for (Operation *parent = rowOps.front(); parent && !loop;
        parent = parent->getParentOp()) {
-    auto loop = dyn_cast<scf::ForOp>(parent);
-    if (!loop)
-      continue;
-    auto pf = loop->getAttrOfType<IntegerAttr>("bits.parallel_factor");
-    if (!pf)
-      continue;
-    mapped.loop = loop;
-    mapped.bankCount = pf.getInt();
-    mapped.bankBase = 0;
-    mapped.itersPerBank = 1;
-    if (auto bid = loop->getAttrOfType<IntegerAttr>("bits.bank_id"))
-      mapped.bankBase = bid.getInt();
-    if (auto ipb = loop->getAttrOfType<IntegerAttr>("bits.iters_per_bank"))
-      mapped.itersPerBank = ipb.getInt();
-    mapped.packFactor = 1;
-    if (auto pf2 = loop->getAttrOfType<IntegerAttr>("bits.pack_factor"))
-      mapped.packFactor = std::max<int64_t>(1, pf2.getInt());
-    found = true;
+    auto candidate = dyn_cast<scf::ForOp>(parent);
+    if (candidate && candidate->hasAttr("bits.parallel_factor"))
+      loop = candidate;
   }
-  if (!found) {
+  if (!loop) {
     rowOps.front()->emitError() << "no bank mapping on any enclosing loop; run "
                                   "bits-opt-mapping first";
     return failure();
   }
+
+  auto readAttr = [&](StringRef name, int64_t fallback) {
+    auto attr = loop->getAttrOfType<IntegerAttr>(name);
+    return attr ? std::max<int64_t>(1, attr.getInt()) : fallback;
+  };
+
+  MappedLoop mapped;
+  mapped.loop = loop;
+  mapped.banksPerGroup = readAttr("bits.parallel_factor", 1);
+  mapped.groupStride = readAttr("bits.bank_group_stride", mapped.banksPerGroup);
+  mapped.packFactor = readAttr("bits.pack_factor", 1);
+  mapped.repeat = readAttr("bits.wave_repeat", 1);
+  int64_t itersPerBank = readAttr("bits.iters_per_bank", 1);
+  mapped.waves = (itersPerBank + mapped.packFactor - 1) / mapped.packFactor;
+
+  // The tree names the banks of one group, and having named them it is also
+  // what says which banks the group is: a reduction's group is the banks its
+  // tree folds, and only when there is no tree does the group run from the bank
+  // the ILP chose.
+  SmallVector<int64_t> group;
+  if (auto treeAttr = loop->getAttrOfType<ArrayAttr>("bits.reduce_tree")) {
+    llvm::SmallDenseSet<int64_t> seen;
+    for (Attribute levelAttr : treeAttr) {
+      auto level = dyn_cast<ArrayAttr>(levelAttr);
+      if (!level)
+        continue;
+      SmallVector<std::pair<int64_t, int64_t>> edges;
+      for (Attribute pairAttr : level) {
+        auto pair = dyn_cast<DictionaryAttr>(pairAttr);
+        if (!pair)
+          continue;
+        auto src = dyn_cast_or_null<IntegerAttr>(pair.get("src_bank"));
+        auto dst = dyn_cast_or_null<IntegerAttr>(pair.get("dst_bank"));
+        if (!src || !dst)
+          continue;
+        edges.push_back({src.getInt(), dst.getInt()});
+        for (int64_t bank : {src.getInt(), dst.getInt()})
+          if (seen.insert(bank).second)
+            group.push_back(bank);
+      }
+      if (!edges.empty())
+        mapped.tree.push_back(std::move(edges));
+    }
+    llvm::sort(group);
+  }
+  if (group.empty()) {
+    int64_t base = 0;
+    if (auto bid = loop->getAttrOfType<IntegerAttr>("bits.bank_id"))
+      base = bid.getInt();
+    for (int64_t i = 0; i < mapped.banksPerGroup; ++i)
+      group.push_back(base + i);
+  }
+  mapped.banksPerGroup = group.size();
+
+  int64_t groups = readAttr("bits.concurrent_groups", 1);
+  for (int64_t g = 0; g < groups; ++g)
+    for (int64_t bank : group)
+      mapped.banks.push_back(bank + g * mapped.groupStride);
+
+  mapped.foldLevels =
+      mapped.packFactor > 1 ? (int64_t)llvm::Log2_64_Ceil(mapped.packFactor) : 0;
+  // A reduction normally spends its first wave producing what the rest fold
+  // into; an expansion that peeled that seed out folds on every wave, and says
+  // so, because the wave count cannot be read both ways.
+  int64_t combines = std::max<int64_t>(0, mapped.waves - 1);
+  if (auto attr = loop->getAttrOfType<IntegerAttr>("bits.reduce_combines"))
+    combines = std::max<int64_t>(0, attr.getInt());
+  mapped.seedWaves = std::max<int64_t>(0, mapped.waves - combines);
   return mapped;
 }
 
@@ -1164,14 +1340,14 @@ struct ConvertBitsRowsToPuD
 
     // Every bank running this computation holds its operands in the same rows,
     // so the layout is decided once and the bank left open.
+    int64_t layoutBank = mapped->banks.empty() ? 0 : mapped->banks.front();
     pud::AddressAllocator allocator(*geometry);
-    RowBinder binder(allocator, mapped->bankBase);
+    RowBinder binder(allocator, layoutBank);
     if (failed(binder.bindCarried(mapped->loop)) ||
         failed(binder.bind(*mapped->loop.getBody())))
       return signalPassFailure();
 
-    RowOpEmitter emitter(*geometry, binder, mapped->bankBase,
-                         mapped->bankCount);
+    RowOpEmitter emitter(*geometry, binder, mapped->banks);
     ScheduleEmitter schedule(emitter, binder, target);
 
     // The new body is built beside the old one and swapped in at the end. It is
@@ -1184,26 +1360,50 @@ struct ConvertBitsRowsToPuD
 
     IRMapping map;
     // Row indices are built from constants defined outside the mapped loop, so
-    // bring those across before anything asks for them.
-    for (Operation &op : *mapped->loop->getBlock())
-      if (isa<arith::ArithDialect>(op.getDialect()))
+    // bring those across before anything asks for them -- from every block the
+    // loop is nested in, outermost first, since a constant may sit anywhere
+    // above it.
+    SmallVector<Block *> enclosing;
+    for (Operation *parent = mapped->loop; parent;
+         parent = parent->getParentOp())
+      if (Block *block = parent->getBlock())
+        enclosing.push_back(block);
+    for (Block *block : llvm::reverse(enclosing))
+      for (Operation &op : *block) {
+        if (!isa<arith::ArithDialect>(op.getDialect()))
+          continue;
+        // Only what can stand on its own out here. An enclosing loop's index
+        // arithmetic is about which tile that loop is on, and this schedule has
+        // no such iteration to be on -- bringing it across would leave the new
+        // body pointing at the old one.
+        if (llvm::any_of(op.getOperands(),
+                         [&](Value v) { return !map.contains(v); }))
+          continue;
         builder.clone(op, map);
+      }
 
     Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
     Value one = builder.create<arith::ConstantIndexOp>(loc, 1);
-    int64_t waves = (mapped->itersPerBank + mapped->packFactor - 1) /
-                    mapped->packFactor;
-    Value tiles = builder.create<arith::ConstantIndexOp>(loc, waves);
+    Value repeats = builder.create<arith::ConstantIndexOp>(loc, mapped->repeat);
+    Value tiles = builder.create<arith::ConstantIndexOp>(loc, mapped->waves);
 
-    // The mapped loop ran once per tile of the whole operand; each bank takes
-    // its own share of them, the tiles sharing a bank row run as one wave, and
-    // the banks run at the same time.
-    auto tileLoop = builder.create<scf::ForOp>(loc, zero, tiles, one);
+    // Enclosing loops whose iterations did not all fit in the machine at once
+    // run the whole schedule again for the ones that were left.
+    auto repeatLoop = builder.create<scf::ForOp>(loc, zero, repeats, one);
     {
       OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(tileLoop.getBody());
-      if (failed(schedule.emit(*mapped->loop.getBody(), builder, map)))
-        return signalPassFailure();
+      builder.setInsertionPointToStart(repeatLoop.getBody());
+
+      // The mapped loop ran once per tile of the whole operand; each bank takes
+      // its own share of them, the tiles sharing a bank row run as one wave, and
+      // the banks run at the same time.
+      auto tileLoop = builder.create<scf::ForOp>(loc, zero, tiles, one);
+      {
+        OpBuilder::InsertionGuard tileGuard(builder);
+        builder.setInsertionPointToStart(tileLoop.getBody());
+        if (failed(schedule.emit(*mapped->loop.getBody(), builder, map)))
+          return signalPassFailure();
+      }
     }
 
     builder.setInsertionPointToEnd(entry.get());
@@ -1221,7 +1421,7 @@ struct ConvertBitsRowsToPuD
     if (auto module = func->getParentOfType<ModuleOp>()) {
       module->setAttr("pud.data_rows_per_bank",
                       builder.getI64IntegerAttr(
-                          allocator.rowsAllocated(mapped->bankBase)));
+                          allocator.rowsAllocated(layoutBank)));
       module->setAttr("pud.banks_per_channel",
                       builder.getI64IntegerAttr(geometry->banksPerChannel));
       module->setAttr("pud.total_banks",

@@ -736,6 +736,66 @@ struct TraceRecord {
 };
 static_assert(sizeof(TraceRecord) == 48, "TraceRecord size mismatch");
 
+/// How many times over the enclosing loops make this one run.
+///
+/// An ancestor whose iterations do not all fit in the machine at once runs its
+/// body in waves, and every wave repeats the whole schedule below it.
+static int64_t getAncestorWaveRepeat(scf::ForOp forOp) {
+  int64_t repeat = 1;
+  for (Operation *parent = forOp->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    auto parentFor = dyn_cast<scf::ForOp>(parent);
+    if (!parentFor)
+      continue;
+    auto tripMaybe = getConstTripCount(parentFor);
+    if (failed(tripMaybe))
+      continue;
+    int64_t tripCount = *tripMaybe;
+    int64_t banksPerIter = 1;
+    if (isSliceReductionFor(parentFor)) {
+      banksPerIter =
+          std::max<int64_t>(1, estimateBestParallelBanksForLoop(parentFor));
+    } else {
+      banksPerIter =
+          std::max<int64_t>(1, estimatePeakBanksPerIteration(parentFor));
+    }
+    int64_t concurrentIters = std::max<int64_t>(1, kNumBanks / banksPerIter);
+    int64_t waves = std::max<int64_t>(1, (tripCount + concurrentIters - 1) / concurrentIters);
+    if (repeat > std::numeric_limits<int64_t>::max() / waves)
+      return std::numeric_limits<int64_t>::max();
+    repeat *= waves;
+  }
+  return repeat;
+}
+
+/// How many copies of this loop's bank group run at the same time.
+///
+/// The nearest enclosing loop's iterations are independent of one another, so as
+/// many of them run at once as there are groups of banks to put them in.
+static int64_t getNearestAncestorConcurrentGroups(scf::ForOp forOp,
+                                                  int64_t banksPerGroup) {
+  for (Operation *parent = forOp->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    auto parentFor = dyn_cast<scf::ForOp>(parent);
+    if (!parentFor)
+      continue;
+    auto tripMaybe = getConstTripCount(parentFor);
+    if (failed(tripMaybe))
+      return int64_t{1};
+    int64_t tripCount = *tripMaybe;
+    int64_t parentParallel = tripCount;
+    if (auto pf =
+            parentFor->getAttrOfType<IntegerAttr>("bits.parallel_factor")) {
+      parentParallel = std::max<int64_t>(1, pf.getInt());
+    }
+    int64_t bankLimited =
+        std::max<int64_t>(1, kNumBanks / std::max<int64_t>(1, banksPerGroup));
+    return std::max<int64_t>(
+        1, std::min<int64_t>({tripCount, parentParallel, bankLimited}));
+  }
+  return int64_t{1};
+}
+
 static void dumpFlattenedEventSequence(func::FuncOp func) {
   std::map<int64_t, std::vector<FlattenedEvent>> eventsByStartTime;
   std::map<int64_t, std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>, size_t>>
@@ -874,58 +934,6 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
       auto &existing = events[it->second];
       existing.rowCopy.edges.append(evt.rowCopy.edges.begin(), evt.rowCopy.edges.end());
     }
-  };
-
-  auto getAncestorWaveRepeat = [&](scf::ForOp forOp) {
-    int64_t repeat = 1;
-    for (Operation *parent = forOp->getParentOp(); parent;
-         parent = parent->getParentOp()) {
-      auto parentFor = dyn_cast<scf::ForOp>(parent);
-      if (!parentFor)
-        continue;
-      auto tripMaybe = getConstTripCount(parentFor);
-      if (failed(tripMaybe))
-        continue;
-      int64_t tripCount = *tripMaybe;
-      int64_t banksPerIter = 1;
-      if (isSliceReductionFor(parentFor)) {
-        banksPerIter =
-            std::max<int64_t>(1, estimateBestParallelBanksForLoop(parentFor));
-      } else {
-        banksPerIter =
-            std::max<int64_t>(1, estimatePeakBanksPerIteration(parentFor));
-      }
-      int64_t concurrentIters = std::max<int64_t>(1, kNumBanks / banksPerIter);
-      int64_t waves = std::max<int64_t>(1, (tripCount + concurrentIters - 1) / concurrentIters);
-      if (repeat > std::numeric_limits<int64_t>::max() / waves)
-        return std::numeric_limits<int64_t>::max();
-      repeat *= waves;
-    }
-    return repeat;
-  };
-
-  auto getNearestAncestorConcurrentGroups = [&](scf::ForOp forOp,
-                                                int64_t banksPerGroup) {
-    for (Operation *parent = forOp->getParentOp(); parent;
-         parent = parent->getParentOp()) {
-      auto parentFor = dyn_cast<scf::ForOp>(parent);
-      if (!parentFor)
-        continue;
-      auto tripMaybe = getConstTripCount(parentFor);
-      if (failed(tripMaybe))
-        return int64_t{1};
-      int64_t tripCount = *tripMaybe;
-      int64_t parentParallel = tripCount;
-      if (auto pf =
-              parentFor->getAttrOfType<IntegerAttr>("bits.parallel_factor")) {
-        parentParallel = std::max<int64_t>(1, pf.getInt());
-      }
-      int64_t bankLimited =
-          std::max<int64_t>(1, kNumBanks / std::max<int64_t>(1, banksPerGroup));
-      return std::max<int64_t>(
-          1, std::min<int64_t>({tripCount, parentParallel, bankLimited}));
-    }
-    return int64_t{1};
   };
 
   // Sibling loops are chained rather than all starting at t=0. Each scf.for
@@ -2984,6 +2992,32 @@ struct BitsOptimiseMappingPass
                           isSliceReductionFor(forOp));
         }
       }
+      // Where a loop's bank group actually lands, which is not `parallel_factor`
+      // alone: the same schedule runs on `concurrent_groups` groups of banks at
+      // once, `bank_group_stride` banks apart, and the whole of it `wave_repeat`
+      // times over for the iterations of enclosing loops that did not fit at
+      // once. The flattener works this out to place its events; recording it
+      // here is what lets anything else -- the row-op emitter above all -- spread
+      // a schedule over exactly the banks it was priced on, rather than deriving
+      // the mapping's decision a second time and drifting from it. This runs
+      // after every loop is annotated because it reads the parents' annotations.
+      func.walk([&](scf::ForOp forOp) {
+        if (!forOp->hasAttr("bits.parallel_factor"))
+          return;
+        int64_t stride =
+            std::max<int64_t>(1, estimateBestParallelBanksForLoop(forOp));
+        forOp->setAttr("bits.bank_group_stride",
+                       attrBuilder.getI64IntegerAttr(stride));
+        forOp->setAttr(
+            "bits.concurrent_groups",
+            attrBuilder.getI64IntegerAttr(
+                getNearestAncestorConcurrentGroups(forOp, stride)));
+        forOp->setAttr(
+            "bits.wave_repeat",
+            attrBuilder.getI64IntegerAttr(
+                std::max<int64_t>(1, getAncestorWaveRepeat(forOp))));
+      });
+
       // Mark the accumulator op inside each slice-reduction loop body so the
       // dispatcher can distinguish regular compute work from reduction steps.
       func.walk([&](scf::ForOp forOp) {
