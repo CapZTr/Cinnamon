@@ -22,6 +22,15 @@ namespace mlir::bits {
 #define GEN_PASS_DEF_BITSPATTERNAPPLYPASS
 #include "cinm-mlir/Dialect/Bits/Transforms/Passes.h.inc"
 
+/// Where a bits.row_add keeps its carry. An adder whose carry stays in the
+/// dual-contact cell it is computed in costs one command less per bit than one
+/// that has to read it from a row and write it back, so which of the two an
+/// expansion builds is a property of the expansion, decided here and recorded
+/// rather than guessed at further down.
+constexpr llvm::StringLiteral kCarryAttrName = "bits.carry";
+constexpr llvm::StringLiteral kCarryResident = "resident";
+constexpr llvm::StringLiteral kCarryLoaded = "loaded";
+
 //===----------------------------------------------------------------------===//
 
 template <typename SliceOp, typename RowOp>
@@ -127,6 +136,11 @@ struct AddIPattern : public OpRewritePattern<AddIOp> {
               builder.create<ExtractRowOp>(bodyLoc, rowType, rhsSlice, ivI64);
           auto rowAdd = builder.create<RowAddOp>(bodyLoc, rowType, rowType,
                                                  lhsRow, rhsRow, cinRow);
+          // The carry is this loop's only loop-carried row and starts at zero,
+          // so it never has to reach a data row: it stays in the dual-contact
+          // cell the adder computes it in, seeded once ahead of the loop. That
+          // is the whole difference between 8 commands a bit and 9.
+          rowAdd->setAttr(kCarryAttrName, builder.getStringAttr(kCarryResident));
 
           Value sumRow = rowAdd.getSum();
           Value coutRow = rowAdd.getCout();
@@ -251,6 +265,7 @@ struct MulIPattern : public OpRewritePattern<MulIOp> {
               bodyLoc, rowType, curPartialSlice, c0Val);
           auto addLSB = builder.create<RowAddOp>(
               bodyLoc, rowType, rowType, andFirstRow, curPartialLSB, c0Row);
+          addLSB->setAttr(kCarryAttrName, builder.getStringAttr(kCarryLoaded));
           Value lsbCout = addLSB.getCout();
           Value lsbSum = addLSB.getSum();
           Value updatedResSlice2 = builder.create<InsertRowOp>(
@@ -276,6 +291,8 @@ struct MulIPattern : public OpRewritePattern<MulIOp> {
                 auto innerAdd = innerBuilder.create<RowAddOp>(
                     innerBodyLoc, rowType, rowType, andRow, curPartialRow,
                     curCarry);
+                innerAdd->setAttr(kCarryAttrName,
+                                  innerBuilder.getStringAttr(kCarryLoaded));
 
                 Value innerAddSum = innerAdd.getSum();
                 Value innerCout = innerAdd.getCout();
@@ -292,6 +309,7 @@ struct MulIPattern : public OpRewritePattern<MulIOp> {
               builder.create<RowAndOp>(bodyLoc, rowType, mdMSBRow, mrRow);
           auto outerAdd = builder.create<RowAddOp>(bodyLoc, rowType, rowType,
                                                    outerAnd, carry, finalCin);
+          outerAdd->setAttr(kCarryAttrName, builder.getStringAttr(kCarryLoaded));
           Value updatedPartialSlice = builder.create<InsertRowOp>(
               bodyLoc, partialAddSliceType, partialSlice, outerAdd.getSum(),
               partialAddBitwidthVal);
@@ -310,6 +328,7 @@ struct MulIPattern : public OpRewritePattern<MulIOp> {
         rewriter.create<ExtractRowOp>(loc, rowType, curPartialSlice, c0Val);
     auto rowAdd = rewriter.create<RowAddOp>(
         loc, rowType, rowType, afterMainLoopAnd, curPartialLSB, c0Row);
+    rowAdd->setAttr(kCarryAttrName, rewriter.getStringAttr(kCarryLoaded));
     Value updatedResSlice3 = rewriter.create<InsertRowOp>(
         loc, resSliceType, curResSlice, rowAdd.getSum(), mrBitwidthIndexV);
     Value finalCarry = rowAdd.getCout();
@@ -334,6 +353,8 @@ struct MulIPattern : public OpRewritePattern<MulIOp> {
               bodyLoc, rowType, curPartialSlice, partialRowIndex);
           auto finalLoopAdd = builder.create<RowAddOp>(
               bodyLoc, rowType, rowType, finalLoopAnd, partialRow, currCin);
+          finalLoopAdd->setAttr(kCarryAttrName,
+                                builder.getStringAttr(kCarryLoaded));
         //   Value resRowIndex = builder.create<arith::AddIOp>(
         //       bodyLoc, partialRowIndex, partialAddBitwidthVal);
           Value resRowIndex = builder.create<arith::AddIOp>(
@@ -351,6 +372,8 @@ struct MulIPattern : public OpRewritePattern<MulIOp> {
         rewriter.create<RowAndOp>(loc, rowType, mdMSBRow, mrMSBRow);
     auto addAfterFinalLoop = rewriter.create<RowAddOp>(
         loc, rowType, rowType, finalAnd, mainLoopCout, coutFinalLoop);
+    addAfterFinalLoop->setAttr(kCarryAttrName,
+                               rewriter.getStringAttr(kCarryLoaded));
     Value rowIdx =
         rewriter.create<arith::ConstantIntOp>(loc, resBitwidth - 2, 64);
     Value updatedResSlice5 =
