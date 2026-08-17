@@ -45,16 +45,12 @@ LogicalResult AAPOp::verify() {
   auto srcGroup = srcAddrT.getGroup();
   auto dstGroup = dstAddrT.getGroup();
 
-  if (srcGroup == 0) {
-    if (dstGroup == 0 || dstGroup == 2)
-      return success();
-  } else if (srcGroup == 1) {
-    if (dstGroup == 0)
-      return success();
-  } else if (srcGroup == 2) {
-    if (dstGroup == 0 || dstGroup == 2)
-      return success();
-  }
+  // A row held at a constant can be read into anything; what nothing may do is
+  // write into one, which is what rejecting a constant destination says. Seeding
+  // a data row from the zero row is how a carry that lives in a row starts, so
+  // constant-to-data is as ordinary as constant-to-compute.
+  if (dstGroup != 1)
+    return success();
 
   return emitOpError("Invalid group of operands");
 }
