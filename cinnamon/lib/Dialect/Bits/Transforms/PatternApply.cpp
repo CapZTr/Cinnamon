@@ -31,6 +31,21 @@ constexpr llvm::StringLiteral kCarryAttrName = "bits.carry";
 constexpr llvm::StringLiteral kCarryResident = "resident";
 constexpr llvm::StringLiteral kCarryLoaded = "loaded";
 
+/// The op a reduction folds with, as the mapping marked it.
+///
+/// What that op becomes here is a loop over bits like any other, and the
+/// schedule needs to be able to tell it apart from the rest: it is the one the
+/// first wave does not do, and the one that runs again for every level of the
+/// tree that brings the banks back together. So the mark comes along.
+constexpr llvm::StringLiteral kReduceAttrName = "bits.is_reduce_op";
+
+void carryReduceMark(Operation *from, ArrayRef<Operation *> onto) {
+  if (!from->hasAttr(kReduceAttrName))
+    return;
+  for (Operation *op : onto)
+    op->setAttr(kReduceAttrName, UnitAttr::get(from->getContext()));
+}
+
 //===----------------------------------------------------------------------===//
 // Operands that are wider than the rows behind them
 //===----------------------------------------------------------------------===//
@@ -128,9 +143,10 @@ static Value rowAt(OpBuilder &builder, Location loc, Type rowType,
 /// Returns the result slice and the carry that fell out of the top.
 template <typename EmitStep>
 static std::pair<Value, Value>
-buildCarryChain(PatternRewriter &rewriter, Location loc, SliceType resType,
-                Value lhsSlice, Value rhsSlice, int64_t width, Value initSlice,
-                Value initCarry, EmitStep emitStep) {
+buildCarryChain(PatternRewriter &rewriter, Location loc, Operation *from,
+                SliceType resType, Value lhsSlice, Value rhsSlice,
+                int64_t width, Value initSlice, Value initCarry,
+                EmitStep emitStep) {
   auto rowType =
       BitRowType::get(rewriter.getContext(), resType.getVectorLength());
   Value vecLenVal = rewriter.create<arith::ConstantIntOp>(
@@ -169,6 +185,7 @@ buildCarryChain(PatternRewriter &rewriter, Location loc, SliceType resType,
           builder.create<scf::YieldOp>(bodyLoc,
                                        ValueRange{updated, coutRow});
         });
+    carryReduceMark(from, loop.getOperation());
     slice = loop.getResult(0);
     carry = loop.getResult(1);
   }
@@ -261,7 +278,7 @@ struct AddIPattern : public OpRewritePattern<AddIOp> {
         rewriter.create<CreateSliceOp>(loc, sliceType, bitwidthVal, vecLenVal);
 
     auto [sum, carry] = buildCarryChain(
-        rewriter, loc, sliceType, lhsSlice, rhsSlice, bitwidth, resSlice,
+        rewriter, loc, op, sliceType, lhsSlice, rhsSlice, bitwidth, resSlice,
         carryRow,
         [&](OpBuilder &builder, Location bodyLoc, Value lhsRow, Value rhsRow,
             Value cinRow) {
@@ -319,7 +336,7 @@ struct SubIPattern : public OpRewritePattern<SubIOp> {
         rewriter.create<CreateSliceOp>(loc, sliceType, bitwidthVal, vecLenVal);
 
     auto [diff, borrow] = buildCarryChain(
-        rewriter, loc, sliceType, lhsSlice, rhsSlice, bitwidth, resSlice,
+        rewriter, loc, op, sliceType, lhsSlice, rhsSlice, bitwidth, resSlice,
         borrowRow,
         [&](OpBuilder &builder, Location bodyLoc, Value lhsRow, Value rhsRow,
             Value binRow) {
@@ -377,7 +394,7 @@ struct AddIFullPattern : public OpRewritePattern<AddIFullOp> {
         rewriter.create<CreateSliceOp>(loc, resType, resBitwidthVal, vecLenVal);
 
     auto [sum, carry] = buildCarryChain(
-        rewriter, loc, resType, lhsSlice, rhsSlice, bitwidth, resSlice,
+        rewriter, loc, op, resType, lhsSlice, rhsSlice, bitwidth, resSlice,
         carryRow,
         [&](OpBuilder &builder, Location bodyLoc, Value lhsRow, Value rhsRow,
             Value cinRow) {

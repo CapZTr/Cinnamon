@@ -181,6 +181,7 @@ public:
   /// them a home. Every tile a bank runs folds into the same rows, which is what
   /// makes the accumulator an accumulator, so one run per bank is all it needs.
   LogicalResult bindCarried(scf::ForOp loop) {
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
     for (auto [i, init] : llvm::enumerate(loop.getInits())) {
       Value arg = loop.getRegionIterArg(i);
       Value result = loop.getResult(i);
@@ -189,6 +190,17 @@ public:
         slices[init] = loc;
         slices[arg] = loc;
         slices[result] = loc;
+        // What a tile hands to the next one has to be where the next one will
+        // look for it. The expansion writes its result into a run of its own,
+        // and left to itself the binder would give that run somewhere else --
+        // so every tile would fold into rows the following tile never reads,
+        // and the accumulator would only ever hold the last tile's work. Follow
+        // the inserts back to the run being written and give it the same home.
+        Value carried = yield.getOperand(i);
+        while (auto insert = carried.getDefiningOp<InsertRowOp>())
+          carried = insert.getSlice();
+        if (carried.getDefiningOp<CreateSliceOp>())
+          slices[carried] = loc;
         continue;
       }
       if (isa<BitRowType>(arg.getType())) {
@@ -234,6 +246,10 @@ public:
     auto it = seeds.find(loop);
     return it == seeds.end() ? ArrayRef<Seed>() : ArrayRef<Seed>(it->second);
   }
+
+  /// A run of rows for something the body did not ask for -- the staging run a
+  /// cross-bank fold copies its neighbour's partial sum into.
+  SliceLoc allocateRun(int64_t numRows) { return newRun(numRows); }
 
   /// Scratch rows the templates use internally, shared by every row op: a
   /// template's temporaries are dead the moment its last command retires.
@@ -400,8 +416,12 @@ LogicalResult RowBinder::bindOp(Operation *op) {
     return success();
   }
   if (auto create = dyn_cast<CreateSliceOp>(op)) {
-    auto slice = cast<SliceType>(create.getSlice().getType());
-    slices[create.getSlice()] = newRun(slice.getBitWidth());
+    // Unless it already has a home: the run a reduction accumulates into is the
+    // one the loop carries, decided before the walk got here.
+    if (!slices.count(create.getSlice())) {
+      auto slice = cast<SliceType>(create.getSlice().getType());
+      slices[create.getSlice()] = newRun(slice.getBitWidth());
+    }
     return success();
   }
   if (auto ones = dyn_cast<CreateAllOneSliceOp>(op)) {
@@ -603,14 +623,23 @@ public:
     }
   }
 
-  /// Copies a run of rows from one bank into another.
+  /// Copies a run of rows along every one of `edges`, a row at a time.
   ///
   /// This is the one command that names two banks, and the only way a value a
-  /// reduction spread over banks reaches the bank that folds it in. The rows are
-  /// a run at each end, so the copy is a loop over them rather than one command
-  /// per row in the program text.
-  void emitCopy(OpBuilder &builder, Location loc, int64_t srcBank,
-                int64_t dstBank, int64_t srcRun, int64_t dstRun, int64_t rows) {
+  /// reduction spread over banks reaches the bank that folds it in.
+  ///
+  /// The rows are the outer loop and the edges the inner one, for the same
+  /// reason the banks are the inner loop everywhere else: the pairs are
+  /// independent of one another, and a copy occupies the two banks it names for
+  /// a whole row's worth of transfer. Sending one row along every edge before
+  /// starting the next row lets those transfers overlap; doing one edge's whole
+  /// run first would leave every other bank waiting, and would hold two of them
+  /// busy for long enough that the rank could not be refreshed in between.
+  void emitCopies(OpBuilder &builder, Location loc,
+                  ArrayRef<std::pair<int64_t, int64_t>> edges, int64_t srcRun,
+                  int64_t dstRun, int64_t rows) {
+    if (edges.empty() || rows <= 0)
+      return;
     Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
     Value count = builder.create<arith::ConstantIndexOp>(loc, rows);
     Value step = builder.create<arith::ConstantIndexOp>(loc, 1);
@@ -627,9 +656,11 @@ public:
                 coord.channel, coord.rank, coord.bank, coord.subarray,
                 b.create<arith::AddIOp>(bodyLoc, base, row));
           };
-          Value src = rowIn(srcBank, srcRun);
-          Value dst = rowIn(dstBank, dstRun);
-          b.create<pud::RowCopyOp>(bodyLoc, src, dst, pud::Backend::Simdram);
+          for (auto [srcBank, dstBank] : edges) {
+            Value src = rowIn(srcBank, srcRun);
+            Value dst = rowIn(dstBank, dstRun);
+            b.create<pud::RowCopyOp>(bodyLoc, src, dst, pud::Backend::Simdram);
+          }
           b.create<scf::YieldOp>(bodyLoc);
         });
   }
@@ -967,7 +998,19 @@ public:
 
   LogicalResult emit(Block &src, OpBuilder &builder, IRMapping &map);
 
+  /// Ops to walk past without issuing anything.
+  ///
+  /// The wave that seeds a reduction does everything the others do except fold,
+  /// because there is nothing yet to fold into: it writes where the accumulator
+  /// lives instead. Leaving the fold out is the whole of that difference.
+  void suppress(ArrayRef<Operation *> ops) {
+    suppressed.insert(ops.begin(), ops.end());
+  }
+  void emitEverything() { suppressed.clear(); }
+
 private:
+  llvm::SmallPtrSet<Operation *, 4> suppressed;
+
   /// Puts a value the template is going to read from a named control row into
   /// that row, unless it is already there.
   ///
@@ -998,6 +1041,8 @@ LogicalResult ScheduleEmitter::emit(Block &src, OpBuilder &builder,
                                     IRMapping &map) {
   for (Operation &op : src) {
     Location loc = op.getLoc();
+    if (suppressed.contains(&op))
+      continue;
 
     if (auto loop = dyn_cast<scf::ForOp>(&op)) {
       // A value the loop keeps in one place has to be put there first.
@@ -1308,6 +1353,165 @@ FailureOr<MappedLoop> readMappedLoop(func::FuncOp func) {
 }
 
 //===----------------------------------------------------------------------===//
+// Bringing a reduction back together
+//===----------------------------------------------------------------------===//
+
+/// What a reduction spread over banks needs, read off the body.
+///
+/// A bank folds the tiles it was given into an accumulator of its own, so at the
+/// end of the waves there is one partial result per bank, and one more per
+/// packed lane within a bank. Both have to be brought together, and neither can
+/// be done where they lie: a bank cannot read another bank's rows, and an
+/// activation drives a whole row rather than a lane of it. So each step is a
+/// copy that puts the other operand somewhere this bank's adder can reach, then
+/// the fold itself.
+struct Reduction {
+  /// The ops the fold turned into, which the seeding wave leaves out.
+  SmallVector<Operation *> ops;
+  /// The accumulator's run and how many rows it has.
+  int64_t accBase = 0;
+  int64_t accRows = 0;
+  /// The run the wave leaves its contribution in, which the seeding wave writes
+  /// straight into the accumulator instead.
+  int64_t addendBase = -1;
+  /// Where a copy puts the partial sum being folded in.
+  int64_t stageBase = 0;
+  bool isAdd = false;
+
+  bool valid() const { return !ops.empty() && accRows > 0; }
+};
+
+FailureOr<Reduction> readReduction(MappedLoop &mapped, RowBinder &binder) {
+  Reduction reduction;
+  for (Operation &op : mapped.loop.getBody()->without_terminator())
+    if (op.hasAttr("bits.is_reduce_op"))
+      reduction.ops.push_back(&op);
+  if (reduction.ops.empty())
+    return reduction;
+
+  if (mapped.loop.getInits().size() != 1)
+    return mapped.loop.emitError()
+           << "a reduction carries exactly one accumulator; this loop carries "
+           << mapped.loop.getInits().size();
+  Value accumulator = mapped.loop.getRegionIterArg(0);
+  auto accType = dyn_cast<SliceType>(accumulator.getType());
+  const SliceLoc *accLoc = binder.sliceFor(accumulator);
+  if (!accType || !accLoc || accLoc->broadcast)
+    return mapped.loop.emitError()
+           << "a reduction accumulates into a run of rows";
+  reduction.accBase = accLoc->base;
+  reduction.accRows = accType.getBitWidth();
+
+  // The other operand of the fold is what one wave produced. Which run that is
+  // is not written down anywhere: it is whichever run the fold reads that is not
+  // the accumulator's.
+  for (Operation *op : reduction.ops) {
+    op->walk([&](ExtractRowOp extract) {
+      const SliceLoc *from = binder.sliceFor(extract.getSlice());
+      if (!from || from->broadcast || from->base == reduction.accBase)
+        return;
+      reduction.addendBase = from->base;
+    });
+    op->walk([&](RowAddOp) { reduction.isAdd = true; });
+  }
+  if (reduction.addendBase < 0)
+    return mapped.loop.emitError()
+           << "a reduction folds in something that is not in a run of rows";
+
+  reduction.stageBase = binder.allocateRun(reduction.accRows).base;
+  return reduction;
+}
+
+/// Issues one fold of `stage` into `acc`, on whichever banks are in scope.
+///
+/// This is not the body's fold re-emitted. The body folds one wave's
+/// contribution into the accumulator, and that contribution can be narrower
+/// than the accumulator is -- a block of a BNN dot product counts to 64 and
+/// accumulates into 13 bits -- so its expansion reads the rows it does not have
+/// from the reserved zero row. What crosses between banks is a whole partial
+/// sum, every row of it, so the fold that adds one is the accumulator's own
+/// width throughout. Same command count, different rows, which is exactly why
+/// it is built here rather than borrowed.
+LogicalResult emitFold(OpBuilder &builder, Location loc, RowOpEmitter &emitter,
+                       const Reduction &reduction, PudBackend backend,
+                       IRMapping &map, Operation *diagOp) {
+  if (!reduction.isAdd)
+    return diagOp->emitError()
+           << "only a sum folds across banks so far; this reduction folds with "
+              "something else, and the fold it needs has no expansion here";
+
+  const RowOpTemplate *tmpl =
+      RowOpLibrary::get().getTemplate(backend, RowOpKind::FullAdd);
+  if (!tmpl)
+    return diagOp->emitError() << "no adder template for backend '"
+                               << getBackendName(backend) << "'";
+
+  // The carry starts at zero and stays in the cell for the whole width, which is
+  // the one command an addition costs beyond its bits.
+  emitter.emitAcrossBanks(builder, loc, /*isAp=*/false,
+                          RowLoc::controlRow(ControlRow::DCC1),
+                          RowLoc::controlRow(ControlRow::C_0), map);
+  for (int64_t row = 0; row < reduction.accRows; ++row) {
+    RowLoc accRow = RowLoc::dataRow(reduction.accBase, {}, row);
+    RowLoc stageRow = RowLoc::dataRow(reduction.stageBase, {}, row);
+    if (failed(emitter.emitTemplate(builder, loc, *tmpl, {accRow, stageRow},
+                                    {accRow}, map)))
+      return diagOp->emitError() << "could not instantiate the adder a fold is";
+  }
+  return success();
+}
+
+/// Issues everything that happens after a bank has run all its waves.
+///
+/// First the packed lanes are folded within each bank, then the banks fold into
+/// one another along the tree the mapping chose. Every level is the same two
+/// steps -- copy, then add -- and differs only in where the copy comes from.
+LogicalResult emitReduceTree(OpBuilder &builder, Location loc,
+                             RowOpEmitter &emitter, MappedLoop &mapped,
+                             const Reduction &reduction, PudBackend backend,
+                             IRMapping &map) {
+  auto copyAlong = [&](ArrayRef<std::pair<int64_t, int64_t>> edges) {
+    emitter.emitCopies(builder, loc, edges, reduction.accBase,
+                       reduction.stageBase, reduction.accRows);
+  };
+
+  // The lanes packed into one row are not addressable on their own, so folding
+  // them is a copy within the bank and an addition, as many times over as it
+  // takes to halve them down to one.
+  SmallVector<std::pair<int64_t, int64_t>> withinBank;
+  for (int64_t bank : mapped.banks)
+    withinBank.push_back({bank, bank});
+  for (int64_t level = 0; level < mapped.foldLevels; ++level) {
+    copyAlong(withinBank);
+    if (failed(emitFold(builder, loc, emitter, reduction, backend, map,
+                        mapped.loop)))
+      return failure();
+  }
+
+  // Then across banks. Every group runs the same tree, offset to its own banks.
+  int64_t groups = mapped.banks.size() / std::max<int64_t>(1, mapped.banksPerGroup);
+  for (const auto &level : mapped.tree) {
+    SmallVector<int64_t> destinations;
+    SmallVector<std::pair<int64_t, int64_t>> edges;
+    for (int64_t group = 0; group < groups; ++group) {
+      int64_t offset = group * mapped.groupStride;
+      for (auto [src, dst] : level) {
+        edges.push_back({src + offset, dst + offset});
+        destinations.push_back(dst + offset);
+      }
+    }
+    copyAlong(edges);
+    // Only the banks that were copied into have anything to add, and they all
+    // do it at once.
+    RowOpEmitter::BankScope scope(emitter, destinations);
+    if (failed(emitFold(builder, loc, emitter, reduction, backend, map,
+                        mapped.loop)))
+      return failure();
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // Pass
 //===----------------------------------------------------------------------===//
 
@@ -1382,10 +1586,17 @@ struct ConvertBitsRowsToPuD
         builder.clone(op, map);
       }
 
+    auto reduction = readReduction(*mapped, binder);
+    if (failed(reduction))
+      return signalPassFailure();
+
     Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
     Value one = builder.create<arith::ConstantIndexOp>(loc, 1);
     Value repeats = builder.create<arith::ConstantIndexOp>(loc, mapped->repeat);
-    Value tiles = builder.create<arith::ConstantIndexOp>(loc, mapped->waves);
+    int64_t seedWaves = reduction->valid() ? mapped->seedWaves : 0;
+    Value seeds = builder.create<arith::ConstantIndexOp>(loc, seedWaves);
+    Value tiles =
+        builder.create<arith::ConstantIndexOp>(loc, mapped->waves - seedWaves);
 
     // Enclosing loops whose iterations did not all fit in the machine at once
     // run the whole schedule again for the ones that were left.
@@ -1393,6 +1604,30 @@ struct ConvertBitsRowsToPuD
     {
       OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(repeatLoop.getBody());
+
+      // What the tree can refer to: everything already in scope out here. The
+      // waves clone their index arithmetic inside the loops that run them, and
+      // the tree comes after those loops, so it cannot use any of it.
+      IRMapping outerScope = map;
+
+      // A reduction has nothing to fold into until something has been produced,
+      // so its first wave produces and stops. Writing that first contribution
+      // where the accumulator lives is what makes it the accumulator's initial
+      // value, and it costs nothing: the same commands, addressed one run over.
+      if (seedWaves > 0) {
+        auto seedLoop = builder.create<scf::ForOp>(loc, zero, seeds, one);
+        OpBuilder::InsertionGuard seedGuard(builder);
+        builder.setInsertionPointToStart(seedLoop.getBody());
+        emitter.aliasRun(reduction->addendBase, reduction->accBase);
+        schedule.suppress(reduction->ops);
+        // On its own map: what this wave brings across lands inside its loop,
+        // where the waves that follow it cannot see it.
+        IRMapping seedScope = map;
+        if (failed(schedule.emit(*mapped->loop.getBody(), builder, seedScope)))
+          return signalPassFailure();
+        schedule.emitEverything();
+        emitter.clearAliases();
+      }
 
       // The mapped loop ran once per tile of the whole operand; each bank takes
       // its own share of them, the tiles sharing a bank row run as one wave, and
@@ -1403,6 +1638,16 @@ struct ConvertBitsRowsToPuD
         builder.setInsertionPointToStart(tileLoop.getBody());
         if (failed(schedule.emit(*mapped->loop.getBody(), builder, map)))
           return signalPassFailure();
+      }
+
+      // Now every bank holds a partial result, and they have to become one.
+      if (reduction->valid() &&
+          (mapped->foldLevels > 0 || !mapped->tree.empty())) {
+        emitter.aliasRun(reduction->addendBase, reduction->stageBase);
+        if (failed(emitReduceTree(builder, loc, emitter, *mapped, *reduction,
+                                  target, outerScope)))
+          return signalPassFailure();
+        emitter.clearAliases();
       }
     }
 
