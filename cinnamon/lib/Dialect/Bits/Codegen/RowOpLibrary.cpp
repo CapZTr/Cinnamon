@@ -738,13 +738,26 @@ std::optional<RowOpRecipe> mlir::bits::getRecipeForMul(int64_t lhsWidth,
                                                        int64_t rhsWidth) {
   if (lhsWidth <= 0 || rhsWidth <= 0)
     return std::nullopt;
-  // Shift-add over the bit-sliced operands, following expandMulSimdram: each
-  // partial product is one row AND, and each accumulation one full adder whose
-  // carry comes from a partial-product row rather than a resident cell.
+  // Shift-add over the bit-sliced operands: one row AND per partial-product
+  // bit, and one full adder per accumulation, its carry coming from a
+  // partial-product row rather than a resident cell.
+  //
+  // Every bit of the multiplier meets every bit of the multiplicand once, so
+  // there are lhs * rhs partial products; the first multiplier bit only
+  // initialises the accumulator, leaving lhs * (rhs - 1) additions. One AAP
+  // ahead of them seeds the carry the accumulation starts from.
+  //
+  // This used to charge lhs * (rhs + 1) ANDs and lhs * rhs - 1 additions,
+  // taken from execute_mul in 94_simdram_schedule_runner.c. That sequence runs
+  // one accumulation round more than a shift-add needs -- it passes over the
+  // low multiplier bit twice -- and drops one partial product unaccumulated in
+  // its last round. The row-level expansion in PatternApply does neither, so it
+  // was being priced for work it does not do: 5.9% high at 16 bits, 11.1% at 8,
+  // and more the narrower the operands.
   RowOpRecipe recipe;
-  recipe.steps.push_back({RowOpKind::And, lhsWidth * (rhsWidth + 1)});
+  recipe.steps.push_back({RowOpKind::And, lhsWidth * rhsWidth});
   recipe.steps.push_back(
-      {RowOpKind::FullAddLoaded, lhsWidth * rhsWidth - 1});
+      {RowOpKind::FullAddLoaded, lhsWidth * (rhsWidth - 1)});
   recipe.fixedAAP = 1;
   return recipe;
 }
