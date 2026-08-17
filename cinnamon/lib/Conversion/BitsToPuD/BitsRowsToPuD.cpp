@@ -181,6 +181,24 @@ public:
     auto it = slices.find(v);
     return it == slices.end() ? nullptr : &it->second;
   }
+
+  /// The run a slice belongs to, looking through inserts that have not been
+  /// bound yet.
+  ///
+  /// An insert hands back the run it was given, so a chain of them is one run
+  /// however far along it a value is asked about. Placement asks ahead of the
+  /// walk -- where a row op's result should go is read off a consumer that has
+  /// not been reached -- and that consumer's slice can be another such consumer.
+  const SliceLoc *runFor(Value v) const {
+    while (true) {
+      if (const SliceLoc *loc = sliceFor(v))
+        return loc;
+      auto insert = v.getDefiningOp<InsertRowOp>();
+      if (!insert)
+        return nullptr;
+      v = insert.getSlice();
+    }
+  }
   /// Copies that have to be issued before `loop` runs.
   ArrayRef<Seed> seedsFor(Operation *loop) const {
     auto it = seeds.find(loop);
@@ -234,7 +252,7 @@ RowLoc RowBinder::homeFor(Value result) {
     if (auto insert = dyn_cast<InsertRowOp>(user)) {
       if (use.getOperandNumber() != 1)
         continue;
-      if (const SliceLoc *slice = sliceFor(insert.getSlice()))
+      if (const SliceLoc *slice = runFor(insert.getSlice()))
         return slice->at(insert.getIndex());
     }
     if (auto yield = dyn_cast<scf::YieldOp>(user)) {
