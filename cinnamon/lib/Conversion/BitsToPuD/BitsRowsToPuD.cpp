@@ -201,6 +201,16 @@ public:
 
   LogicalResult bind(Block &block);
 
+  /// Says whether the nest about to be bound runs any wave that folds.
+  ///
+  /// A reduction whose every element already sits in a bank of its own -- the
+  /// selection reading one distance per bank -- runs no waves at all: the whole
+  /// of it is the cross-bank tree. That changes which of the fold's two operands
+  /// is the earlier nest's run. With waves, the addend is what a wave reads and
+  /// the accumulator is private; without them, the accumulator IS this bank's
+  /// element and the addend only ever arrives in the tree's staging run.
+  void beginNest(bool hasFoldingWaves) { foldingWaves = hasFoldingWaves; }
+
   /// Binds what the mapped loop carries from one tile to the next.
   ///
   /// Its iter args are the values that outlive a tile -- the accumulator a
@@ -223,7 +233,8 @@ public:
         auto produced = producedRunFor(init, slice.getBitWidth());
         if (failed(produced))
           return failure();
-        if (*produced && readsRun(*loop.getBody(), (*produced)->base))
+        if (*produced && foldingWaves &&
+            readsRun(*loop.getBody(), (*produced)->base))
           produced = std::optional<SliceLoc>();
         SliceLoc loc = *produced ? **produced : newRun(slice.getBitWidth());
         slices[init] = loc;
@@ -345,6 +356,7 @@ private:
   /// Runs holding an operand the runtime lays out. Nothing in the function
   /// writes them, which is the whole point of them.
   llvm::DenseSet<int64_t> external;
+  bool foldingWaves = true;
 };
 
 /// Whether an op computes on rows, i.e. becomes a template instantiation.
@@ -620,7 +632,11 @@ LogicalResult RowBinder::bindOp(Operation *op) {
     auto produced = producedRunFor(transpose.getOutput(), slice.getBitWidth());
     if (failed(produced))
       return failure();
-    if (*produced) {
+    // In a nest that runs no folding wave nothing in the body is ever emitted,
+    // and the one thing this transpose could be -- the fold's addend -- reaches
+    // the adder in the staging run the tree copies into, not here. Leaving it a
+    // run of its own is what keeps that alias distinct from the accumulator.
+    if (*produced && foldingWaves) {
       slices[transpose.getOutput()] = **produced;
       return success();
     }
@@ -786,7 +802,8 @@ LogicalResult RowBinder::bind(Block &block) {
 /// runtime lays out before the first command; an earlier nest, reached by
 /// following the tensor back to it; and a `bits.insert_row` in this function.
 LogicalResult verifyReadsHaveWriters(func::FuncOp func,
-                                     const RowBinder &binder) {
+                                     const RowBinder &binder,
+                                     const llvm::DenseSet<Operation *> &unemitted) {
   llvm::DenseSet<int64_t> written;
   func.walk([&](InsertRowOp insert) {
     if (const SliceLoc *loc = binder.sliceFor(insert.getSlice()))
@@ -796,6 +813,10 @@ LogicalResult verifyReadsHaveWriters(func::FuncOp func,
 
   LogicalResult result = success();
   func.walk([&](ExtractRowOp extract) {
+    // A fold that no wave runs is not emitted, so what it names is not read.
+    for (Operation *parent = extract; parent; parent = parent->getParentOp())
+      if (unemitted.contains(parent))
+        return;
     const SliceLoc *loc = binder.sliceFor(extract.getSlice());
     // Unbound is a different complaint, and bindOp has already made it.
     if (!loc || loc->broadcast || binder.isExternal(loc->base) ||
@@ -1740,11 +1761,26 @@ FailureOr<Reduction> readReduction(MappedLoop &mapped, RowBinder &binder) {
     });
     op->walk([&](RowAddOp) { reduction.isAdd = true; });
   }
-  if (reduction.addendBase < 0)
-    return mapped.loop.emitError()
-           << "a reduction folds in something that is not in a run of rows";
+  if (reduction.addendBase < 0) {
+    // A reduction whose elements each start in a bank of their own folds
+    // nothing per wave -- the tree is the whole of it -- so the fold reads the
+    // accumulator and whatever the tree copied in beside it, and there is no
+    // third run for a wave's contribution to be in.
+    if (mapped.waves > mapped.seedWaves)
+      return mapped.loop.emitError()
+             << "a reduction folds in something that is not in a run of rows";
+    reduction.addendBase = reduction.accBase;
+    reduction.addendRows = reduction.accRows;
+  }
 
-  reduction.stageBase = binder.allocateRun(reduction.accRows).base;
+  // Where a partial sum arriving from another bank is put. A nest that folds
+  // per wave needs that to be somewhere other than the run its waves write, but
+  // a nest that folds only across banks has no wave writing anything: the run
+  // its body names for the addend is never written by anything else, so it is
+  // the staging run, and allocating a second one would leave the first dead.
+  reduction.stageBase = mapped.waves > mapped.seedWaves
+                            ? binder.allocateRun(reduction.accRows).base
+                            : reduction.addendBase;
   return reduction;
 }
 
@@ -1885,14 +1921,34 @@ struct ConvertBitsRowsToPuD
                              : mappedLoops->front().banks.front();
     pud::AddressAllocator allocator(*geometry);
     RowBinder binder(allocator, layoutBank);
-    for (MappedLoop &mapped : *mappedLoops)
+    for (MappedLoop &mapped : *mappedLoops) {
+      // Waves that fold are what makes the body read anything. Only a reduction
+      // has a seeding wave to subtract, so only a reduction can have none left.
+      bool reduces = llvm::any_of(
+          mapped.loop.getBody()->without_terminator(),
+          [](Operation &op) { return op.hasAttr("bits.is_reduce_op"); });
+      binder.beginNest(!reduces || mapped.waves > mapped.seedWaves);
       if (failed(binder.bindCarried(mapped.loop)) ||
           failed(binder.bind(*mapped.loop.getBody())))
         return signalPassFailure();
+    }
+
+    // A reduction that folds only across banks suppresses its body's fold on
+    // the one wave it runs, so those ops issue nothing and read nothing; the
+    // fold that does happen is the tree's, on the accumulator and the run the
+    // tree copies into.
+    llvm::DenseSet<Operation *> unemitted;
+    for (MappedLoop &mapped : *mappedLoops) {
+      if (mapped.waves > mapped.seedWaves)
+        continue;
+      for (Operation &op : mapped.loop.getBody()->without_terminator())
+        if (op.hasAttr("bits.is_reduce_op"))
+          unemitted.insert(&op);
+    }
 
     // Everything is bound and nothing has been emitted, which is the only
     // moment at which both where a value lives and where it came from are known.
-    if (failed(verifyReadsHaveWriters(func, binder)))
+    if (failed(verifyReadsHaveWriters(func, binder, unemitted)))
       return signalPassFailure();
 
     // The new body is built beside the old one and swapped in at the end. It is

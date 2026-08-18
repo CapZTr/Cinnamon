@@ -24,6 +24,7 @@
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
+#include <mlir/Dialect/Tensor/IR/Tensor.h>
 #include <mlir/IR/IRMapping.h>
 #include <mlir/IR/Operation.h>
 #include <mlir/IR/Value.h>
@@ -1916,6 +1917,142 @@ buildChannelAwareReduceTree(ArrayRef<int64_t> activeBanks) {
   return levels;
 }
 
+// ---------------------------------------------------------------------------
+// Nests that fold what an earlier nest spread over banks
+// ---------------------------------------------------------------------------
+
+// The loop whose result a tensor holds, following it back past the ops that
+// only re-present it. `bits.assemble` and the reshapes move no data, so a nest
+// reading through them is reading the run the earlier nest wrote.
+static scf::ForOp producerLoopOf(Value tensor) {
+  for (unsigned step = 0; tensor && step < 32; ++step) {
+    Operation *def = tensor.getDefiningOp();
+    if (!def)
+      return {};
+    if (auto loop = dyn_cast<scf::ForOp>(def))
+      return loop;
+    if (auto assemble = dyn_cast<AssembleOp>(def)) {
+      tensor = assemble.getInput();
+      continue;
+    }
+    if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(def)) {
+      tensor = collapse.getSrc();
+      continue;
+    }
+    if (auto expand = dyn_cast<tensor::ExpandShapeOp>(def)) {
+      tensor = expand.getSrc();
+      continue;
+    }
+    if (auto castOp = dyn_cast<tensor::CastOp>(def)) {
+      tensor = castOp.getSource();
+      continue;
+    }
+    return {};
+  }
+  return {};
+}
+
+// The innermost annotated loop of a nest -- the one whose body is one wave, and
+// the one the row-op emitter reads its bank set off. A loop further out
+// contributes banks, not iterations.
+static scf::ForOp mappedLoopOf(scf::ForOp nest) {
+  scf::ForOp mapped;
+  int64_t bestDepth = -1;
+  nest.getBody()->walk([&](scf::ForOp inner) {
+    if (!inner->hasAttr("bits.parallel_factor"))
+      return;
+    int64_t depth = 0;
+    for (Operation *parent = inner; parent; parent = parent->getParentOp())
+      ++depth;
+    if (depth > bestDepth) {
+      bestDepth = depth;
+      mapped = inner;
+    }
+  });
+  return mapped;
+}
+
+// Which bank holds each element of what a nest produced.
+//
+// A nest writes one run with the bank left open, and its result tensor has one
+// element per bank group, so element g is that run in group g's banks -- and in
+// a reduction, in the one bank its tree folded into. Returns empty when the
+// nest's groups and its result do not line up one to one, which is the only
+// case this can speak for.
+static SmallVector<int64_t> producedElementBanks(scf::ForOp producer) {
+  SmallVector<int64_t> banks;
+  scf::ForOp mapped = mappedLoopOf(producer);
+  if (!mapped)
+    return banks;
+  auto readAttr = [&](StringRef name, int64_t fallback) {
+    auto attr = mapped->getAttrOfType<IntegerAttr>(name);
+    return attr ? std::max<int64_t>(1, attr.getInt()) : fallback;
+  };
+  int64_t parallelFactor = readAttr("bits.parallel_factor", 1);
+  int64_t stride = readAttr("bits.bank_group_stride", parallelFactor);
+  int64_t groups = readAttr("bits.concurrent_groups", 1);
+
+  auto tripMaybe = getConstTripCount(producer);
+  if (failed(tripMaybe) || *tripMaybe != groups)
+    return banks;
+
+  // Where a group's result ends up: the last level of its tree has one edge and
+  // that edge's destination is the bank holding the whole group's fold.
+  int64_t root = 0;
+  if (auto bankAttr = mapped->getAttrOfType<IntegerAttr>("bits.bank_id"))
+    root = bankAttr.getInt();
+  if (auto treeAttr = mapped->getAttrOfType<ArrayAttr>("bits.reduce_tree")) {
+    for (Attribute levelAttr : treeAttr) {
+      auto level = dyn_cast<ArrayAttr>(levelAttr);
+      if (!level || level.empty())
+        continue;
+      if (auto pair = dyn_cast<DictionaryAttr>(level[level.size() - 1]))
+        if (auto dst = dyn_cast_or_null<IntegerAttr>(pair.get("dst_bank")))
+          root = dst.getInt();
+    }
+  }
+  for (int64_t g = 0; g < groups; ++g)
+    banks.push_back((root + g * stride) % kNumBanks);
+  return banks;
+}
+
+// The banks a reduction should run on when what it folds is an earlier nest's
+// result, taken along the axis that nest spread over banks.
+//
+// The mapping used to plan every nest on its own, so the selection that folds
+// sixteen candidate distances was given four banks of its own while the
+// distances sat in sixteen others -- a schedule that reads rows no bank it runs
+// on holds. Reading them where they are makes the whole reduction the
+// cross-bank tree, with nothing to fold per bank: each bank enters the tree
+// holding exactly one element. Returns empty unless that is the situation.
+static SmallVector<int64_t> crossNestReduceBanks(scf::ForOp lp) {
+  SmallVector<int64_t> none;
+  if (!isSliceReductionFor(lp) || hasNestedForOp(lp))
+    return none;
+  Value iv = lp.getInductionVar();
+  scf::ForOp producer;
+  lp.getBody()->walk([&](tensor::ExtractSliceOp extract) {
+    if (producer)
+      return;
+    // Indexed by this loop's own induction variable: the loop is walking the
+    // producer's elements, which is to say its banks.
+    if (!llvm::is_contained(extract.getOffsets(), iv))
+      return;
+    producer = producerLoopOf(extract.getSource());
+  });
+  if (!producer || producer == lp || producer->isAncestor(lp))
+    return none;
+  SmallVector<int64_t> banks = producedElementBanks(producer);
+  if (banks.size() < 2)
+    return none;
+  // One bank per element only helps if the loop is walking all of them; a
+  // reduction over fewer has iterations left over that this cannot place.
+  auto tripMaybe = getConstTripCount(lp);
+  if (failed(tripMaybe) || *tripMaybe + 1 != (int64_t)banks.size())
+    return none;
+  return banks;
+}
+
 // Critical-path cost of the inter-bank reduce tree for `banks` consecutive
 // active banks (base 0): within a level, copies serialise on each channel's
 // data bus (a copy occupies both its src and dst channel bus for its whole
@@ -2919,6 +3056,54 @@ struct BitsOptimiseMappingPass
         if (!treeLevels.empty())
           lp->setAttr("bits.reduce_tree", ArrayAttr::get(ctx, treeLevels));
       };
+      // A reduction over an earlier nest's result runs where that result is.
+      // Its elements are one per bank already, so there is nothing to fold per
+      // bank and the whole reduction is the cross-bank tree over those banks.
+      auto annotateCrossNestReduce = [&](scf::ForOp lp,
+                                         ArrayRef<int64_t> banks) {
+        lp->setAttr("bits.parallel_factor",
+                    attrBuilder.getI64IntegerAttr((int64_t)banks.size()));
+        lp->setAttr("bits.loop_kind", StringAttr::get(ctx, "reduction"));
+        lp->setAttr("bits.iters_per_bank", attrBuilder.getI64IntegerAttr(1));
+        lp->setAttr("bits.pack_factor", attrBuilder.getI64IntegerAttr(1));
+        // Every bank enters the tree holding one element, so no wave folds and
+        // the wave the loop does run is the seed. Saying so overrides the peel
+        // count the expansion left behind, which counted the elements as though
+        // they all had to pass through one bank.
+        lp->setAttr("bits.intra_reduce_count", attrBuilder.getI64IntegerAttr(0));
+        lp->setAttr("bits.reduce_combines", attrBuilder.getI64IntegerAttr(0));
+        lp->setAttr("bits.bank_id",
+                    attrBuilder.getI64IntegerAttr(banks.front()));
+        auto levels = buildChannelAwareReduceTree(banks);
+        lp->setAttr("bits.reduce_levels",
+                    attrBuilder.getI64IntegerAttr((int64_t)levels.size()));
+        SmallVector<Attribute> treeLevels;
+        for (const auto &level : levels) {
+          SmallVector<Attribute> levelPairs;
+          for (const auto &[srcBank, dstBank] : level) {
+            NamedAttrList pair;
+            pair.set("src_bank",
+                     IntegerAttr::get(IntegerType::get(ctx, 64), srcBank));
+            pair.set("dst_bank",
+                     IntegerAttr::get(IntegerType::get(ctx, 64), dstBank));
+            levelPairs.push_back(DictionaryAttr::get(ctx, pair.getAttrs()));
+          }
+          treeLevels.push_back(ArrayAttr::get(ctx, levelPairs));
+        }
+        if (!treeLevels.empty())
+          lp->setAttr("bits.reduce_tree", ArrayAttr::get(ctx, treeLevels));
+        // The tree names the banks outright, so there is no group to repeat or
+        // to stride; marking the loop keeps the placement pass off it.
+        int64_t stride = banks.size() > 1 ? banks[1] - banks[0] : 1;
+        lp->setAttr("bits.bank_group_stride",
+                    attrBuilder.getI64IntegerAttr(std::max<int64_t>(1, stride)));
+        lp->setAttr("bits.concurrent_groups", attrBuilder.getI64IntegerAttr(1));
+        lp->setAttr("bits.wave_repeat", attrBuilder.getI64IntegerAttr(1));
+        lp->setAttr("bits.cross_nest_reduce", UnitAttr::get(ctx));
+        // Nothing is packed into a row here, so there are no lanes to fold.
+        lp->removeAttr("bits.fold_levels");
+      };
+
       SmallVector<scf::ForOp> allForOps;
       func.walk([&](scf::ForOp forOp) { allForOps.push_back(forOp); });
 
@@ -3004,6 +3189,10 @@ struct BitsOptimiseMappingPass
       func.walk([&](scf::ForOp forOp) {
         if (!forOp->hasAttr("bits.parallel_factor"))
           return;
+        // A cross-nest reduction's banks are the ones its producer wrote, named
+        // in its tree; re-deriving a placement for it would move it off them.
+        if (forOp->hasAttr("bits.cross_nest_reduce"))
+          return;
         int64_t stride =
             std::max<int64_t>(1, estimateBestParallelBanksForLoop(forOp));
         forOp->setAttr("bits.bank_group_stride",
@@ -3016,6 +3205,21 @@ struct BitsOptimiseMappingPass
             "bits.wave_repeat",
             attrBuilder.getI64IntegerAttr(
                 std::max<int64_t>(1, getAncestorWaveRepeat(forOp))));
+      });
+
+      // Now that every nest knows which banks it landed on, re-place the ones
+      // that fold an earlier nest's result: the planner chose their banks
+      // without knowing where the thing they read is, and the answer is that
+      // they run on the banks that already hold it. This has to come after the
+      // placement walk above, because that walk is where a nest's groups and
+      // stride -- which is to say where each of its elements ended up -- are
+      // written down.
+      func.walk([&](scf::ForOp forOp) {
+        if (forOp->hasAttr("bits.cross_nest_reduce"))
+          return;
+        SmallVector<int64_t> banks = crossNestReduceBanks(forOp);
+        if (banks.size() > 1)
+          annotateCrossNestReduce(forOp, banks);
       });
 
       // Mark the accumulator op inside each slice-reduction loop body so the

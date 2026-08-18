@@ -10,6 +10,7 @@ DEPENDS
 LINK_LIBS PUBLIC
   MLIRIR
   MLIRTransformUtils
+  MLIRTensorDialect
   BitsCodegen
 )
 
