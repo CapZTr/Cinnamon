@@ -57,7 +57,19 @@ def ConvertBitsRowsToPuD
            "Bytes from one bank's row to the next bank's, which is the row "
            "size of the substrate. The rows a kernel addresses are laid out at "
            "this stride, so this is what turns a row coordinate into an "
-           "address; it travels with the IR for whatever realises them.">
+           "address; it travels with the IR for whatever realises them.">,
+    Option<"rowsPerSubarray", "rows-per-subarray", "int64_t", /*default=*/"512",
+           "Rows a subarray holds. A row op drives a whole subarray's sense "
+           "amplifiers, so every row it names has to be in one -- the rows it "
+           "reserves for computation included, and those are at the front of "
+           "the space. That makes this the number of rows a kernel has to fit "
+           "in, not a number it may exceed at a cost.">,
+    Option<"operandPerWave", "operand-per-wave", "bool", /*default=*/"false",
+           "Give every wave of a reduction its own rows of the operand it "
+           "reads, rather than every pass. The dataflow is then complete -- no "
+           "two waves read the same values -- but the operand of a reduction "
+           "of any depth does not fit in a subarray, so this is for measuring "
+           "what residency would cost, not for a kernel that has to run.">
   ];
 }
 

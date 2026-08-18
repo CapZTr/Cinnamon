@@ -184,6 +184,36 @@ struct TensorOrigin {
   int64_t rows = 0;
 };
 
+/// How a run's rows move as the schedule works through the operand.
+///
+/// A nest runs its schedule over and over -- once per wave of the mapped loop,
+/// and the whole of that once per repeat of the enclosing loops that did not
+/// fit in the machine at once. Every one of those passes computes on a
+/// different tile, so a run holding one pass's values has to be somewhere
+/// different each time, or the pass after it writes over what the pass before
+/// it left.
+enum class Advance {
+  /// One set of rows for the whole kernel. Scratch a template writes and reads
+  /// back within the one command sequence, and an operand every pass reads the
+  /// same values out of -- a broadcast of something an enclosing loop does not
+  /// index.
+  Fixed,
+  /// A set per pass of the enclosing loops. An accumulator: every wave of a
+  /// pass folds into the same rows, which is what makes it an accumulator, and
+  /// the next pass starts a new sum somewhere else.
+  PerPass,
+  /// A set per wave, and per pass. An operand the mapped loop indexes, and the
+  /// result of a nest that leaves one tile per wave.
+  PerWave,
+};
+
+/// A run of rows, and how many copies of it the kernel was given.
+struct RunInfo {
+  int64_t rows = 0;
+  int64_t copies = 1;
+  Advance advance = Advance::Fixed;
+};
+
 //===----------------------------------------------------------------------===//
 // Binding values to rows
 //===----------------------------------------------------------------------===//
@@ -209,7 +239,59 @@ public:
   /// is the earlier nest's run. With waves, the addend is what a wave reads and
   /// the accumulator is private; without them, the accumulator IS this bank's
   /// element and the addend only ever arrives in the tree's staging run.
-  void beginNest(bool hasFoldingWaves) { foldingWaves = hasFoldingWaves; }
+  void beginNest(scf::ForOp mappedLoop, int64_t waves, int64_t repeat,
+                 bool hasFoldingWaves, bool reduces, bool operandPerWave) {
+    foldingWaves = hasFoldingWaves;
+    nestWaves = std::max<int64_t>(1, waves);
+    nestRepeat = std::max<int64_t>(1, repeat);
+    plan.clear();
+    if (!mappedLoop)
+      return;
+
+    // The induction variables a run's contents can depend on. The mapped loop's
+    // is the wave; one further out hands this schedule a bank for each of its
+    // iterations that fit at once and a pass for the rest, and the bank is free
+    // -- every bank holds its own tile at the same row -- so what is left of it
+    // is the pass.
+    Value wave = mappedLoop.getInductionVar();
+    SmallVector<Value> passes;
+    for (Operation *parent = mappedLoop->getParentOp(); parent;
+         parent = parent->getParentOp())
+      if (auto parentFor = dyn_cast<scf::ForOp>(parent))
+        passes.push_back(parentFor.getInductionVar());
+
+    // What an operand the mapped loop indexes costs. A reduction's waves fold
+    // into one accumulator, and an accumulator cannot follow its addends from
+    // subarray to subarray, so giving every wave its own rows only works while
+    // they all fit in one -- which for a reduction of any depth they do not.
+    // Giving the pass its own rows always fits, and leaves the waves within a
+    // pass reading the tile the pass staged.
+    Advance perWave =
+        (!reduces || operandPerWave) ? Advance::PerWave : Advance::PerPass;
+    mappedLoop.getBody()->walk([&](TransposeOp transpose) {
+      Value from = transpose.getInput();
+      if (dependsOn(from, wave))
+        plan[transpose.getOutput()] = perWave;
+      else if (llvm::any_of(passes,
+                            [&](Value iv) { return dependsOn(from, iv); }))
+        plan[transpose.getOutput()] = Advance::PerPass;
+    });
+
+    // What the mapped loop carries is the accumulator, and every wave of a pass
+    // folds into it on purpose.
+    for (Value init : mappedLoop.getInits())
+      if (isa<SliceType>(init.getType()))
+        plan[init] = Advance::PerPass;
+
+    // What the nest hands on. A reduction hands on its accumulator, which is
+    // already spoken for; anything else writes one tile per wave and needs
+    // somewhere to put each of them.
+    mappedLoop.getBody()->walk([&](tensor::InsertOp insert) {
+      if (Value run = runWrittenBy(insert.getScalar()))
+        if (!plan.count(run))
+          plan[run] = Advance::PerWave;
+    });
+  }
 
   /// Binds what the mapped loop carries from one tile to the next.
   ///
@@ -236,7 +318,7 @@ public:
         if (*produced && foldingWaves &&
             readsRun(*loop.getBody(), (*produced)->base))
           produced = std::optional<SliceLoc>();
-        SliceLoc loc = *produced ? **produced : newRun(slice.getBitWidth());
+        SliceLoc loc = *produced ? **produced : newRun(init, slice.getBitWidth());
         slices[init] = loc;
         slices[arg] = loc;
         slices[result] = loc;
@@ -303,7 +385,14 @@ public:
 
   /// A run of rows for something the body did not ask for -- the staging run a
   /// cross-bank fold copies its neighbour's partial sum into.
-  SliceLoc allocateRun(int64_t numRows) { return newRun(numRows); }
+  SliceLoc allocateRun(int64_t numRows) { return newRun({}, numRows); }
+
+  /// The shape of a run: how long it is, how many copies of it the kernel was
+  /// given, and what steps between them.
+  const RunInfo *runInfo(int64_t base) const {
+    auto it = runs.find(base);
+    return it == runs.end() ? nullptr : &it->second;
+  }
 
   /// Scratch rows the templates use internally, shared by every row op: a
   /// template's temporaries are dead the moment its last command retires.
@@ -317,8 +406,55 @@ private:
   RowLoc scratchRow() {
     return RowLoc::dataRow(allocator.allocate(flatBank, 1).row);
   }
-  SliceLoc newRun(int64_t numRows) {
-    return SliceLoc::run(allocator.allocate(flatBank, numRows).row);
+  SliceLoc newRun(Value forValue, int64_t numRows) {
+    Advance advance = Advance::Fixed;
+    if (forValue) {
+      auto it = plan.find(forValue);
+      if (it != plan.end())
+        advance = it->second;
+    }
+    int64_t copies = advance == Advance::PerWave ? nestWaves * nestRepeat
+                     : advance == Advance::PerPass ? nestRepeat
+                                                   : 1;
+    // A nest that runs its schedule once has nothing to step through. Saying so
+    // is what keeps a run with a single copy out of the way of everything that
+    // asks which pass it is on -- the reduce tree above all, which runs when
+    // the waves are over and has no wave to be on.
+    if (copies <= 1)
+      advance = Advance::Fixed;
+    SliceLoc loc =
+        SliceLoc::run(allocator.allocate(flatBank, numRows * copies).row);
+    runs[loc.base] = RunInfo{numRows, copies, advance};
+    return loc;
+  }
+
+  /// Whether what a value holds is decided by an induction variable, following
+  /// the index arithmetic and the tensor ops back. This is what says whether a
+  /// wave reads its own tile of an operand or the same one every time.
+  static bool dependsOn(Value value, Value iv) {
+    llvm::SmallDenseSet<Value> seen;
+    SmallVector<Value> worklist{value};
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      if (!v || !seen.insert(v).second)
+        continue;
+      if (v == iv)
+        return true;
+      // A block argument other than the one being looked for is where a loop
+      // hands something on, and what it hands on is its init.
+      if (auto arg = dyn_cast<BlockArgument>(v)) {
+        auto owner = dyn_cast_or_null<scf::ForOp>(arg.getOwner()->getParentOp());
+        if (owner && arg != owner.getInductionVar())
+          worklist.push_back(owner.getInits()[arg.getArgNumber() - 1]);
+        continue;
+      }
+      Operation *def = v.getDefiningOp();
+      if (!def || seen.size() > 256)
+        continue;
+      for (Value operand : def->getOperands())
+        worklist.push_back(operand);
+    }
+    return false;
   }
 
   /// Where the values a tensor holds already are, and what put them there.
@@ -356,6 +492,13 @@ private:
   /// Runs holding an operand the runtime lays out. Nothing in the function
   /// writes them, which is the whole point of them.
   llvm::DenseSet<int64_t> external;
+  /// What each run looks like, by the row it starts at.
+  DenseMap<int64_t, RunInfo> runs;
+  /// How the runs of the nest being bound move from pass to pass, for the
+  /// values whose runs move at all.
+  DenseMap<Value, Advance> plan;
+  int64_t nestWaves = 1;
+  int64_t nestRepeat = 1;
   bool foldingWaves = true;
 };
 
@@ -640,7 +783,7 @@ LogicalResult RowBinder::bindOp(Operation *op) {
       slices[transpose.getOutput()] = **produced;
       return success();
     }
-    SliceLoc loc = newRun(slice.getBitWidth());
+    SliceLoc loc = newRun(transpose.getOutput(), slice.getBitWidth());
     // Otherwise it comes from outside, and the runtime fills it in before the
     // kernel runs; nothing in the function writes it and nothing has to. A
     // tensor the walk could not account for gets a run too, and is left for the
@@ -655,7 +798,7 @@ LogicalResult RowBinder::bindOp(Operation *op) {
     // one the loop carries, decided before the walk got here.
     if (!slices.count(create.getSlice())) {
       auto slice = cast<SliceType>(create.getSlice().getType());
-      slices[create.getSlice()] = newRun(slice.getBitWidth());
+      slices[create.getSlice()] = newRun(create.getSlice(), slice.getBitWidth());
     }
     return success();
   }
@@ -875,6 +1018,19 @@ public:
   void aliasRun(int64_t from, int64_t to) { runAlias[from] = to; }
   void clearAliases() { runAlias.clear(); }
 
+  /// Which pass of the schedule the commands being emitted belong to.
+  ///
+  /// A run that holds one pass's values is a different run of rows each pass,
+  /// so an address into it is the run's base plus the pass's share of it. Both
+  /// indices are given because a run steps with one or the other: an operand
+  /// the mapped loop indexes moves every wave, an accumulator only when the
+  /// enclosing loops come round again. Null means the commands are outside any
+  /// pass -- the reduce tree, which runs once when the waves are done.
+  void setPass(Value wave, Value pass) {
+    waveIndex = wave;
+    passIndex = pass;
+  }
+
   ArrayRef<int64_t> mappedBanks() const { return allBanks; }
 
   /// Issues one command to every mapped bank.
@@ -1040,6 +1196,23 @@ private:
     auto alias = runAlias.find(ref.base);
     int64_t base = alias == runAlias.end() ? ref.base : alias->second;
     Value row = b.create<arith::ConstantIntOp>(loc, base + ref.offset, 64);
+    // A run that holds one pass's values has one set of rows per pass, laid out
+    // end to end, so this pass's set is that many runs into it. The index is
+    // the loop variable of whichever loop the run steps with, and the whole
+    // term is loop-invariant inside the bank loop that issues the commands,
+    // which is what keeps this arithmetic rather than a second address.
+    if (const RunInfo *info = binder.runInfo(base)) {
+      Value step = info->advance == Advance::PerWave    ? waveIndex
+                   : info->advance == Advance::PerPass ? passIndex
+                                                       : Value();
+      if (!step && info->advance != Advance::Fixed)
+        strayPassRow = true;
+      if (step && info->rows > 0) {
+        Value stride = b.create<arith::ConstantIntOp>(loc, info->rows, 64);
+        row = b.create<arith::AddIOp>(
+            loc, row, b.create<arith::MulIOp>(loc, step, stride));
+      }
+    }
     if (ref.index) {
       // The index has to have been brought across already: what is being built
       // replaces the IR the original index belongs to, so referring to it would
@@ -1115,11 +1288,19 @@ private:
   SmallVector<int64_t> allBanks;
   SmallVector<int64_t> banks;
   DenseMap<int64_t, int64_t> runAlias;
+  /// Where in the passes the commands being emitted are, as i64 values in the
+  /// function being built.
+  Value waveIndex;
+  Value passIndex;
 
 public:
   /// Set when a row index named a value that was never brought across, which
   /// would have made an address out of the IR being replaced.
   bool unresolvedIndex = false;
+  /// Set when a run that holds one pass's values was addressed from somewhere
+  /// with no pass to be on, which would have named the first pass's rows
+  /// whatever pass the schedule was actually running.
+  bool strayPassRow = false;
 };
 
 //===----------------------------------------------------------------------===//
@@ -2015,7 +2196,9 @@ struct ConvertBitsRowsToPuD
       bool reduces = llvm::any_of(
           mapped.loop.getBody()->without_terminator(),
           [](Operation &op) { return op.hasAttr("bits.is_reduce_op"); });
-      binder.beginNest(!reduces || mapped.waves > mapped.seedWaves);
+      binder.beginNest(mapped.loop, mapped.waves, mapped.repeat,
+                       !reduces || mapped.waves > mapped.seedWaves, reduces,
+                       operandPerWave);
       if (failed(binder.bindCarried(mapped.loop)) ||
           failed(binder.bind(*mapped.loop.getBody())))
         return signalPassFailure();
@@ -2097,6 +2280,19 @@ struct ConvertBitsRowsToPuD
         OpBuilder::InsertionGuard guard(builder);
         builder.setInsertionPointToStart(repeatLoop.getBody());
 
+        // Where in the operand this pass is. A run that holds one pass's values
+        // is addressed this many runs into the space it was given, so these are
+        // what stop the pass after this one writing over what it leaves.
+        auto asI64 = [&](Value index) {
+          return builder.create<arith::IndexCastOp>(loc, builder.getI64Type(),
+                                                    index)
+              .getResult();
+        };
+        Value pass = asI64(repeatLoop.getInductionVar());
+        Value firstWave = builder.create<arith::MulIOp>(
+            loc, pass,
+            builder.create<arith::ConstantIntOp>(loc, mapped.waves, 64));
+
         // What the tree can refer to: everything already in scope out here. The
         // waves clone their index arithmetic inside the loops that run them, and
         // the tree comes after those loops, so it cannot use any of it.
@@ -2111,6 +2307,10 @@ struct ConvertBitsRowsToPuD
           auto seedLoop = builder.create<scf::ForOp>(loc, zero, seeds, one);
           OpBuilder::InsertionGuard seedGuard(builder);
           builder.setInsertionPointToStart(seedLoop.getBody());
+          emitter.setPass(builder.create<arith::AddIOp>(
+                              loc, firstWave,
+                              asI64(seedLoop.getInductionVar())),
+                          pass);
           emitter.aliasRun(reduction->addendBase, reduction->accBase);
           schedule.suppress(reduction->ops);
           // On its own map: what this wave brings across lands inside its loop,
@@ -2129,6 +2329,14 @@ struct ConvertBitsRowsToPuD
         {
           OpBuilder::InsertionGuard tileGuard(builder);
           builder.setInsertionPointToStart(tileLoop.getBody());
+          // The waves the seed already ran come before this one.
+          Value wave = builder.create<arith::AddIOp>(
+              loc, firstWave, asI64(tileLoop.getInductionVar()));
+          if (seedWaves > 0)
+            wave = builder.create<arith::AddIOp>(
+                loc, wave,
+                builder.create<arith::ConstantIntOp>(loc, seedWaves, 64));
+          emitter.setPass(wave, pass);
           if (failed(schedule.emit(*mapped.loop.getBody(), builder, map)))
             return signalPassFailure();
         }
@@ -2136,10 +2344,23 @@ struct ConvertBitsRowsToPuD
         // Now every bank holds a partial result, and they have to become one.
         if (reduction->valid() &&
             (mapped.foldLevels > 0 || !mapped.tree.empty())) {
+          // The tree runs once the waves are done, so there is no wave to be
+          // on. What it touches is the accumulator, which steps with the pass,
+          // and the staging run, which is scratch; a run that steps with the
+          // wave has no address out here, and the emitter says so if one is
+          // asked for.
+          emitter.setPass(Value(), pass);
           emitter.aliasRun(reduction->addendBase, reduction->stageBase);
           if (failed(emitReduceTree(builder, loc, emitter, schedule, mapped,
                                     *reduction, target, outerScope)))
             return signalPassFailure();
+          if (emitter.strayPassRow) {
+            mapped.loop.emitError()
+                << "the reduce tree addresses a run that holds one wave's "
+                   "values; the tree runs after the waves and has no wave to "
+                   "take that run's rows from";
+            return signalPassFailure();
+          }
           emitter.clearAliases();
         }
       }
@@ -2153,14 +2374,33 @@ struct ConvertBitsRowsToPuD
     body.push_back(entry.release());
     func.setType(FunctionType::get(func.getContext(), {}, {}));
 
+    // A row op activates a whole subarray, so every row it names has to be in
+    // one -- and the rows the substrate reserves for computation are at the
+    // front of the space, so every data row has to be in theirs. That makes the
+    // subarray the size of the row space, not a boundary it may cross at a
+    // cost. Saying so here turns what would otherwise be an assertion failing
+    // deep inside a simulated run into a number that can be compared against
+    // the machine.
+    int64_t dataRows = allocator.rowsAllocated(layoutBank);
+    int64_t reserved = pud::controlRowCount();
+    if (rowsPerSubarray > 0 && reserved + dataRows > rowsPerSubarray) {
+      func.emitError()
+          << "the kernel addresses " << dataRows << " rows a bank, which with "
+          << reserved << " reserved for computation is " << (reserved + dataRows)
+          << " in a subarray of " << rowsPerSubarray
+          << "; a row op cannot name rows in two subarrays, so every row of "
+             "this kernel has to be in one. Fewer passes -- more banks -- is "
+             "what makes a kernel fit";
+      return signalPassFailure();
+    }
+
     // The shape of the row space these addresses were handed out in. Whatever
     // realises them has to provide exactly this many rows per bank, and has to
     // split a flat bank index into a channel and a bank on the same boundary,
     // so the shape travels with the IR rather than being restated downstream.
     if (auto module = func->getParentOfType<ModuleOp>()) {
       module->setAttr("pud.data_rows_per_bank",
-                      builder.getI64IntegerAttr(
-                          allocator.rowsAllocated(layoutBank)));
+                      builder.getI64IntegerAttr(dataRows));
       module->setAttr("pud.banks_per_channel",
                       builder.getI64IntegerAttr(geometry->banksPerChannel));
       module->setAttr("pud.total_banks",

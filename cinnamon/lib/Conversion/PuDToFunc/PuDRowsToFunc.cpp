@@ -72,7 +72,7 @@ struct RowSpace {
   /// Bytes from one row of the space to the next: a row exists in every bank.
   int64_t period() const { return rowStride * totalBanks; }
   /// Rows the substrate reserves, which sit at the front of the space.
-  static int64_t controlRows() { return getMaxEnumValForSimdramCtrlRow() + 1; }
+  static int64_t controlRows() { return pud::controlRowCount(); }
 };
 
 FailureOr<RowSpace> readRowSpace(ModuleOp module) {
