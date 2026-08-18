@@ -979,6 +979,11 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
     // execute as a single full-row wave, so each bank runs ceil(itersPerBank/P)
     // waves and then folds the P packed lanes (ceil(log2 P) levels).
     int64_t packFactor = getLoopPackFactor(forOp);
+    // Folds a bank does to bring together what several passes of the nest it
+    // reads left in it, before any of the banks fold into one another.
+    int64_t passFolds = 0;
+    if (auto attr = forOp->getAttrOfType<IntegerAttr>("bits.pass_folds"))
+      passFolds = std::max<int64_t>(0, attr.getInt());
     int64_t wavesPerBank = (itersPerBank + packFactor - 1) / packFactor;
     int64_t foldLevels =
         packFactor > 1 ? (int64_t)llvm::Log2_64_Ceil(packFactor) : 0;
@@ -1165,13 +1170,24 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
       // inter-bank tree. Each level is a cost-proxy intra-bank row copy
       // (src == dst bank) plus one reduce op (decision: reuse cross-bank cost).
       if (reduceProducer && isReduceCombinerOp(reduceProducer)) {
+        // What a bank folds within itself, as the item count before and after
+        // each step. Folding the packed lanes halves them, so each level
+        // doubles what one row holds; folding what several passes left in the
+        // bank brings in one more bank's worth at a time. Both are a row copy
+        // and a reduce op, and differ only in how much the sum has grown.
+        SmallVector<std::pair<int64_t, int64_t>> foldSteps;
+        int64_t foldHeld = itemsPerBank;
         for (int64_t level = 0; level < foldLevels; ++level) {
-          // Folding the packed lanes doubles the item count each level; the
-          // copy that stages the other half moves a partial sum, so it is as
-          // wide as the sum is.
-          int64_t foldItems = itemsPerBank << level;
+          foldSteps.push_back({foldHeld, foldHeld * 2});
+          foldHeld *= 2;
+        }
+        for (int64_t p = 0; p < passFolds; ++p) {
+          foldSteps.push_back({foldHeld, foldHeld + itemsPerBank});
+          foldHeld += itemsPerBank;
+        }
+        for (auto [foldItems, foldItemsOut] : foldSteps) {
           int64_t wIn = losslessReduceWidth(reduceBase, foldItems);
-          int64_t wOut = losslessReduceWidth(reduceBase, foldItems * 2);
+          int64_t wOut = losslessReduceWidth(reduceBase, foldItemsOut);
           bool grows = wOut > wIn;
           int64_t copyStart = cursor;
           int64_t copyEnd =
@@ -1232,7 +1248,11 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
       DenseMap<int64_t, int64_t> chanReady;
       // Item count entering the tree: every bank already holds the sum of its
       // own wavesPerBank * packFactor products, and each tree level doubles it.
-      int64_t treeItems = wavesPerBank * std::max<int64_t>(1, packFactor);
+      // Every bank arrives at the tree holding what its own folds left it with:
+      // its waves' packed lanes, plus one more element for every pass the
+      // producer took beyond the first.
+      int64_t treeItems =
+          wavesPerBank * std::max<int64_t>(1, packFactor) + passFolds;
       for (Attribute levelAttr : treeAttr) {
         auto level = dyn_cast<ArrayAttr>(levelAttr);
         if (!level)
@@ -1999,8 +2019,11 @@ static scf::ForOp mappedLoopOf(scf::ForOp nest) {
 // a reduction, in the one bank its tree folded into. Returns empty when the
 // nest's groups and its result do not line up one to one, which is the only
 // case this can speak for.
-static SmallVector<int64_t> producedElementBanks(scf::ForOp producer) {
+static SmallVector<int64_t> producedElementBanks(scf::ForOp producer,
+                                                 int64_t *passesOut = nullptr) {
   SmallVector<int64_t> banks;
+  if (passesOut)
+    *passesOut = 1;
   scf::ForOp mapped = mappedLoopOf(producer);
   if (!mapped)
     return banks;
@@ -2011,10 +2034,18 @@ static SmallVector<int64_t> producedElementBanks(scf::ForOp producer) {
   int64_t parallelFactor = readAttr("bits.parallel_factor", 1);
   int64_t stride = readAttr("bits.bank_group_stride", parallelFactor);
   int64_t groups = readAttr("bits.concurrent_groups", 1);
+  // The banks hold the nest's elements a pass at a time: as many at once as
+  // there are groups, and as many passes over as it took to get through them.
+  // Element e is therefore in group e % groups, on pass e / groups -- the order
+  // the flattener places them in and the order the row-op emitter reads them
+  // back in.
+  int64_t passes = readAttr("bits.wave_repeat", 1);
 
   auto tripMaybe = getConstTripCount(producer);
-  if (failed(tripMaybe) || *tripMaybe != groups)
+  if (failed(tripMaybe) || *tripMaybe != groups * passes)
     return banks;
+  if (passesOut)
+    *passesOut = passes;
 
   // Where a group's result ends up: the last level of its tree has one edge and
   // that edge's destination is the bank holding the whole group's fold.
@@ -2045,8 +2076,10 @@ static SmallVector<int64_t> producedElementBanks(scf::ForOp producer) {
 // on holds. Reading them where they are makes the whole reduction the
 // cross-bank tree, with nothing to fold per bank: each bank enters the tree
 // holding exactly one element. Returns empty unless that is the situation.
-static SmallVector<int64_t> crossNestReduceBanks(scf::ForOp lp) {
+static SmallVector<int64_t> crossNestReduceBanks(scf::ForOp lp,
+                                                int64_t *passFoldsOut) {
   SmallVector<int64_t> none;
+  *passFoldsOut = 0;
   if (!isSliceReductionFor(lp) || hasNestedForOp(lp))
     return none;
   Value iv = lp.getInductionVar();
@@ -2062,14 +2095,21 @@ static SmallVector<int64_t> crossNestReduceBanks(scf::ForOp lp) {
   });
   if (!producer || producer == lp || producer->isAncestor(lp))
     return none;
-  SmallVector<int64_t> banks = producedElementBanks(producer);
+  int64_t passes = 1;
+  SmallVector<int64_t> banks = producedElementBanks(producer, &passes);
   if (banks.size() < 2)
     return none;
-  // One bank per element only helps if the loop is walking all of them; a
-  // reduction over fewer has iterations left over that this cannot place.
+  // The loop has to be walking all of them; a reduction over fewer has
+  // iterations left over that this cannot place. When the producer took several
+  // passes each bank holds one element per pass, so what the loop walks is
+  // banks times passes, and the elements a bank holds have to be brought
+  // together before the banks are: one fold per pass after the first, in the
+  // bank, with the addend a run further into the same rows.
   auto tripMaybe = getConstTripCount(lp);
-  if (failed(tripMaybe) || *tripMaybe + 1 != (int64_t)banks.size())
+  if (failed(tripMaybe) ||
+      *tripMaybe + 1 != (int64_t)banks.size() * passes)
     return none;
+  *passFoldsOut = passes - 1;
   return banks;
 }
 
@@ -3216,18 +3256,24 @@ struct BitsOptimiseMappingPass
       // A reduction over an earlier nest's result runs where that result is.
       // Its elements are one per bank already, so there is nothing to fold per
       // bank and the whole reduction is the cross-bank tree over those banks.
-      auto annotateCrossNestReduce = [&](scf::ForOp lp,
-                                         ArrayRef<int64_t> banks) {
+      auto annotateCrossNestReduce = [&](scf::ForOp lp, ArrayRef<int64_t> banks,
+                                         int64_t passFolds) {
         lp->setAttr("bits.parallel_factor",
                     attrBuilder.getI64IntegerAttr((int64_t)banks.size()));
         lp->setAttr("bits.loop_kind", StringAttr::get(ctx, "reduction"));
         lp->setAttr("bits.iters_per_bank", attrBuilder.getI64IntegerAttr(1));
         lp->setAttr("bits.pack_factor", attrBuilder.getI64IntegerAttr(1));
-        // Every bank enters the tree holding one element, so no wave folds and
-        // the wave the loop does run is the seed. Saying so overrides the peel
-        // count the expansion left behind, which counted the elements as though
-        // they all had to pass through one bank.
-        lp->setAttr("bits.intra_reduce_count", attrBuilder.getI64IntegerAttr(0));
+        // Every bank enters the tree holding the elements the producer left in
+        // it -- one per pass it took -- so no wave folds and the wave the loop
+        // does run is the seed. Saying so overrides the peel count the
+        // expansion left behind, which counted the elements as though they all
+        // had to pass through one bank. What each bank does have to do first is
+        // bring its own elements together, and that is one fold per pass after
+        // the first.
+        lp->setAttr("bits.pass_folds",
+                    attrBuilder.getI64IntegerAttr(passFolds));
+        lp->setAttr("bits.intra_reduce_count",
+                    attrBuilder.getI64IntegerAttr(passFolds));
         lp->setAttr("bits.reduce_combines", attrBuilder.getI64IntegerAttr(0));
         lp->setAttr("bits.bank_id",
                     attrBuilder.getI64IntegerAttr(banks.front()));
@@ -3374,9 +3420,10 @@ struct BitsOptimiseMappingPass
       func.walk([&](scf::ForOp forOp) {
         if (forOp->hasAttr("bits.cross_nest_reduce"))
           return;
-        SmallVector<int64_t> banks = crossNestReduceBanks(forOp);
+        int64_t passFolds = 0;
+        SmallVector<int64_t> banks = crossNestReduceBanks(forOp, &passFolds);
         if (banks.size() > 1)
-          annotateCrossNestReduce(forOp, banks);
+          annotateCrossNestReduce(forOp, banks, passFolds);
       });
 
       // And the same for a nest that does not fold what it reads: a ReLU runs

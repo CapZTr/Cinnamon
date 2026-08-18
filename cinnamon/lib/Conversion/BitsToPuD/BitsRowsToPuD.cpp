@@ -1675,6 +1675,11 @@ struct MappedLoop {
   /// Levels of intra-bank folding of the packed lanes, then the cross-bank tree
   /// as lists of (source, destination) banks within a group.
   int64_t foldLevels = 0;
+  /// Folds a bank does to bring together the elements an earlier nest left in
+  /// it -- one per pass that nest took beyond the first. They come before the
+  /// tree and read a run further into the same rows, which is where the pass
+  /// that produced them put them.
+  int64_t passFolds = 0;
   SmallVector<SmallVector<std::pair<int64_t, int64_t>>> tree;
 };
 
@@ -1867,6 +1872,8 @@ FailureOr<MappedLoop> readMappedLoop(scf::ForOp loop) {
 
   mapped.foldLevels =
       mapped.packFactor > 1 ? (int64_t)llvm::Log2_64_Ceil(mapped.packFactor) : 0;
+  if (auto attr = loop->getAttrOfType<IntegerAttr>("bits.pass_folds"))
+    mapped.passFolds = std::max<int64_t>(0, attr.getInt());
   // A reduction normally spends its first wave producing what the rest fold
   // into; an expansion that peeled that seed out folds on every wave, and says
   // so, because the wave count cannot be read both ways.
@@ -2034,6 +2041,21 @@ LogicalResult emitReduceTree(OpBuilder &builder, Location loc,
     withinBank.push_back({bank, bank});
   for (int64_t level = 0; level < mapped.foldLevels; ++level) {
     copyAlong(withinBank);
+    if (failed(emitFold(builder, loc, emitter, schedule, reduction, backend,
+                        map, mapped.loop)))
+      return failure();
+  }
+
+  // Then what the passes of an earlier nest left in this bank. Each of them is
+  // a run further into the accumulator's rows -- that is where the pass that
+  // produced it put it -- so the copy that stages one reads from a fixed offset
+  // rather than from a pass this schedule is on. The last pass comes first, so
+  // that what everything ends up folded into is the first, which is the run the
+  // tree and whatever reads this nest go to.
+  for (int64_t pass = mapped.passFolds; pass >= 1; --pass) {
+    emitter.emitCopies(builder, loc, withinBank,
+                       reduction.accBase + pass * reduction.accRows,
+                       reduction.stageBase, reduction.accRows);
     if (failed(emitFold(builder, loc, emitter, schedule, reduction, backend,
                         map, mapped.loop)))
       return failure();
@@ -2343,7 +2365,8 @@ struct ConvertBitsRowsToPuD
 
         // Now every bank holds a partial result, and they have to become one.
         if (reduction->valid() &&
-            (mapped.foldLevels > 0 || !mapped.tree.empty())) {
+            (mapped.foldLevels > 0 || mapped.passFolds > 0 ||
+             !mapped.tree.empty())) {
           // The tree runs once the waves are done, so there is no wave to be
           // on. What it touches is the accumulator, which steps with the pass,
           // and the staging run, which is scratch; a run that steps with the
