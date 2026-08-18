@@ -52,7 +52,12 @@ def ConvertBitsRowsToPuD
   let options = [
     Option<"backend", "backend", "std::string", /*default=*/"\"simdram\"",
            "PuD substrate whose row-op templates are instantiated. Must match "
-           "the backend the mapping was priced for.">
+           "the backend the mapping was priced for.">,
+    Option<"rowStride", "row-stride", "int64_t", /*default=*/"8192",
+           "Bytes from one bank's row to the next bank's, which is the row "
+           "size of the substrate. The rows a kernel addresses are laid out at "
+           "this stride, so this is what turns a row coordinate into an "
+           "address; it travels with the IR for whatever realises them.">
   ];
 }
 

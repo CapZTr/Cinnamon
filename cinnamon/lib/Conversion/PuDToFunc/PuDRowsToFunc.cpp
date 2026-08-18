@@ -5,29 +5,28 @@
 //
 // A row op becomes the target's instruction for it, emitted in place.
 //
-// An address does not become a call either. The dialect names a row by where it is --
-// channel, rank, bank, subarray, row -- and the runtime that owns the row
-// allocation publishes where each row it allocated actually landed, as tables
-// indexed by that coordinate:
+// An address does not become a call either, and it is not a lookup. The dialect
+// names a row by where it is -- channel, rank, bank, subarray, row -- and the
+// runtime that owns the row space lays it out at a fixed stride, so a
+// coordinate is arithmetic:
 //
-//   void *pud_ctrl_row_addr[<control rows>][<banks>]
-//   void *pud_row_addr     [<rows per bank>][<banks>]
+//   pud_arena + (control rows + row) * (row stride * banks) + bank * row stride
 //
-// so resolving a coordinate is a load, emitted here. Turning it into a call
-// instead would hide it: the coordinate of a row op inside a loop is affine in
-// the induction variables, and nothing downstream can see that through a call
-// into another translation unit -- the redundant halves of the flattening stay,
-// and the part that does not vary with the innermost loop cannot leave it.
+// with the rows the substrate reserves at the front, in the order the dialect
+// enumerates them.
 //
-// The two tables follow the coordinate. Control rows are named rather than
-// numbered because the substrate reserves them: where they are is a property of
-// it, not of what the allocation happened to hand out.
+// It used to be a load out of a table the runtime published, one entry per
+// (row, bank). That table is as large as the kernel's row space -- 63 kB for
+// popcount -- and a kernel walks all of it every wave, so it does not stay in a
+// 32 kB L1, and every miss is a DRAM read that stops the row-op stream while
+// the controller turns the bus around. Arithmetic has no such table: the bank
+// loop becomes a pointer walking by the row stride, and the row coordinate
+// folds into the loop that produced it.
 //
-// The tables are indexed by bank and row alone. Rank and subarray are carried
-// through the dialect but do not yet select anything: rows are laid out per
-// bank, so there is nothing for those coordinates to pick between. Distributing
-// rows over them is a later change, and it is these tables that will gain the
-// dimensions when it happens.
+// Rank and subarray are carried through the dialect but do not yet select
+// anything: rows are laid out per bank, so there is nothing for those
+// coordinates to pick between. Distributing rows over them is a later change,
+// and it is this arithmetic that will gain the terms when it happens.
 //
 //===----------------------------------------------------------------------===//
 
@@ -56,9 +55,8 @@ using namespace mlir::pud;
 
 namespace {
 
-/// Names of the row-address tables the runtime publishes.
-constexpr StringLiteral kCtrlRowTable = "pud_ctrl_row_addr";
-constexpr StringLiteral kDataRowTable = "pud_row_addr";
+/// The base of the row space, as the runtime publishes it.
+constexpr StringLiteral kArenaSymbol = "pud_arena";
 
 /// The shape of the row space, as the conversion to PuD recorded it.
 ///
@@ -69,19 +67,12 @@ struct RowSpace {
   int64_t banksPerChannel = 0;
   int64_t totalBanks = 0;
   int64_t dataRowsPerBank = 0;
+  int64_t rowStride = 0;
 
-  /// Type of a table with `rows` rows in every bank.
-  LLVM::LLVMArrayType tableType(MLIRContext *ctx, int64_t rows) const {
-    auto ptr = LLVM::LLVMPointerType::get(ctx);
-    return LLVM::LLVMArrayType::get(
-        LLVM::LLVMArrayType::get(ptr, totalBanks), rows);
-  }
-  LLVM::LLVMArrayType ctrlTableType(MLIRContext *ctx) const {
-    return tableType(ctx, getMaxEnumValForSimdramCtrlRow() + 1);
-  }
-  LLVM::LLVMArrayType dataTableType(MLIRContext *ctx) const {
-    return tableType(ctx, dataRowsPerBank);
-  }
+  /// Bytes from one row of the space to the next: a row exists in every bank.
+  int64_t period() const { return rowStride * totalBanks; }
+  /// Rows the substrate reserves, which sit at the front of the space.
+  static int64_t controlRows() { return getMaxEnumValForSimdramCtrlRow() + 1; }
 };
 
 FailureOr<RowSpace> readRowSpace(ModuleOp module) {
@@ -95,13 +86,18 @@ FailureOr<RowSpace> readRowSpace(ModuleOp module) {
   };
   if (!get("pud.banks_per_channel", space.banksPerChannel) ||
       !get("pud.total_banks", space.totalBanks) ||
-      !get("pud.data_rows_per_bank", space.dataRowsPerBank)) {
+      !get("pud.data_rows_per_bank", space.dataRowsPerBank) ||
+      !get("pud.row_stride", space.rowStride)) {
     module.emitError() << "no row space on the module; run "
                           "convert-bits-rows-to-pud first";
     return failure();
   }
   if (space.banksPerChannel <= 0 || space.totalBanks <= 0) {
     module.emitError() << "the row space spans no banks";
+    return failure();
+  }
+  if (space.rowStride <= 0) {
+    module.emitError() << "a row has to be some bytes wide";
     return failure();
   }
   return space;
@@ -138,21 +134,22 @@ void emitRowOp(OpBuilder &builder, Location loc, unsigned opcode,
       /*operand_attrs=*/ArrayAttr());
 }
 
-/// Declares one of the runtime's tables once per module.
+/// Declares the runtime's arena pointer once per module.
 ///
-/// The table is dso_local: the runtime that defines it is linked into the same
-/// program as the kernel that reads it -- it is the runtime for this kernel --
-/// so the address is known at link time and an indirection through a global
-/// offset table would be one more load in the row-op path for nothing.
-void declareTable(ModuleOp module, StringRef name, Type type) {
-  if (module.lookupSymbol<LLVM::GlobalOp>(name))
+/// It is dso_local: the runtime that defines it is linked into the same program
+/// as the kernel that reads it -- it is the runtime for this kernel -- so the
+/// address is known at link time and an indirection through a global offset
+/// table would be one more load in the row-op path for nothing.
+void declareArena(ModuleOp module) {
+  if (module.lookupSymbol<LLVM::GlobalOp>(kArenaSymbol))
     return;
   OpBuilder builder(module.getBodyRegion());
   builder.setInsertionPointToStart(module.getBody());
-  builder.create<LLVM::GlobalOp>(module.getLoc(), type, /*isConstant=*/false,
-                                 LLVM::Linkage::External, name,
-                                 /*value=*/Attribute(), /*alignment=*/0,
-                                 /*addrSpace=*/0, /*dsoLocal=*/true);
+  builder.create<LLVM::GlobalOp>(
+      module.getLoc(), LLVM::LLVMPointerType::get(module.getContext()),
+      /*isConstant=*/false, LLVM::Linkage::External, kArenaSymbol,
+      /*value=*/Attribute(), /*alignment=*/0, /*addrSpace=*/0,
+      /*dsoLocal=*/true);
 }
 
 /// The bank a coordinate names, as one index over the whole memory -- the same
@@ -165,22 +162,56 @@ Value flattenBank(OpBuilder &builder, Location loc, Value channel, Value bank,
   return builder.create<arith::AddIOp>(loc, inChannels, bank);
 }
 
-/// Reads a row's address out of one of the runtime's tables.
-Value lookUpRow(OpBuilder &builder, Location loc, StringRef table,
-                Type tableType, LLVM::GEPArg row, Value bank) {
+/// The base of the row space, loaded once per function.
+///
+/// Once, because a row op clobbers memory as far as the compiler is concerned
+/// -- that is what keeps the schedule in order -- so a load written out per
+/// address could never be hoisted out from between two of them, and a kernel
+/// would spend an instruction and a cache access per operand re-reading a
+/// pointer that never changes.
+class ArenaBase {
+public:
+  Value get(OpBuilder &builder, func::FuncOp func) {
+    auto it = bases.find(func.getOperation());
+    if (it != bases.end())
+      return it->second;
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(&func.getBody().front());
+    Location loc = func.getLoc();
+    auto ptrType = LLVM::LLVMPointerType::get(builder.getContext());
+    Value arena = builder.create<LLVM::AddressOfOp>(loc, ptrType, kArenaSymbol);
+    Value base = builder.create<LLVM::LoadOp>(loc, ptrType, arena);
+    bases[func.getOperation()] = base;
+    return base;
+  }
+
+private:
+  DenseMap<Operation *, Value> bases;
+};
+
+/// Where a row of the space is: its index times the period, plus the bank.
+///
+/// `rowInSpace` counts from the front of the space, where the substrate's
+/// reserved rows are, so a data row is offset past them.
+Value rowAddress(OpBuilder &builder, Location loc, const RowSpace &space,
+                 Value base, Value rowInSpace, Value bank) {
   auto ptrType = LLVM::LLVMPointerType::get(builder.getContext());
-  Value base = builder.create<LLVM::AddressOfOp>(loc, ptrType, table);
-  SmallVector<LLVM::GEPArg, 3> index{LLVM::GEPArg(0), row, LLVM::GEPArg(bank)};
-  Value slot = builder.create<LLVM::GEPOp>(loc, ptrType, tableType, base, index,
-                                           /*inbounds=*/true);
-  return builder.create<LLVM::LoadOp>(loc, ptrType, slot);
+  Value period = builder.create<arith::ConstantIntOp>(loc, space.period(), 64);
+  Value stride =
+      builder.create<arith::ConstantIntOp>(loc, space.rowStride, 64);
+  Value offset = builder.create<arith::AddIOp>(
+      loc, builder.create<arith::MulIOp>(loc, rowInSpace, period),
+      builder.create<arith::MulIOp>(loc, bank, stride));
+  return builder.create<LLVM::GEPOp>(loc, ptrType, builder.getI8Type(), base,
+                                     ArrayRef<LLVM::GEPArg>{LLVM::GEPArg(offset)},
+                                     /*inbounds=*/true);
 }
 
 /// A data row: the row the coordinate names, in the bank it names.
 struct GetRowLowering : public OpConversionPattern<GetRowOp> {
   GetRowLowering(const TypeConverter &converter, MLIRContext *ctx,
-                 const RowSpace &space)
-      : OpConversionPattern(converter, ctx), space(space) {}
+                 const RowSpace &space, ArenaBase &arena)
+      : OpConversionPattern(converter, ctx), space(space), arena(arena) {}
 
   LogicalResult
   matchAndRewrite(GetRowOp op, OpAdaptor adaptor,
@@ -188,21 +219,24 @@ struct GetRowLowering : public OpConversionPattern<GetRowOp> {
     Location loc = op.getLoc();
     Value bank = flattenBank(rewriter, loc, adaptor.getChannelID(),
                              adaptor.getBankID(), space.banksPerChannel);
-    rewriter.replaceOp(
-        op, lookUpRow(rewriter, loc, kDataRowTable,
-                      space.dataTableType(op.getContext()), adaptor.getRowID(),
-                      bank));
+    // Past the rows the substrate reserves, which are at the front.
+    Value first = rewriter.create<arith::ConstantIntOp>(
+        loc, RowSpace::controlRows(), 64);
+    Value row = rewriter.create<arith::AddIOp>(loc, first, adaptor.getRowID());
+    Value base = arena.get(rewriter, op->getParentOfType<func::FuncOp>());
+    rewriter.replaceOp(op, rowAddress(rewriter, loc, space, base, row, bank));
     return success();
   }
 
   const RowSpace &space;
+  ArenaBase &arena;
 };
 
 /// A control row: named rather than numbered, so the name is the row index.
 struct GetCtrlRowLowering : public OpConversionPattern<GetCtrlRowOp> {
   GetCtrlRowLowering(const TypeConverter &converter, MLIRContext *ctx,
-                     const RowSpace &space)
-      : OpConversionPattern(converter, ctx), space(space) {}
+                     const RowSpace &space, ArenaBase &arena)
+      : OpConversionPattern(converter, ctx), space(space), arena(arena) {}
 
   LogicalResult
   matchAndRewrite(GetCtrlRowOp op, OpAdaptor adaptor,
@@ -210,14 +244,15 @@ struct GetCtrlRowLowering : public OpConversionPattern<GetCtrlRowOp> {
     Location loc = op.getLoc();
     Value bank = flattenBank(rewriter, loc, adaptor.getChannelID(),
                              adaptor.getBankID(), space.banksPerChannel);
-    rewriter.replaceOp(
-        op, lookUpRow(rewriter, loc, kCtrlRowTable,
-                      space.ctrlTableType(op.getContext()),
-                      static_cast<int32_t>(op.getCtrlRow()), bank));
+    Value row = rewriter.create<arith::ConstantIntOp>(
+        loc, static_cast<int64_t>(op.getCtrlRow()), 64);
+    Value base = arena.get(rewriter, op->getParentOfType<func::FuncOp>());
+    rewriter.replaceOp(op, rowAddress(rewriter, loc, space, base, row, bank));
     return success();
   }
 
   const RowSpace &space;
+  ArenaBase &arena;
 };
 
 /// Which instruction each row op is. The encodings are the target's; the
@@ -292,8 +327,7 @@ struct ConvertPuDRowsToFunc
       return signalPassFailure();
     space = *rowSpace;
 
-    declareTable(module, kCtrlRowTable, space.ctrlTableType(ctx));
-    declareTable(module, kDataRowTable, space.dataTableType(ctx));
+    declareArena(module);
 
     TypeConverter converter;
     converter.addConversion([](Type type) { return type; });
@@ -308,7 +342,8 @@ struct ConvertPuDRowsToFunc
                            scf::SCFDialect, LLVM::LLVMDialect>();
 
     RewritePatternSet patterns(ctx);
-    patterns.add<GetRowLowering, GetCtrlRowLowering>(converter, ctx, space);
+    patterns.add<GetRowLowering, GetCtrlRowLowering>(converter, ctx, space,
+                                                    arena);
     patterns.add<AAPLowering, APLowering, RowCopyLowering>(converter, ctx);
 
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
@@ -316,6 +351,7 @@ struct ConvertPuDRowsToFunc
   }
 
   RowSpace space;
+  ArenaBase arena;
 };
 
 } // namespace

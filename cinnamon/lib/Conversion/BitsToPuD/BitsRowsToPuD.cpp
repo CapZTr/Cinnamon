@@ -1752,6 +1752,7 @@ struct ConvertBitsRowsToPuD
                       builder.getI64IntegerAttr(geometry->banksPerChannel));
       module->setAttr("pud.total_banks",
                       builder.getI64IntegerAttr(geometry->totalBanks));
+      module->setAttr("pud.row_stride", builder.getI64IntegerAttr(rowStride));
     }
   }
 };
