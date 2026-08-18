@@ -55,6 +55,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
@@ -156,6 +157,33 @@ struct Seed {
   RowLoc src;
 };
 
+/// What put the values a tensor holds into the machine.
+///
+/// A kernel is several nests one after another and a later one reads what an
+/// earlier one wrote: the conv writes a run, `bits.assemble` presents it as a
+/// tensor again, and the ReLU nest picks that tensor up with a
+/// `tensor.extract_slice` and a `bits.transpose`. Between those two the values
+/// never leave the machine, so the transpose is not a load -- it names rows
+/// that already hold what it wants, and the only question is which ones.
+enum class RowSource {
+  /// It comes from outside the kernel, so the runtime is what lays it out and
+  /// wherever the binder puts it is where it will be.
+  External,
+  /// A nest of this function wrote it, into the run this says.
+  Produced,
+  /// Nothing in the function accounts for it.
+  Unknown,
+};
+
+/// The answer to "where is this tensor", with the run when there is one.
+struct TensorOrigin {
+  RowSource kind = RowSource::Unknown;
+  SliceLoc run;
+  /// How many rows the producer's run has, so a reader that wants more of them
+  /// than were written can be told rather than left to read past the end.
+  int64_t rows = 0;
+};
+
 //===----------------------------------------------------------------------===//
 // Binding values to rows
 //===----------------------------------------------------------------------===//
@@ -186,7 +214,18 @@ public:
       Value arg = loop.getRegionIterArg(i);
       Value result = loop.getResult(i);
       if (auto slice = dyn_cast<SliceType>(arg.getType())) {
-        SliceLoc loc = newRun(slice.getBitWidth());
+        // What the accumulator starts from can be an earlier nest's result --
+        // the selection starts from the first of the distances the nest before
+        // it computed. Those rows are already in the machine, so the
+        // accumulator can be that run rather than a copy of it, but only if it
+        // is the last thing to want them: an accumulator is written every wave,
+        // and a run something still has to read is not somewhere to write.
+        auto produced = producedRunFor(init, slice.getBitWidth());
+        if (failed(produced))
+          return failure();
+        if (*produced && readsRun(*loop.getBody(), (*produced)->base))
+          produced = std::optional<SliceLoc>();
+        SliceLoc loc = *produced ? **produced : newRun(slice.getBitWidth());
         slices[init] = loc;
         slices[arg] = loc;
         slices[result] = loc;
@@ -195,11 +234,12 @@ public:
         // and left to itself the binder would give that run somewhere else --
         // so every tile would fold into rows the following tile never reads,
         // and the accumulator would only ever hold the last tile's work. Follow
-        // the inserts back to the run being written and give it the same home.
-        Value carried = yield.getOperand(i);
-        while (auto insert = carried.getDefiningOp<InsertRowOp>())
-          carried = insert.getSlice();
-        if (carried.getDefiningOp<CreateSliceOp>())
+        // what the yield hands back to the run being written and give it the
+        // same home. The trail runs through the bit loop the expansion built as
+        // well as through its inserts: the fold is a loop over rows, so what
+        // reaches the yield is that loop's result, and the run is the slice it
+        // started from.
+        if (Value carried = runWrittenBy(yield.getOperand(i)))
           slices[carried] = loc;
         continue;
       }
@@ -223,6 +263,9 @@ public:
     auto it = slices.find(v);
     return it == slices.end() ? nullptr : &it->second;
   }
+  /// Whether a run holds something loaded from outside the kernel, which is to
+  /// say that the runtime has already put it there.
+  bool isExternal(int64_t base) const { return external.contains(base); }
 
   /// The run a slice belongs to, looking through inserts that have not been
   /// bound yet.
@@ -267,6 +310,27 @@ private:
     return SliceLoc::run(allocator.allocate(flatBank, numRows).row);
   }
 
+  /// Where the values a tensor holds already are, and what put them there.
+  TensorOrigin traceTensor(Value tensor) const;
+
+  /// The run an earlier nest left a slice's contents in, if it is read out of
+  /// one -- null when the contents come from outside the kernel instead.
+  ///
+  /// Fails when a producer is found whose run is too short for what is being
+  /// read out of it: that is two nests disagreeing about a layout, and quietly
+  /// reading past the end of the run would be the worst way to find out.
+  FailureOr<std::optional<SliceLoc>> producedRunFor(Value slice,
+                                                    int64_t wantRows) const;
+
+  /// The `bits.create_slice` whose run a value ends up being, following the
+  /// inserts and the bit loops that wrote it. Null when the trail leads
+  /// somewhere else, which means the run is not this loop's to place.
+  static Value runWrittenBy(Value carried);
+
+  /// Whether anything in a nest reads a run that is already in the machine --
+  /// which is what makes it unsafe to write over.
+  bool readsRun(Block &body, int64_t base) const;
+
   /// Where a row a template produces has to end up, read off what consumes it.
   RowLoc homeFor(Value result);
   LogicalResult bindOp(Operation *op);
@@ -278,6 +342,9 @@ private:
   DenseMap<Value, SliceLoc> slices;
   DenseMap<Operation *, SmallVector<Seed>> seeds;
   SmallVector<int64_t> temps;
+  /// Runs holding an operand the runtime lays out. Nothing in the function
+  /// writes them, which is the whole point of them.
+  llvm::DenseSet<int64_t> external;
 };
 
 /// Whether an op computes on rows, i.e. becomes a template instantiation.
@@ -309,6 +376,141 @@ std::optional<std::pair<ControlRow, Value>> residentResult(Operation *op) {
   if (auto greater = dyn_cast<RowGreaterStepOp>(op))
     return std::make_pair(ControlRow::T2, greater.getGOut());
   return std::nullopt;
+}
+
+/// Follows a tensor back to whatever put its values where they are.
+///
+/// The walk is over the dataflow that is about to be discarded, and it is the
+/// last thing that dataflow is good for: reshapes, slices and `bits.assemble`
+/// hand on what they were given, a loop hands on what its yield holds, and a
+/// `tensor.insert` of a slice is a nest saying "this run". An op the walk does
+/// not know is external exactly when everything it reads is, which is what makes
+/// a `linalg.broadcast` of a kernel operand an operand and not a mystery.
+static TensorOrigin traceRun(Value v, const RowBinder &binder, unsigned depth) {
+  TensorOrigin unknown;
+  TensorOrigin external;
+  external.kind = RowSource::External;
+  // Deep enough for any chain a frontend builds, and a bound on a walk that has
+  // no other reason to stop.
+  if (!v || depth > 64)
+    return unknown;
+
+  // A slice is the end of the walk: it is a run, if it has been given one.
+  if (auto sliceType = dyn_cast<SliceType>(v.getType())) {
+    const SliceLoc *loc = binder.sliceFor(v);
+    if (!loc || loc->broadcast)
+      return unknown;
+    TensorOrigin origin;
+    origin.kind = RowSource::Produced;
+    origin.run = *loc;
+    origin.rows = sliceType.getBitWidth();
+    return origin;
+  }
+
+  if (auto arg = dyn_cast<BlockArgument>(v)) {
+    auto loop = dyn_cast_or_null<scf::ForOp>(arg.getOwner()->getParentOp());
+    if (!loop)
+      return external; // the function's own argument
+    if (arg == loop.getInductionVar())
+      return unknown;
+    return traceRun(loop.getInits()[arg.getArgNumber() - 1], binder, depth + 1);
+  }
+
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return unknown;
+  if (auto loop = dyn_cast<scf::ForOp>(def)) {
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    return traceRun(yield.getOperand(cast<OpResult>(v).getResultNumber()),
+                    binder, depth + 1);
+  }
+  if (auto insert = dyn_cast<tensor::InsertOp>(def)) {
+    // Every element of the tensor a nest builds is the same run in a different
+    // bank -- the schedule is written once with the bank left open -- so the
+    // one being inserted answers for all of them.
+    TensorOrigin scalar = traceRun(insert.getScalar(), binder, depth + 1);
+    if (scalar.kind == RowSource::Produced)
+      return scalar;
+    return traceRun(insert.getDest(), binder, depth + 1);
+  }
+  if (auto assemble = dyn_cast<AssembleOp>(def))
+    return traceRun(assemble.getInput(), binder, depth + 1);
+  if (isa<tensor::EmptyOp>(def))
+    return external;
+
+  TensorOrigin result = external;
+  bool sawTensor = false;
+  for (Value operand : def->getOperands()) {
+    if (!isa<TensorType, SliceType>(operand.getType()))
+      continue;
+    sawTensor = true;
+    TensorOrigin from = traceRun(operand, binder, depth + 1);
+    if (from.kind == RowSource::Unknown)
+      return unknown;
+    if (from.kind == RowSource::External)
+      continue;
+    if (result.kind == RowSource::Produced &&
+        result.run.base != from.run.base)
+      return unknown; // two nests at once, and no way to say which
+    result = from;
+  }
+  return sawTensor ? result : unknown;
+}
+
+TensorOrigin RowBinder::traceTensor(Value tensor) const {
+  return traceRun(tensor, *this, 0);
+}
+
+Value RowBinder::runWrittenBy(Value carried) {
+  // The trail is finite -- each step goes to a strictly earlier definition --
+  // but it is walked before anything has been checked, so it gets a bound.
+  for (unsigned step = 0; carried && step < 64; ++step) {
+    if (carried.getDefiningOp<CreateSliceOp>())
+      return carried;
+    if (auto insert = carried.getDefiningOp<InsertRowOp>()) {
+      carried = insert.getSlice();
+      continue;
+    }
+    if (auto inner = carried.getDefiningOp<scf::ForOp>()) {
+      auto innerYield = cast<scf::YieldOp>(inner.getBody()->getTerminator());
+      carried = innerYield.getOperand(cast<OpResult>(carried).getResultNumber());
+      continue;
+    }
+    if (auto arg = dyn_cast<BlockArgument>(carried)) {
+      auto owner = dyn_cast_or_null<scf::ForOp>(arg.getOwner()->getParentOp());
+      if (owner && arg != owner.getInductionVar()) {
+        carried = owner.getInits()[arg.getArgNumber() - 1];
+        continue;
+      }
+    }
+    break;
+  }
+  return {};
+}
+
+bool RowBinder::readsRun(Block &body, int64_t base) const {
+  bool found = false;
+  body.walk([&](TransposeOp transpose) {
+    TensorOrigin origin = traceTensor(transpose.getInput());
+    if (origin.kind == RowSource::Produced && origin.run.base == base)
+      found = true;
+  });
+  return found;
+}
+
+FailureOr<std::optional<SliceLoc>>
+RowBinder::producedRunFor(Value slice, int64_t wantRows) const {
+  auto transpose = slice.getDefiningOp<TransposeOp>();
+  if (!transpose)
+    return std::optional<SliceLoc>();
+  TensorOrigin origin = traceTensor(transpose.getInput());
+  if (origin.kind != RowSource::Produced)
+    return std::optional<SliceLoc>();
+  if (origin.rows < wantRows)
+    return transpose.emitError()
+           << "reads " << wantRows << " rows of a run an earlier nest wrote "
+           << origin.rows << " rows of; the two nests disagree about the layout";
+  return std::optional<SliceLoc>(origin.run);
 }
 
 RowLoc RowBinder::homeFor(Value result) {
@@ -412,7 +614,24 @@ LogicalResult RowBinder::bindOp(Operation *op) {
     auto slice = dyn_cast<SliceType>(transpose.getOutput().getType());
     if (!slice)
       return op->emitError() << "only a transpose to a slice can be placed";
-    slices[transpose.getOutput()] = newRun(slice.getBitWidth());
+    // A transpose of an earlier nest's result is not a load: those rows are
+    // where that nest left them, and reading a run of this one's own would read
+    // rows nothing ever wrote.
+    auto produced = producedRunFor(transpose.getOutput(), slice.getBitWidth());
+    if (failed(produced))
+      return failure();
+    if (*produced) {
+      slices[transpose.getOutput()] = **produced;
+      return success();
+    }
+    SliceLoc loc = newRun(slice.getBitWidth());
+    // Otherwise it comes from outside, and the runtime fills it in before the
+    // kernel runs; nothing in the function writes it and nothing has to. A
+    // tensor the walk could not account for gets a run too, and is left for the
+    // check at the end to name.
+    if (traceTensor(transpose.getInput()).kind == RowSource::External)
+      external.insert(loc.base);
+    slices[transpose.getOutput()] = loc;
     return success();
   }
   if (auto create = dyn_cast<CreateSliceOp>(op)) {
@@ -551,6 +770,48 @@ LogicalResult RowBinder::bind(Block &block) {
     }
   }
   return success();
+}
+
+/// Checks that every run a schedule reads is one something wrote.
+///
+/// The binder decides where each row-level value lives, and a run it hands out
+/// that nothing ever writes is not a compile error anywhere else: the schedule
+/// is well-formed, it is priced, it runs, and it computes on whatever the last
+/// kernel left in those rows. The chains where this goes wrong are the ones
+/// between nests -- the writer is one nest and the reader the next, with the
+/// tensor dataflow the only thing connecting them -- which is exactly the part
+/// this pass throws away. So it is checked before it is thrown away.
+///
+/// Three things count as writing a run: an operand of the kernel, which the
+/// runtime lays out before the first command; an earlier nest, reached by
+/// following the tensor back to it; and a `bits.insert_row` in this function.
+LogicalResult verifyReadsHaveWriters(func::FuncOp func,
+                                     const RowBinder &binder) {
+  llvm::DenseSet<int64_t> written;
+  func.walk([&](InsertRowOp insert) {
+    if (const SliceLoc *loc = binder.sliceFor(insert.getSlice()))
+      if (!loc->broadcast)
+        written.insert(loc->base);
+  });
+
+  LogicalResult result = success();
+  func.walk([&](ExtractRowOp extract) {
+    const SliceLoc *loc = binder.sliceFor(extract.getSlice());
+    // Unbound is a different complaint, and bindOp has already made it.
+    if (!loc || loc->broadcast || binder.isExternal(loc->base) ||
+        written.contains(loc->base))
+      return;
+    Operation *def = extract.getSlice().getDefiningOp();
+    auto diag = extract.emitError()
+                << "reads rows nothing writes: the run at row " << loc->base
+                << " holds no operand of the kernel, no earlier nest's result "
+                   "and nothing this function puts there";
+    diag.attachNote(def ? def->getLoc() : extract.getLoc())
+        << "the slice being read comes from "
+        << (def ? def->getName().getStringRef() : StringRef("a block argument"));
+    result = failure();
+  });
+  return result;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1628,6 +1889,11 @@ struct ConvertBitsRowsToPuD
       if (failed(binder.bindCarried(mapped.loop)) ||
           failed(binder.bind(*mapped.loop.getBody())))
         return signalPassFailure();
+
+    // Everything is bound and nothing has been emitted, which is the only
+    // moment at which both where a value lives and where it came from are known.
+    if (failed(verifyReadsHaveWriters(func, binder)))
+      return signalPassFailure();
 
     // The new body is built beside the old one and swapped in at the end. It is
     // built from the old one -- the loop nest, the index arithmetic, the order
