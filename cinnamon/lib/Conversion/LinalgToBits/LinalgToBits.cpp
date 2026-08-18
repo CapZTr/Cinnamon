@@ -616,6 +616,86 @@ struct ConvertLinalgMatmulToBits
 // is exactly one full-row bit-serial wave.
 static constexpr int64_t kElementwiseTileLanes = 8192;
 
+// The lane width an earlier nest laid a tensor out in, if that is where the
+// tensor comes from -- zero when it comes from outside the kernel.
+//
+// A nest writes tiles of whatever width its own operands had and
+// `bits.assemble` presents them as a tensor again; between the two nothing
+// moves. A consumer that then cut that tensor into tiles of the standard width
+// would be naming rows that are not the ones holding it -- the convolution
+// leaves 64 lanes per tile and the ReLU after it was asking for 8192 -- so the
+// two would agree on the values and disagree on where they are.
+//
+// Inheriting the producer's width costs nothing: a row op drives a whole bank
+// row whatever width the slice claims, and the interleaved tiling below already
+// lays tiles out the way `bits.assemble` reads them, so the same reasoning that
+// makes tile `t` every T-th element holds for any T.
+static int64_t producerTileLanes(Value tensor) {
+  for (unsigned step = 0; tensor && step < 32; ++step) {
+    Operation *def = tensor.getDefiningOp();
+    if (!def)
+      return 0;
+    if (auto assemble = dyn_cast<AssembleOp>(def)) {
+      auto tiles = dyn_cast<RankedTensorType>(assemble.getInput().getType());
+      if (!tiles || tiles.getRank() != 1)
+        return 0;
+      auto slice = dyn_cast<SliceType>(tiles.getElementType());
+      return slice ? slice.getVectorLength() : 0;
+    }
+    if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(def)) {
+      tensor = collapse.getSrc();
+      continue;
+    }
+    if (auto expand = dyn_cast<tensor::ExpandShapeOp>(def)) {
+      tensor = expand.getSrc();
+      continue;
+    }
+    if (auto castOp = dyn_cast<tensor::CastOp>(def)) {
+      tensor = castOp.getSource();
+      continue;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+// Whether a tensor still comes from a linalg op this pass is going to rewrite.
+static bool stillUnconverted(Value tensor) {
+  for (unsigned step = 0; tensor && step < 32; ++step) {
+    Operation *def = tensor.getDefiningOp();
+    if (!def)
+      return false;
+    if (isa<linalg::LinalgOp>(def)) {
+      // The layout ops the conversion leaves alone are not going to become a
+      // nest, so a tensor coming from one comes from wherever they got it.
+      StringRef name = def->getName().getStringRef();
+      return name != "linalg.broadcast" && name != "linalg.transpose" &&
+             name != "linalg.generic";
+    }
+    if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(def)) {
+      tensor = collapse.getSrc();
+      continue;
+    }
+    if (auto expand = dyn_cast<tensor::ExpandShapeOp>(def)) {
+      tensor = expand.getSrc();
+      continue;
+    }
+    if (auto castOp = dyn_cast<tensor::CastOp>(def)) {
+      tensor = castOp.getSource();
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+// The tile width to cut a consumed tensor into: its producer's, when it has
+// one, and the full bank row otherwise.
+static int64_t tileLanesFor(Value tensor) {
+  int64_t lanes = producerTileLanes(tensor);
+  return lanes > 0 ? lanes : kElementwiseTileLanes;
+}
+
 // Elementwise linalg named ops (linalg.add / linalg.mul / ...) -> a tiled
 // scf.for whose body is a single bits slice op.
 //
@@ -659,7 +739,7 @@ struct ConvertLinalgElementwiseToBits : public ConversionPattern {
       : ConversionPattern(opName, /*benefit=*/1, ctx) {}
 
   LogicalResult
-  matchAndRewrite(Operation *op, ArrayRef<Value>,
+  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
                   ConversionPatternRewriter &rewriter) const override {
     auto dpsOp = dyn_cast<DestinationStyleOpInterface>(op);
     if (!dpsOp || dpsOp.getDpsInputs().size() != 2 ||
@@ -700,7 +780,23 @@ struct ConvertLinalgElementwiseToBits : public ConversionPattern {
         return failure();
       numElems *= d;
     }
-    const int64_t lanes = kElementwiseTileLanes;
+    // Where the operand came from has to be asked of the converted operand:
+    // by the time this runs the nest that produced it is already a
+    // `bits.assemble`, and the unconverted value this op still names is the
+    // linalg op that used to be there.
+    Value fromProducer = zeroIsRhs ? lhs : rhs;
+    if (operands.size() == op->getNumOperands())
+      fromProducer = zeroIsRhs ? operands[0] : operands[1];
+    // The driver has no order to it, so this can be reached while the nest
+    // that produces the operand is still a linalg op. Its tiling is not
+    // knowable until it is one, so wait: the driver retries a pattern whose
+    // operands moved, and a producer that never converts fails the pass for
+    // that reason rather than this one.
+    if (stillUnconverted(fromProducer))
+      return rewriter.notifyMatchFailure(
+          op, "the nest producing this operand has not been converted yet, so "
+              "the tiling it will use is not known");
+    const int64_t lanes = tileLanesFor(fromProducer);
     if (numElems % lanes != 0)
       return rewriter.notifyMatchFailure(
           op, "element count must be a multiple of the bank row width");
@@ -2253,37 +2349,72 @@ struct ConvertLinalgToBits
 
     kFrontendWideAdd = wideAdd;
 
-    RewritePatternSet patterns(&ctx);
-    patterns.add<ConvertLinalgMatmulToBits, ConvertLinalgMatvecToBits,
-                 ConvertLinalgFillToBits, ConvertLinalgGenericTruncToBits,
-                 ConvertLinalgGenericToBits, EraseDeadLinalgGeneric>(&ctx);
-    patterns.add<ConvertLinalgConv2DNchwFchwToBits>(&ctx, laneDim);
-    patterns.add<ConvertLinalgElementwiseToBits>(&ctx, "linalg.add");
-    patterns.add<ConvertLinalgElementwiseToBits>(&ctx, "linalg.sub");
-    patterns.add<ConvertLinalgElementwiseToBits>(&ctx, "linalg.mul");
-    patterns.add<ConvertLinalgElementwiseToBits>(&ctx, "linalg.max");
-    patterns.add<ConvertLinalgPopcountToBits>(&ctx);
-    patterns.add<ConvertLinalgRangeScanToBits>(&ctx);
-    patterns.add<ConvertLinalgMinMaxReduceToBits>(&ctx);
-    patterns.add<ConvertLinalgSquaredDistanceToBits>(&ctx);
-    patterns.add<ConvertLinalgBinaryDotToBits>(&ctx);
+    // Two rounds. An elementwise op has to be cut into the tiles the nest that
+    // produces its operand used, and that is not knowable while the operand is
+    // still a linalg op -- the driver legalises in no order worth relying on,
+    // and does not come back to a pattern whose operands have since moved. So
+    // the producers are converted first, and the consumers see nests.
+    auto isElementwise = [](Operation *op) {
+      StringRef name = op->getName().getStringRef();
+      // `linalg.fill` waits with them: a ReLU is recognised as max(x, 0), and
+      // it can only see the zero while the fill that makes it is still a fill.
+      return name == "linalg.add" || name == "linalg.sub" ||
+             name == "linalg.mul" || name == "linalg.max" ||
+             name == "linalg.fill";
+    };
 
-    ConversionTarget target(ctx);
-    target.markUnknownOpDynamicallyLegal([](...) { return true; });
-    target.addLegalDialect<BitsDialect>();
-    target.addLegalOp<linalg::BroadcastOp>();
-    // Data-layout ops emitted by the conv lowering; they carry no compute.
-    target.addLegalOp<linalg::TransposeOp>();
-    target.addDynamicallyLegalOp<linalg::GenericOp>([](linalg::GenericOp op) {
-      return isExtSIGeneric(op) || isTruncIGeneric(op);
-    });
-    target.addDynamicallyLegalOp<linalg::YieldOp>(
-        [](linalg::YieldOp) { return true; });
-    // target.addIllegalOp<linalg::GenericOp>();
-    target.addIllegalDialect<linalg::LinalgDialect>();
+    auto buildTarget = [&](bool elementwiseLegal) {
+      auto target = std::make_unique<ConversionTarget>(ctx);
+      target->markUnknownOpDynamicallyLegal([](...) { return true; });
+      target->addLegalDialect<BitsDialect>();
+      if (elementwiseLegal) {
+        // Dialect-level, so the per-op settings below still take precedence.
+        target->addDynamicallyLegalDialect<linalg::LinalgDialect>(
+            [&](Operation *op) { return isElementwise(op); });
+      } else {
+        target->addIllegalDialect<linalg::LinalgDialect>();
+      }
+      target->addLegalOp<linalg::BroadcastOp>();
+      // Data-layout ops emitted by the conv lowering; they carry no compute.
+      target->addLegalOp<linalg::TransposeOp>();
+      target->addDynamicallyLegalOp<linalg::GenericOp>([](linalg::GenericOp op) {
+        return isExtSIGeneric(op) || isTruncIGeneric(op);
+      });
+      target->addDynamicallyLegalOp<linalg::YieldOp>(
+          [](linalg::YieldOp) { return true; });
+      return target;
+    };
 
-    if (applyPartialConversion(func, target, std::move(patterns)).failed()) {
+    RewritePatternSet producers(&ctx);
+    producers.add<ConvertLinalgMatmulToBits, ConvertLinalgMatvecToBits,
+                  ConvertLinalgGenericTruncToBits, ConvertLinalgGenericToBits,
+                  EraseDeadLinalgGeneric>(&ctx);
+    producers.add<ConvertLinalgConv2DNchwFchwToBits>(&ctx, laneDim);
+    producers.add<ConvertLinalgPopcountToBits>(&ctx);
+    producers.add<ConvertLinalgRangeScanToBits>(&ctx);
+    producers.add<ConvertLinalgMinMaxReduceToBits>(&ctx);
+    producers.add<ConvertLinalgSquaredDistanceToBits>(&ctx);
+    producers.add<ConvertLinalgBinaryDotToBits>(&ctx);
+
+    auto producerTarget = buildTarget(/*elementwiseLegal=*/true);
+    if (applyPartialConversion(func, *producerTarget, std::move(producers))
+            .failed()) {
       signalPassFailure();
+      return;
+    }
+
+    RewritePatternSet consumers(&ctx);
+    consumers.add<EraseDeadLinalgGeneric, ConvertLinalgFillToBits>(&ctx);
+    consumers.add<ConvertLinalgElementwiseToBits>(&ctx, "linalg.add");
+    consumers.add<ConvertLinalgElementwiseToBits>(&ctx, "linalg.sub");
+    consumers.add<ConvertLinalgElementwiseToBits>(&ctx, "linalg.mul");
+    consumers.add<ConvertLinalgElementwiseToBits>(&ctx, "linalg.max");
+
+    auto consumerTarget = buildTarget(/*elementwiseLegal=*/false);
+    if (applyPartialConversion(func, *consumerTarget, std::move(consumers))
+            .failed()) {
+      signalPassFailure();
+      return;
     }
 
     // removeUnnecessaryAssembles(func);
