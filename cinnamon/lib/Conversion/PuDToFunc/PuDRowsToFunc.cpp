@@ -69,8 +69,17 @@ struct RowSpace {
   int64_t dataRowsPerBank = 0;
   int64_t rowStride = 0;
 
-  /// Bytes from one row of the space to the next: a row exists in every bank.
-  int64_t period() const { return rowStride * totalBanks; }
+  /// Bytes from one row of the space to the next.
+  ///
+  /// A row exists in every bank of the channel, not only in the banks this
+  /// kernel was given: what turns an address back into a bank and a row is the
+  /// controller's decode, and that counts in banks per channel. Laying the
+  /// rows out any denser than that puts the second row of bank 0 in some other
+  /// bank -- at eight banks of a thirty-two-bank channel, in bank eight -- and
+  /// every row op after the first names rows the kernel never meant. The banks
+  /// the kernel does not use are a hole in the space, which costs address
+  /// range and nothing else.
+  int64_t period() const { return rowStride * banksPerChannel; }
   /// Rows the substrate reserves, which sit at the front of the space.
   static int64_t controlRows() { return pud::controlRowCount(); }
 };
