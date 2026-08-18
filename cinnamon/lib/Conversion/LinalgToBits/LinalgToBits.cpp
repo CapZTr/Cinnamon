@@ -630,17 +630,42 @@ static constexpr int64_t kElementwiseTileLanes = 8192;
 // row whatever width the slice claims, and the interleaved tiling below already
 // lays tiles out the way `bits.assemble` reads them, so the same reasoning that
 // makes tile `t` every T-th element holds for any T.
-static int64_t producerTileLanes(Value tensor) {
+struct ProducerTiling {
+  int64_t lanes = 0;
+  /// Whether a transpose stands between the producer's `bits.assemble` and
+  /// here. `bits.assemble` lays <T x slice<W x L>> out as <L x T>, so without
+  /// one a tile is every T-th element and with one it is a contiguous run of L
+  /// -- and whichever way the operand was laid out, the result has to be laid
+  /// back the same way.
+  bool transposed = false;
+};
+
+static ProducerTiling producerTileLanes(Value tensor) {
+  ProducerTiling none;
+  ProducerTiling found;
   for (unsigned step = 0; tensor && step < 32; ++step) {
     Operation *def = tensor.getDefiningOp();
     if (!def)
-      return 0;
+      return none;
     if (auto assemble = dyn_cast<AssembleOp>(def)) {
       auto tiles = dyn_cast<RankedTensorType>(assemble.getInput().getType());
       if (!tiles || tiles.getRank() != 1)
-        return 0;
+        return none;
       auto slice = dyn_cast<SliceType>(tiles.getElementType());
-      return slice ? slice.getVectorLength() : 0;
+      if (!slice)
+        return none;
+      found.lanes = slice.getVectorLength();
+      return found;
+    }
+    if (auto transpose = dyn_cast<linalg::TransposeOp>(def)) {
+      // Only the 2-D flip the conv lowering emits; anything else is a
+      // permutation this cannot undo on the way out.
+      ArrayRef<int64_t> perm = transpose.getPermutation();
+      if (perm.size() != 2 || perm[0] != 1 || perm[1] != 0)
+        return none;
+      found.transposed = !found.transposed;
+      tensor = transpose.getInput();
+      continue;
     }
     if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(def)) {
       tensor = collapse.getSrc();
@@ -654,9 +679,9 @@ static int64_t producerTileLanes(Value tensor) {
       tensor = castOp.getSource();
       continue;
     }
-    return 0;
+    return none;
   }
-  return 0;
+  return none;
 }
 
 // Whether a tensor still comes from a linalg op this pass is going to rewrite.
@@ -689,11 +714,13 @@ static bool stillUnconverted(Value tensor) {
   return false;
 }
 
-// The tile width to cut a consumed tensor into: its producer's, when it has
-// one, and the full bank row otherwise.
-static int64_t tileLanesFor(Value tensor) {
-  int64_t lanes = producerTileLanes(tensor);
-  return lanes > 0 ? lanes : kElementwiseTileLanes;
+// How to cut a consumed tensor into tiles: its producer's way, when it has a
+// producer, and full bank rows otherwise.
+static ProducerTiling tileLanesFor(Value tensor) {
+  ProducerTiling tiling = producerTileLanes(tensor);
+  if (tiling.lanes <= 0)
+    tiling.lanes = kElementwiseTileLanes;
+  return tiling;
 }
 
 // Elementwise linalg named ops (linalg.add / linalg.mul / ...) -> a tiled
@@ -796,7 +823,8 @@ struct ConvertLinalgElementwiseToBits : public ConversionPattern {
       return rewriter.notifyMatchFailure(
           op, "the nest producing this operand has not been converted yet, so "
               "the tiling it will use is not known");
-    const int64_t lanes = tileLanesFor(fromProducer);
+    const ProducerTiling tiling = tileLanesFor(fromProducer);
+    const int64_t lanes = tiling.lanes;
     if (numElems % lanes != 0)
       return rewriter.notifyMatchFailure(
           op, "element count must be a multiple of the bank row width");
@@ -842,9 +870,17 @@ struct ConvertLinalgElementwiseToBits : public ConversionPattern {
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPointToStart(forOp.getBody());
       Value iv = forOp.getInductionVar();
+      // Interleaved by default, because that is how `bits.assemble` reads a
+      // tile back. A producer whose result was transposed on the way out laid
+      // its tiles down contiguously instead, so follow it.
       SmallVector<OpFoldResult> offsets{iv};
       SmallVector<OpFoldResult> sizes{rewriter.getIndexAttr(lanes)};
       SmallVector<OpFoldResult> strides{rewriter.getIndexAttr(tiles)};
+      if (tiling.transposed) {
+        Value lanesCst = getOrCreateIndexConstant(rewriter, loc, lanes);
+        offsets[0] = rewriter.create<arith::MulIOp>(loc, iv, lanesCst).getResult();
+        strides[0] = rewriter.getIndexAttr(1);
+      }
       Value dataFlat = isMax ? (zeroIsRhs ? lhsFlat : rhsFlat) : lhsFlat;
       Value lhsTile = rewriter.create<tensor::ExtractSliceOp>(
           loc, tileTensorTy, dataFlat, offsets, sizes, strides);
@@ -908,6 +944,18 @@ struct ConvertLinalgElementwiseToBits : public ConversionPattern {
     auto assembledTy = RankedTensorType::get({lanes, tiles}, elemTy);
     Value assembled =
         rewriter.create<AssembleOp>(loc, assembledTy, forOp.getResult(0));
+    if (tiling.transposed) {
+      // Put it back the way it was read: the tiles were taken contiguously, so
+      // <L x T> has to become <T x L> before it collapses to the element order
+      // the rest of the function expects. A transpose is a layout change and
+      // carries no compute, exactly like the one the conv lowering emits.
+      Value init = rewriter.create<tensor::EmptyOp>(
+          loc, ArrayRef<int64_t>{tiles, lanes}, elemTy);
+      assembled = rewriter
+                      .create<linalg::TransposeOp>(loc, assembled, init,
+                                                   ArrayRef<int64_t>{1, 0})
+                      ->getResult(0);
+    }
     SmallVector<ReassociationIndices> backRe = {{0, 1}};
     Value flat1d = rewriter.create<tensor::CollapseShapeOp>(loc, flat1dTy,
                                                             assembled, backRe);
