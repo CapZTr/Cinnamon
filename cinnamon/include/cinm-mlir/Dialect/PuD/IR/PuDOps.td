@@ -65,6 +65,27 @@ def RowCopyOp : PuD_Op<"row_copy", [Pure]> {
   let hasVerifier = 1;
 }
 
+def RowStreamOp : PuD_Op<"row_stream", [Pure]> {
+  let summary = "One half of a copy whose ends are in different channels";
+  let description = [{
+    A `pud.row_copy` names two rows and leaves the substrate to work out what
+    moving between them costs. That works while one controller owns both: it
+    can reach the row it is reading. Rows in different channels are owned by
+    different controllers and neither can see the other's, so the copy is two
+    commands rather than one -- the row streamed out of the source channel, and
+    the row streamed into the destination channel, each addressed to the
+    controller that owns it. Each occupies its own channel's data bus for a
+    whole row, and the two pipeline.
+
+    `out` distinguishes the halves: reading the row out of the source, or
+    writing it into the destination.
+  }];
+
+  let arguments = (ins RowType:$addr, UnitAttr:$out, PuD_BackendAttr:$backend);
+
+  let assemblyFormat = "$addr attr-dict `:` qualified(type($addr))";
+}
+
 def APOp : PuD_Op<"AP", [Pure]> {
   let summary = "Activate ; Precharge";
   let description = [{

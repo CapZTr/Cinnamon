@@ -1045,13 +1045,20 @@ public:
   void emitAcrossBanks(OpBuilder &builder, Location loc, bool isAp,
                        const RowLoc &dst, const RowLoc &src, IRMapping &map) {
     Value step = builder.create<arith::ConstantIndexOp>(loc, 1);
+    int64_t perChannel = std::max<int64_t>(1, geometry.banksPerChannel);
     for (auto [from, to] : bankRanges()) {
-      Value lb = builder.create<arith::ConstantIndexOp>(loc, from);
-      Value ub = builder.create<arith::ConstantIndexOp>(loc, to);
+      // A range is within one channel, so the channel is a constant here and
+      // the loop counts the banks of it. Counting flat banks instead and
+      // dividing would put a division and a multiply by the channel's span in
+      // the innermost loop of the kernel, on a machine wide enough for the
+      // division not to fold -- which is every machine this is for.
+      int64_t channel = from / perChannel;
+      Value lb = builder.create<arith::ConstantIndexOp>(loc, from - channel * perChannel);
+      Value ub = builder.create<arith::ConstantIndexOp>(loc, to - channel * perChannel);
       builder.create<scf::ForOp>(
           loc, lb, ub, step, ValueRange{},
           [&](OpBuilder &b, Location bodyLoc, Value iv, ValueRange) {
-            BankCoord coord = decomposeBank(b, bodyLoc, iv);
+            BankCoord coord = bankInChannel(b, bodyLoc, channel, iv);
             Value dstAddr = materialise(b, bodyLoc, dst, coord, map);
             if (isAp) {
               b.create<pud::APOp>(bodyLoc, dstAddr, pud::Backend::Simdram);
@@ -1098,10 +1105,29 @@ public:
                 coord.channel, coord.rank, coord.bank, coord.subarray,
                 b.create<arith::AddIOp>(bodyLoc, base, row));
           };
+          int64_t perChannel = std::max<int64_t>(1, geometry.banksPerChannel);
+          int64_t total = std::max<int64_t>(1, geometry.totalBanks);
+          auto channelOf = [&](int64_t bank) {
+            return (((bank % total) + total) % total) / perChannel;
+          };
           for (auto [srcBank, dstBank] : edges) {
             Value src = rowIn(srcBank, srcRun);
             Value dst = rowIn(dstBank, dstRun);
-            b.create<pud::RowCopyOp>(bodyLoc, src, dst, pud::Backend::Simdram);
+            // One controller owns both ends, or neither owns both. A copy
+            // within a channel is the one command it looks like; across
+            // channels neither controller can reach the other's row, so it is
+            // the row out of one and the row into the other, each addressed to
+            // the controller that owns it. This is the expansion the trace
+            // player has always replayed a cross-channel copy as.
+            if (channelOf(srcBank) == channelOf(dstBank)) {
+              b.create<pud::RowCopyOp>(bodyLoc, src, dst,
+                                       pud::Backend::Simdram);
+            } else {
+              b.create<pud::RowStreamOp>(bodyLoc, src, /*out=*/true,
+                                         pud::Backend::Simdram);
+              b.create<pud::RowStreamOp>(bodyLoc, dst, /*out=*/false,
+                                         pud::Backend::Simdram);
+            }
           }
           b.create<scf::YieldOp>(bodyLoc);
         });
@@ -1148,8 +1174,12 @@ private:
     flat.erase(llvm::unique(flat), flat.end());
 
     SmallVector<std::pair<int64_t, int64_t>> ranges;
+    int64_t perChannel = std::max<int64_t>(1, geometry.banksPerChannel);
     for (int64_t bank : flat) {
-      if (!ranges.empty() && ranges.back().second == bank)
+      // A range never crosses a channel: the loop that runs it takes its
+      // channel as a constant, and one loop cannot have two.
+      if (!ranges.empty() && ranges.back().second == bank &&
+          ranges.back().first / perChannel == bank / perChannel)
         ranges.back().second = bank + 1;
       else
         ranges.push_back({bank, bank + 1});
@@ -1157,16 +1187,12 @@ private:
     return ranges;
   }
 
-  /// Splits a flat bank index into that coordinate. The mapping numbers banks
-  /// flatly and a channel holds a fixed number of them, so the index divides on
-  /// that boundary.
-  BankCoord decomposeBank(OpBuilder &b, Location loc, Value iv) {
-    Value flat = b.create<arith::IndexCastOp>(loc, b.getI64Type(), iv);
-    Value perChannel =
-        b.create<arith::ConstantIntOp>(loc, geometry.banksPerChannel, 64);
+  /// A bank counted out within a channel that is known here.
+  BankCoord bankInChannel(OpBuilder &b, Location loc, int64_t channel,
+                          Value iv) {
     BankCoord coord;
-    coord.channel = b.create<arith::DivSIOp>(loc, flat, perChannel);
-    coord.bank = b.create<arith::RemSIOp>(loc, flat, perChannel);
+    coord.channel = b.create<arith::ConstantIntOp>(loc, channel, 64);
+    coord.bank = b.create<arith::IndexCastOp>(loc, b.getI64Type(), iv);
     // Ranks and subarrays are part of the coordinate; nothing distributes over
     // them yet, so every address takes the first of each.
     coord.rank = b.create<arith::ConstantIntOp>(loc, 0, 64);
@@ -2444,10 +2470,21 @@ struct ConvertBitsRowsToPuD
       // The stride the machine decodes rows at, which is the machine's to say
       // and not this pass's -- the option is an override for asking what some
       // other row size would cost.
-      module->setAttr("pud.row_stride",
-                      builder.getI64IntegerAttr(
-                          rowStride > 0 ? (int64_t)rowStride
-                                        : geometry->rowStride));
+      int64_t stride =
+          rowStride > 0 ? (int64_t)rowStride : geometry->rowStride;
+      module->setAttr("pud.row_stride", builder.getI64IntegerAttr(stride));
+      // What one channel's controller owns, which is what separates a bank in
+      // one channel from the same-numbered bank in the next. It is the span a
+      // subarray's rows take across a channel's banks, rounded up to a power of
+      // two -- the same figure both gem5 configurations compute, because the
+      // controller's geometry checks want it that way.
+      int64_t channelRows = std::max<int64_t>(1, subarrayRows);
+      int64_t channelSpan = channelRows * geometry->banksPerChannel * stride;
+      int64_t channelSize = 1;
+      while (channelSize < channelSpan)
+        channelSize <<= 1;
+      module->setAttr("pud.channel_size",
+                      builder.getI64IntegerAttr(channelSize));
     }
   }
 };

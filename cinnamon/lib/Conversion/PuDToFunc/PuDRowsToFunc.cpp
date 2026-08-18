@@ -68,6 +68,10 @@ struct RowSpace {
   int64_t totalBanks = 0;
   int64_t dataRowsPerBank = 0;
   int64_t rowStride = 0;
+  /// Bytes one channel's controller owns. A bank of channel c is this much
+  /// further into the space than the same bank of channel c-1, which is what
+  /// puts a row op in the hands of the controller that owns the rows it names.
+  int64_t channelSize = 0;
 
   /// Bytes from one row of the space to the next.
   ///
@@ -96,7 +100,8 @@ FailureOr<RowSpace> readRowSpace(ModuleOp module) {
   if (!get("pud.banks_per_channel", space.banksPerChannel) ||
       !get("pud.total_banks", space.totalBanks) ||
       !get("pud.data_rows_per_bank", space.dataRowsPerBank) ||
-      !get("pud.row_stride", space.rowStride)) {
+      !get("pud.row_stride", space.rowStride) ||
+      !get("pud.channel_size", space.channelSize)) {
     module.emitError() << "no row space on the module; run "
                           "convert-bits-rows-to-pud first";
     return failure();
@@ -161,15 +166,6 @@ void declareArena(ModuleOp module) {
       /*dsoLocal=*/true);
 }
 
-/// The bank a coordinate names, as one index over the whole memory -- the same
-/// flattening the mapping numbered banks with.
-Value flattenBank(OpBuilder &builder, Location loc, Value channel, Value bank,
-                  int64_t banksPerChannel) {
-  Value perChannel =
-      builder.create<arith::ConstantIntOp>(loc, banksPerChannel, 64);
-  Value inChannels = builder.create<arith::MulIOp>(loc, channel, perChannel);
-  return builder.create<arith::AddIOp>(loc, inChannels, bank);
-}
 
 /// The base of the row space, loaded once per function.
 ///
@@ -198,19 +194,31 @@ private:
   DenseMap<Operation *, Value> bases;
 };
 
-/// Where a row of the space is: its index times the period, plus the bank.
+/// Where a row of the space is: its channel, then its index times the period,
+/// plus the bank within the channel.
+///
+/// The same arithmetic the trace player's slotAddr does, and for the same
+/// reason: a row op is routed to the controller that owns the address it
+/// carries, and each controller owns one channel's worth of the space. Laying
+/// the rows out without the channel term puts every bank of a multi-channel
+/// kernel in the first channel, where the second one's rows have no place --
+/// which is a page fault at 64 banks and was as far as this path went.
 ///
 /// `rowInSpace` counts from the front of the space, where the substrate's
 /// reserved rows are, so a data row is offset past them.
 Value rowAddress(OpBuilder &builder, Location loc, const RowSpace &space,
-                 Value base, Value rowInSpace, Value bank) {
+                 Value base, Value rowInSpace, Value channel, Value bank) {
   auto ptrType = LLVM::LLVMPointerType::get(builder.getContext());
   Value period = builder.create<arith::ConstantIntOp>(loc, space.period(), 64);
   Value stride =
       builder.create<arith::ConstantIntOp>(loc, space.rowStride, 64);
+  Value channelSpan =
+      builder.create<arith::ConstantIntOp>(loc, space.channelSize, 64);
   Value offset = builder.create<arith::AddIOp>(
-      loc, builder.create<arith::MulIOp>(loc, rowInSpace, period),
-      builder.create<arith::MulIOp>(loc, bank, stride));
+      loc, builder.create<arith::MulIOp>(loc, channel, channelSpan),
+      builder.create<arith::AddIOp>(
+          loc, builder.create<arith::MulIOp>(loc, rowInSpace, period),
+          builder.create<arith::MulIOp>(loc, bank, stride)));
   return builder.create<LLVM::GEPOp>(loc, ptrType, builder.getI8Type(), base,
                                      ArrayRef<LLVM::GEPArg>{LLVM::GEPArg(offset)},
                                      /*inbounds=*/true);
@@ -226,14 +234,14 @@ struct GetRowLowering : public OpConversionPattern<GetRowOp> {
   matchAndRewrite(GetRowOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    Value bank = flattenBank(rewriter, loc, adaptor.getChannelID(),
-                             adaptor.getBankID(), space.banksPerChannel);
     // Past the rows the substrate reserves, which are at the front.
     Value first = rewriter.create<arith::ConstantIntOp>(
         loc, RowSpace::controlRows(), 64);
     Value row = rewriter.create<arith::AddIOp>(loc, first, adaptor.getRowID());
     Value base = arena.get(rewriter, op->getParentOfType<func::FuncOp>());
-    rewriter.replaceOp(op, rowAddress(rewriter, loc, space, base, row, bank));
+    rewriter.replaceOp(op, rowAddress(rewriter, loc, space, base, row,
+                                      adaptor.getChannelID(),
+                                      adaptor.getBankID()));
     return success();
   }
 
@@ -251,12 +259,12 @@ struct GetCtrlRowLowering : public OpConversionPattern<GetCtrlRowOp> {
   matchAndRewrite(GetCtrlRowOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    Value bank = flattenBank(rewriter, loc, adaptor.getChannelID(),
-                             adaptor.getBankID(), space.banksPerChannel);
     Value row = rewriter.create<arith::ConstantIntOp>(
         loc, static_cast<int64_t>(op.getCtrlRow()), 64);
     Value base = arena.get(rewriter, op->getParentOfType<func::FuncOp>());
-    rewriter.replaceOp(op, rowAddress(rewriter, loc, space, base, row, bank));
+    rewriter.replaceOp(op, rowAddress(rewriter, loc, space, base, row,
+                                      adaptor.getChannelID(),
+                                      adaptor.getBankID()));
     return success();
   }
 
@@ -270,6 +278,8 @@ enum RowOpcode : unsigned {
   kAP = 0x60,
   kAAP = 0x61,
   kRowCopy = 0x62,
+  kRowRdStream = 0x6f,
+  kRowWrStream = 0x70,
 };
 
 struct AAPLowering : public OpConversionPattern<AAPOp> {
@@ -297,6 +307,21 @@ struct RowCopyLowering : public OpConversionPattern<RowCopyOp> {
                   ConversionPatternRewriter &rewriter) const override {
     emitRowOp(rewriter, op.getLoc(), kRowCopy,
               ValueRange{adaptor.getDstAddr(), adaptor.getSrcAddr()});
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+/// Half of a copy between channels: one address, and which end of it this is.
+struct RowStreamLowering : public OpConversionPattern<RowStreamOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(RowStreamOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    emitRowOp(rewriter, op.getLoc(),
+              op.getOut() ? kRowRdStream : kRowWrStream,
+              ValueRange{adaptor.getAddr()});
     rewriter.eraseOp(op);
     return success();
   }
@@ -351,6 +376,7 @@ struct ConvertPuDRowsToFunc
                            scf::SCFDialect, LLVM::LLVMDialect>();
 
     RewritePatternSet patterns(ctx);
+    patterns.add<RowStreamLowering>(converter, ctx);
     patterns.add<GetRowLowering, GetCtrlRowLowering>(converter, ctx, space,
                                                     arena);
     patterns.add<AAPLowering, APLowering, RowCopyLowering>(converter, ctx);
