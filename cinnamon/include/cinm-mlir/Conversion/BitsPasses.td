@@ -53,11 +53,14 @@ def ConvertBitsRowsToPuD
     Option<"backend", "backend", "std::string", /*default=*/"\"simdram\"",
            "PuD substrate whose row-op templates are instantiated. Must match "
            "the backend the mapping was priced for.">,
-    Option<"rowStride", "row-stride", "int64_t", /*default=*/"8192",
+    Option<"rowStride", "row-stride", "int64_t", /*default=*/"0",
            "Bytes from one bank's row to the next bank's, which is the row "
            "size of the substrate. The rows a kernel addresses are laid out at "
            "this stride, so this is what turns a row coordinate into an "
-           "address; it travels with the IR for whatever realises them.">,
+           "address; it travels with the IR for whatever realises them. Zero "
+           "takes the machine's own -- 8 kB on DDR4, 1 kB on HBM -- which the "
+           "mapping recorded; anything else asks what another row size would "
+           "cost, and will not decode on the machine that was mapped for.">,
     Option<"rowsPerSubarray", "rows-per-subarray", "int64_t", /*default=*/"512",
            "Rows a subarray holds. A row op drives a whole subarray's sense "
            "amplifiers, so every row it names has to be in one -- the rows it "

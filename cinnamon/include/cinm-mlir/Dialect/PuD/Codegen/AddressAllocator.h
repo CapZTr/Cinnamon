@@ -47,6 +47,11 @@ struct MemoryGeometry {
   /// Ranks per channel. Not yet distributed over -- every address takes rank 0
   /// -- but part of the coordinate.
   int64_t ranksPerChannel = 1;
+  /// Bytes from one bank's row to the next bank's: the rank's row buffer. It is
+  /// what the controller decodes a bank and a row out of an address with, so
+  /// rows laid out at any other stride land in banks the kernel did not name.
+  /// 8 kB on DDR4 x64, 1 kB on HBM.
+  int64_t rowStride = 8192;
 };
 
 /// Hands out rows for a computation, and resolves the flat bank indices the

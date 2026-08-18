@@ -52,6 +52,12 @@ static constexpr int64_t kMaxIlpNodesPerLoopBody = 16;
 
 static int64_t kNumBanks = 32;
 static int64_t kBanksPerChannel = 32;        // ddr: 32, hbm: 16
+// Bytes from one bank's row to the next bank's: the rank's row buffer, which is
+// the device's times the devices in a rank. It is what the memory controller
+// decodes an address's bank and row out of, so a kernel that lays its rows out
+// at any other stride names rows in banks it was never given. DDR4 x64 is 1 kB
+// across 8 devices, HBM 1 kB across one.
+static int64_t kRowStride = 8192;            // ddr: 8192, hbm: 1024
 static int64_t kCopyCostIntraChPerBit = 19;  // same-channel inter-bank; hbm: 6
 static int64_t kCopyCostCrossChPerBit = 10;  // cross-channel;           hbm: 3
 
@@ -2863,10 +2869,12 @@ struct BitsOptimiseMappingPass
     }
     if (memType == "ddr") {
       kBanksPerChannel = 32;
+      kRowStride = 8192;
       kCopyCostIntraChPerBit = 19;
       kCopyCostCrossChPerBit = 10;
     } else if (memType == "hbm") {
       kBanksPerChannel = 16;
+      kRowStride = 1024;
       kCopyCostIntraChPerBit = 6;
       kCopyCostCrossChPerBit = 3;
     } else {
@@ -2963,6 +2971,8 @@ struct BitsOptimiseMappingPass
                                    builder.getI64IntegerAttr(kBanksPerChannel)),
               builder.getNamedAttr("ranks_per_channel",
                                    builder.getI64IntegerAttr(1)),
+              builder.getNamedAttr("row_stride",
+                                   builder.getI64IntegerAttr(kRowStride)),
           }));
     }
     DAG dag;

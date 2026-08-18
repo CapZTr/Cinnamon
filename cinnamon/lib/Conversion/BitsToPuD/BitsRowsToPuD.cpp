@@ -1712,7 +1712,8 @@ FailureOr<pud::MemoryGeometry> readGeometry(func::FuncOp func) {
   };
   if (!get("total_banks", geometry.totalBanks) ||
       !get("banks_per_channel", geometry.banksPerChannel) ||
-      !get("ranks_per_channel", geometry.ranksPerChannel)) {
+      !get("ranks_per_channel", geometry.ranksPerChannel) ||
+      !get("row_stride", geometry.rowStride)) {
     func.emitError() << "memory geometry is missing a field";
     return failure();
   }
@@ -2440,7 +2441,13 @@ struct ConvertBitsRowsToPuD
                       builder.getI64IntegerAttr(geometry->banksPerChannel));
       module->setAttr("pud.total_banks",
                       builder.getI64IntegerAttr(geometry->totalBanks));
-      module->setAttr("pud.row_stride", builder.getI64IntegerAttr(rowStride));
+      // The stride the machine decodes rows at, which is the machine's to say
+      // and not this pass's -- the option is an override for asking what some
+      // other row size would cost.
+      module->setAttr("pud.row_stride",
+                      builder.getI64IntegerAttr(
+                          rowStride > 0 ? (int64_t)rowStride
+                                        : geometry->rowStride));
     }
   }
 };
