@@ -1881,6 +1881,94 @@ LogicalResult emitReduceTree(OpBuilder &builder, Location loc,
   return success();
 }
 
+/// Whether the nests that hand each other data were planned to the same shape.
+///
+/// A nest writes its result with the bank left open: one tile per bank per
+/// pass, tile `t` in the `t`-th of the banks it was mapped onto. The nest that
+/// reads that result addresses those rows the same way, so the two only ever
+/// name the same tile if they agree on which bank holds which one, and on how
+/// many each bank holds. The mapping plans them separately, so agreeing is not
+/// automatic.
+///
+/// This cannot be left to `verifyReadsHaveWriters`. That check is about rows,
+/// and a consumer that covers a fraction of the tiles, or covers them in a
+/// different order, still reads nothing but rows that were written -- which is
+/// exactly how the ReLU covering eight of sixty-four tiles passed it. What
+/// found that was the op count; this is the check that would have.
+LogicalResult verifyNestShapesAgree(MutableArrayRef<MappedLoop> loops,
+                                    const RowBinder &binder,
+                                    int64_t totalBanks) {
+  auto normalise = [&](ArrayRef<int64_t> banks) {
+    SmallVector<int64_t> out;
+    int64_t total = std::max<int64_t>(1, totalBanks);
+    for (int64_t bank : banks)
+      out.push_back(((bank % total) + total) % total);
+    return out;
+  };
+  // How many tiles of the operand each bank holds once the nest is done. Every
+  // wave of a reduction folds into the one accumulator, so a reduction leaves
+  // one per pass; anything else leaves one per wave.
+  auto tilesPerBank = [&](MappedLoop &mapped) {
+    bool reduces = llvm::any_of(
+        mapped.loop.getBody()->without_terminator(),
+        [](Operation &op) { return op.hasAttr("bits.is_reduce_op"); });
+    return (reduces ? 1 : mapped.waves) * mapped.repeat;
+  };
+
+  SmallVector<llvm::DenseSet<int64_t>> reads(loops.size()), writes(loops.size());
+  for (auto [i, mapped] : llvm::enumerate(loops)) {
+    mapped.loop.getBody()->walk([&, i = i](InsertRowOp insert) {
+      if (const SliceLoc *loc = binder.sliceFor(insert.getSlice()))
+        if (!loc->broadcast)
+          writes[i].insert(loc->base);
+    });
+    mapped.loop.getBody()->walk([&, i = i](ExtractRowOp extract) {
+      if (const SliceLoc *loc = binder.sliceFor(extract.getSlice()))
+        if (!loc->broadcast)
+          reads[i].insert(loc->base);
+    });
+  }
+
+  LogicalResult result = success();
+  for (size_t consumer = 1; consumer < loops.size(); ++consumer) {
+    // A fold of an earlier nest's result reads every bank that nest wrote and
+    // brings them together; it is not one tile per bank and has nothing to
+    // agree about. Its banks are the producer's by construction -- the tree
+    // names them.
+    if (loops[consumer].loop->hasAttr("bits.cross_nest_reduce"))
+      continue;
+    for (size_t producer = 0; producer < consumer; ++producer) {
+      if (llvm::none_of(reads[consumer], [&](int64_t run) {
+            return writes[producer].contains(run);
+          }))
+        continue;
+      SmallVector<int64_t> want = normalise(loops[producer].banks);
+      SmallVector<int64_t> have = normalise(loops[consumer].banks);
+      if (want != have) {
+        loops[consumer].loop.emitError()
+            << "reads a nest that ran on other banks: this nest holds tile t "
+               "in bank "
+            << (have.empty() ? -1 : have[0]) << " onwards over " << have.size()
+            << " banks, the nest it reads left it in bank "
+            << (want.empty() ? -1 : want[0]) << " onwards over " << want.size()
+            << "; every row it reads was written, but not by the tile it means";
+        result = failure();
+        continue;
+      }
+      int64_t wantTiles = tilesPerBank(loops[producer]);
+      int64_t haveTiles = tilesPerBank(loops[consumer]);
+      if (wantTiles != haveTiles) {
+        loops[consumer].loop.emitError()
+            << "reads a nest that left a different number of tiles in each "
+               "bank: this nest takes "
+            << haveTiles << " per bank, the nest it reads left " << wantTiles;
+        result = failure();
+      }
+    }
+  }
+  return result;
+}
+
 //===----------------------------------------------------------------------===//
 // Pass
 //===----------------------------------------------------------------------===//
@@ -1949,6 +2037,9 @@ struct ConvertBitsRowsToPuD
     // Everything is bound and nothing has been emitted, which is the only
     // moment at which both where a value lives and where it came from are known.
     if (failed(verifyReadsHaveWriters(func, binder, unemitted)))
+      return signalPassFailure();
+    if (failed(verifyNestShapesAgree(*mappedLoops, binder,
+                                     geometry->totalBanks)))
       return signalPassFailure();
 
     // The new body is built beside the old one and swapped in at the end. It is
