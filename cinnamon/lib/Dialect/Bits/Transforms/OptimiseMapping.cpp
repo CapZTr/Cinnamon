@@ -1947,6 +1947,26 @@ static scf::ForOp producerLoopOf(Value tensor) {
       tensor = castOp.getSource();
       continue;
     }
+    // An op this does not know is still on the way back to a nest when there is
+    // only one place it could have come from. A `linalg.transpose` -- which is
+    // how the spatial convolution layout hands its result on -- reads one
+    // tensor and writes into a `tensor.empty`, so the empty is not an input and
+    // what is left names the producer. Anything with two real inputs is two
+    // nests at once and there is no single answer to give.
+    Value only;
+    unsigned inputs = 0;
+    for (Value operand : def->getOperands()) {
+      if (!isa<TensorType>(operand.getType()))
+        continue;
+      if (operand.getDefiningOp<tensor::EmptyOp>())
+        continue;
+      only = operand;
+      ++inputs;
+    }
+    if (inputs == 1) {
+      tensor = only;
+      continue;
+    }
     return {};
   }
   return {};
@@ -2051,6 +2071,143 @@ static SmallVector<int64_t> crossNestReduceBanks(scf::ForOp lp) {
   if (failed(tripMaybe) || *tripMaybe + 1 != (int64_t)banks.size())
     return none;
   return banks;
+}
+
+// Every bank a nest's schedule runs on, in the order the row-op emitter counts
+// them out: one group of `parallel_factor` banks holds one instance of the
+// schedule, and the enclosing loop's iterations put `concurrent_groups` of them
+// side by side, `bank_group_stride` apart. A reduction's group is the banks its
+// tree names; without a tree the group starts where the ILP put it.
+static SmallVector<int64_t> mappedNestBanks(scf::ForOp mapped) {
+  SmallVector<int64_t> banks;
+  if (!mapped)
+    return banks;
+  auto readAttr = [&](StringRef name, int64_t fallback) {
+    auto attr = mapped->getAttrOfType<IntegerAttr>(name);
+    return attr ? std::max<int64_t>(1, attr.getInt()) : fallback;
+  };
+  int64_t perGroup = readAttr("bits.parallel_factor", 1);
+  int64_t stride = readAttr("bits.bank_group_stride", perGroup);
+  int64_t groups = readAttr("bits.concurrent_groups", 1);
+
+  SmallVector<int64_t> group;
+  if (auto treeAttr = mapped->getAttrOfType<ArrayAttr>("bits.reduce_tree")) {
+    llvm::SmallDenseSet<int64_t> seen;
+    for (Attribute levelAttr : treeAttr) {
+      auto level = dyn_cast<ArrayAttr>(levelAttr);
+      if (!level)
+        continue;
+      for (Attribute pairAttr : level) {
+        auto pair = dyn_cast<DictionaryAttr>(pairAttr);
+        if (!pair)
+          continue;
+        for (StringRef end : {"src_bank", "dst_bank"})
+          if (auto bank = dyn_cast_or_null<IntegerAttr>(pair.get(end)))
+            if (seen.insert(bank.getInt()).second)
+              group.push_back(bank.getInt());
+      }
+    }
+    llvm::sort(group);
+  }
+  if (group.empty()) {
+    int64_t base = 0;
+    if (auto bankAttr = mapped->getAttrOfType<IntegerAttr>("bits.bank_id"))
+      base = bankAttr.getInt();
+    for (int64_t i = 0; i < perGroup; ++i)
+      group.push_back(base + i);
+  }
+  for (int64_t g = 0; g < groups; ++g)
+    for (int64_t bank : group)
+      banks.push_back(bank + g * stride);
+  return banks;
+}
+
+// The nest whose result a nest reads, when it reads one nest's result and no
+// other's. Two producers at once is a layout question this cannot answer, so it
+// answers nothing.
+static scf::ForOp producerNestOf(scf::ForOp nest) {
+  scf::ForOp producer;
+  bool ambiguous = false;
+  nest.getBody()->walk([&](tensor::ExtractSliceOp extract) {
+    scf::ForOp from = producerLoopOf(extract.getSource());
+    if (!from || from == nest || nest->isAncestor(from) ||
+        from->isAncestor(nest))
+      return;
+    if (producer && producer != from)
+      ambiguous = true;
+    producer = from;
+  });
+  return ambiguous ? scf::ForOp() : producer;
+}
+
+// Whether a bank list is a run of consecutive banks, which is the only shape
+// one `bits.bank_id` can move.
+static bool isContiguousRun(ArrayRef<int64_t> banks) {
+  for (size_t i = 1; i < banks.size(); ++i)
+    if (banks[i] != banks[0] + (int64_t)i)
+      return false;
+  return !banks.empty();
+}
+
+// A nest that reads an earlier nest's result runs on the banks that result is
+// in -- the non-reducing half of what `crossNestReduceBanks` does for a fold.
+//
+// The mapping plans every nest on its own, so the ReLU that consumes a
+// convolution was given a bank group of its own, starting wherever the ILP
+// happened to put it. It reads the right rows either way -- every bank holds
+// its share of the convolution at the same row -- but not the right bank's
+// share of them: tile `i` is computed in the producer's bank `i % groups` and
+// read back in the consumer's, and those are the same bank only when the two
+// groups start together.
+//
+// Nothing else about the consumer moves: the group it was given is the same
+// size as the producer's, so it keeps its own wave count and its own share of
+// the tiles, and only the bank the group starts at is taken from the producer.
+// A consumer whose group is a different size is a layout mismatch this cannot
+// paper over, and is left alone for the row-op lowering's shape check to name.
+static void placeConsumersOnProducerBanks(func::FuncOp func,
+                                          Builder &attrBuilder) {
+  SmallVector<scf::ForOp> nests;
+  func.walk([&](scf::ForOp forOp) {
+    if (!forOp->hasAttr("bits.parallel_factor"))
+      return;
+    // The nest is the outermost annotated loop; an annotated loop inside one is
+    // where that nest's schedule lives, not a nest of its own.
+    for (Operation *parent = forOp->getParentOp(); parent;
+         parent = parent->getParentOp())
+      if (auto parentFor = dyn_cast<scf::ForOp>(parent))
+        if (parentFor->hasAttr("bits.parallel_factor"))
+          return;
+    nests.push_back(forOp);
+  });
+
+  for (scf::ForOp nest : nests) {
+    scf::ForOp mapped = mappedLoopOf(nest);
+    if (!mapped)
+      mapped = nest;
+    // A fold of an earlier nest's result has already been put on that nest's
+    // banks, by name; re-deriving a base for it would move it off them.
+    if (mapped->hasAttr("bits.cross_nest_reduce") ||
+        mapped->hasAttr("bits.reduce_tree"))
+      continue;
+    scf::ForOp producer = producerNestOf(nest);
+    if (!producer)
+      continue;
+    scf::ForOp producerMapped = mappedLoopOf(producer);
+    if (!producerMapped)
+      producerMapped = producer;
+
+    SmallVector<int64_t> want = mappedNestBanks(producerMapped);
+    SmallVector<int64_t> have = mappedNestBanks(mapped);
+    if (want.size() != have.size() || want == have)
+      continue;
+    if (!isContiguousRun(want) || !isContiguousRun(have))
+      continue;
+    auto bankAttr = mapped->getAttrOfType<IntegerAttr>("bits.bank_id");
+    int64_t base = bankAttr ? bankAttr.getInt() : 0;
+    mapped->setAttr("bits.bank_id",
+                    attrBuilder.getI64IntegerAttr(base + want[0] - have[0]));
+  }
 }
 
 // Critical-path cost of the inter-bank reduce tree for `banks` consecutive
@@ -3221,6 +3378,12 @@ struct BitsOptimiseMappingPass
         if (banks.size() > 1)
           annotateCrossNestReduce(forOp, banks);
       });
+
+      // And the same for a nest that does not fold what it reads: a ReLU runs
+      // where the convolution left its output, not on a group of its own. This
+      // comes last so that it reads the placements every walk above it wrote,
+      // the cross-nest folds included.
+      placeConsumersOnProducerBanks(func, attrBuilder);
 
       // Mark the accumulator op inside each slice-reduction loop body so the
       // dispatcher can distinguish regular compute work from reduction steps.
