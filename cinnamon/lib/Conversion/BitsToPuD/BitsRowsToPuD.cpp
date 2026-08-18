@@ -240,7 +240,7 @@ public:
   /// the accumulator is private; without them, the accumulator IS this bank's
   /// element and the addend only ever arrives in the tree's staging run.
   void beginNest(scf::ForOp mappedLoop, int64_t waves, int64_t repeat,
-                 bool hasFoldingWaves, bool reduces, bool operandPerWave) {
+                 bool hasFoldingWaves, bool operandPerWave) {
     foldingWaves = hasFoldingWaves;
     nestWaves = std::max<int64_t>(1, waves);
     nestRepeat = std::max<int64_t>(1, repeat);
@@ -260,14 +260,14 @@ public:
       if (auto parentFor = dyn_cast<scf::ForOp>(parent))
         passes.push_back(parentFor.getInductionVar());
 
-    // What an operand the mapped loop indexes costs. A reduction's waves fold
-    // into one accumulator, and an accumulator cannot follow its addends from
-    // subarray to subarray, so giving every wave its own rows only works while
-    // they all fit in one -- which for a reduction of any depth they do not.
-    // Giving the pass its own rows always fits, and leaves the waves within a
-    // pass reading the tile the pass staged.
-    Advance perWave =
-        (!reduces || operandPerWave) ? Advance::PerWave : Advance::PerPass;
+    // What the waves of a pass read, and where what they produce goes. With the
+    // operand resident each wave has its own rows of it and computes the answer
+    // the kernel is for; without, the waves of a pass share one set and compute
+    // on the same tile as many times as there are waves. That second mode is
+    // not a smaller version of the first -- it is a model of what the schedule
+    // costs, kept for the kernels whose operand does not fit in a subarray at
+    // any bank count, where the alternative is nothing at all.
+    Advance perWave = operandPerWave ? Advance::PerWave : Advance::PerPass;
     mappedLoop.getBody()->walk([&](TransposeOp transpose) {
       Value from = transpose.getInput();
       if (dependsOn(from, wave))
@@ -289,7 +289,7 @@ public:
     mappedLoop.getBody()->walk([&](tensor::InsertOp insert) {
       if (Value run = runWrittenBy(insert.getScalar()))
         if (!plan.count(run))
-          plan[run] = Advance::PerWave;
+          plan[run] = perWave;
     });
   }
 
@@ -2197,7 +2197,7 @@ struct ConvertBitsRowsToPuD
           mapped.loop.getBody()->without_terminator(),
           [](Operation &op) { return op.hasAttr("bits.is_reduce_op"); });
       binder.beginNest(mapped.loop, mapped.waves, mapped.repeat,
-                       !reduces || mapped.waves > mapped.seedWaves, reduces,
+                       !reduces || mapped.waves > mapped.seedWaves,
                        operandPerWave);
       if (failed(binder.bindCarried(mapped.loop)) ||
           failed(binder.bind(*mapped.loop.getBody())))
@@ -2383,14 +2383,18 @@ struct ConvertBitsRowsToPuD
     // the machine.
     int64_t dataRows = allocator.rowsAllocated(layoutBank);
     int64_t reserved = pud::controlRowCount();
-    if (rowsPerSubarray > 0 && reserved + dataRows > rowsPerSubarray) {
+    int64_t subarrayRows = rowsPerSubarray;
+    if (subarrayRows > 0 && reserved + dataRows > subarrayRows) {
       func.emitError()
           << "the kernel addresses " << dataRows << " rows a bank, which with "
           << reserved << " reserved for computation is " << (reserved + dataRows)
-          << " in a subarray of " << rowsPerSubarray
+          << " in a subarray of " << subarrayRows
           << "; a row op cannot name rows in two subarrays, so every row of "
-             "this kernel has to be in one. Fewer passes -- more banks -- is "
-             "what makes a kernel fit";
+             "this kernel has to be in one. More banks is what makes an "
+             "operand fit; a kernel too big to be resident at any bank count "
+             "can still be measured with operand-per-wave=false, which shares "
+             "a pass's rows between its waves and so computes on the same tile "
+             "several times over";
       return signalPassFailure();
     }
 

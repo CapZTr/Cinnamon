@@ -64,12 +64,16 @@ def ConvertBitsRowsToPuD
            "reserves for computation included, and those are at the front of "
            "the space. That makes this the number of rows a kernel has to fit "
            "in, not a number it may exceed at a cost.">,
-    Option<"operandPerWave", "operand-per-wave", "bool", /*default=*/"false",
+    Option<"operandPerWave", "operand-per-wave", "bool", /*default=*/"true",
            "Give every wave of a reduction its own rows of the operand it "
-           "reads, rather than every pass. The dataflow is then complete -- no "
-           "two waves read the same values -- but the operand of a reduction "
-           "of any depth does not fit in a subarray, so this is for measuring "
-           "what residency would cost, not for a kernel that has to run.">
+           "reads, rather than one set per pass that its waves share. On means "
+           "the operand is resident and no two waves read the same values, "
+           "which is what a kernel has to be to compute the right answer; it "
+           "costs rows, and a kernel whose operand does not fit in a subarray "
+           "is told so. Off shares a pass's rows between its waves, which fits "
+           "anything but computes on the same tile several times over -- for a "
+           "kernel too big to be resident, where what is wanted is the "
+           "schedule's cost rather than its result.">
   ];
 }
 
