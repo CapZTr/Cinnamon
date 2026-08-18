@@ -796,9 +796,59 @@ RowOpTemplate buildSubtractor() {
   return tmpl;
 }
 
+/// One BitWeaving range-scan bit step, five commands.
+///
+///   R' = maj(R,  v, !lower[j])     ">= lower"
+///   S' = maj(S, !v,  upper[j])     "<= upper"
+///
+/// The two chains want opposite senses of the value, and there are only two
+/// dual-contact cells -- both already holding a chain -- so there is nowhere to
+/// put `v` to get `!v` for free. Carry the second chain COMPLEMENTED instead:
+/// complementing a majority complements all three of its inputs, so
+///
+///   !S' = maj(!S, v, !upper[j])
+///
+/// and now both chains read the same `v`, which one command puts in both rows
+/// they read it from. The cell holds !S and row DCC1N reads S, which is what the
+/// bindings say and what the fold reads; nothing downstream sees the difference.
+///
+///   1. AAP(T2_T3 <- v)        one command, both the rows the chains read
+///   2. AAP(T1 <- !lower[j])
+///   3. AP (DCC0_T1_T3)        maj(R, !lower, v) -> DCC0, T1, T3
+///   4. AAP(T0 <- !upper[j])
+///   5. AP (DCC1_T0_T2)        maj(!S, !upper, v) -> DCC1, T0, T2
+///
+/// Step 3 destroys T3, which is why `v` is in T2 as well; nothing else in the
+/// sequence writes a row a later step reads.
+///
+/// lime schedules seven, spending two of them moving R out of cell 0 to make
+/// room for `v` and then putting it back. Worth writing out for more than the
+/// two commands: lime's four variants do not share a command mix -- two are five
+/// AAPs and two APs, two are six and one -- and the trace player cannot know a
+/// bound's bits, so there is no sequence it could replay that would agree with
+/// all four. These five are the same shape whatever the bounds are.
+RowOpTemplate buildRangeScanStep(bool lowerBit, bool upperBit) {
+  RowOpTemplate tmpl;
+  tmpl.instrs = {
+      aap(ctrl(ControlRow::T2_T3), RowOperand::input(0)),
+      aap(ctrl(ControlRow::T1),
+          ctrl(lowerBit ? ControlRow::C_0 : ControlRow::C_1)),
+      ap(ControlRow::DCC0_T1_T3),
+      aap(ctrl(ControlRow::T0),
+          ctrl(upperBit ? ControlRow::C_0 : ControlRow::C_1)),
+      ap(ControlRow::DCC1_T0_T2),
+  };
+  tmpl.numInputs = 3;
+  tmpl.numOutputs = 2;
+  tmpl.inputBindings = {RowOperand::input(0), ctrl(ControlRow::DCC0),
+                        ctrl(ControlRow::DCC1N)};
+  tmpl.outputBindings = {ctrl(ControlRow::DCC0), ctrl(ControlRow::DCC1N)};
+  return tmpl;
+}
+
 /// Folds the two range-scan chains into the match mask: `mask = R AND S`.
 ///
-///   1. AAP(T3 <- DCC1)             T3 = the "<= upper" chain
+///   1. AAP(T3 <- DCC1N)            T3 = the "<= upper" chain
 ///   2. AAP(T1 <- C_0)
 ///   3. AAP(out0 <- DCC0_T1_T3)     maj(R, 0, S) = R AND S
 ///
@@ -807,16 +857,19 @@ RowOpTemplate buildSubtractor() {
 /// both. Written out because lime would be given a three-input majority with no
 /// way to know two of its operands are already sitting in cells, and would pay a
 /// command restating one of them.
+///
+/// It reads the second chain from the cell's complementing contact because that
+/// is the side the chain is kept on -- see buildRangeScanStep.
 RowOpTemplate buildScanFold() {
   RowOpTemplate tmpl;
   tmpl.instrs = {
-      aap(ctrl(ControlRow::T3), ctrl(ControlRow::DCC1)),
+      aap(ctrl(ControlRow::T3), ctrl(ControlRow::DCC1N)),
       aap(ctrl(ControlRow::T1), ctrl(ControlRow::C_0)),
       aap(RowOperand::output(0), ctrl(ControlRow::DCC0_T1_T3)),
   };
   tmpl.numInputs = 2;
   tmpl.numOutputs = 1;
-  tmpl.inputBindings = {ctrl(ControlRow::DCC0), ctrl(ControlRow::DCC1)};
+  tmpl.inputBindings = {ctrl(ControlRow::DCC0), ctrl(ControlRow::DCC1N)};
   tmpl.outputBindings = {RowOperand::output(0)};
   return tmpl;
 }
@@ -899,6 +952,14 @@ std::optional<RowOpTemplate> getHandWrittenTemplate(PudBackend backend,
     return buildEquality(/*negated=*/true);
   case RowOpKind::FullSub:
     return buildSubtractor();
+  case RowOpKind::RangeScan00:
+    return buildRangeScanStep(/*lowerBit=*/false, /*upperBit=*/false);
+  case RowOpKind::RangeScan01:
+    return buildRangeScanStep(/*lowerBit=*/false, /*upperBit=*/true);
+  case RowOpKind::RangeScan10:
+    return buildRangeScanStep(/*lowerBit=*/true, /*upperBit=*/false);
+  case RowOpKind::RangeScan11:
+    return buildRangeScanStep(/*lowerBit=*/true, /*upperBit=*/true);
   case RowOpKind::ScanFold:
     return buildScanFold();
   case RowOpKind::GreaterStep:
@@ -1099,12 +1160,13 @@ unsigned mlir::bits::getReferenceCommands(PudBackend backend, RowOpKind kind) {
   //
   //  * row_xor's 7 is inferred from the XNOR sequence by symmetry -- the
   //    simulator has no expansion for XOR.
-  //  * the range-scan step's 4 is a timing skeleton, not a working sequence:
-  //    expandRangeScan's second per-bit command writes C_0 into the (!DCC1, T1)
-  //    group, which drives DCC1 -- the ">= lower" accumulator -- to 1 on every
-  //    iteration, so that chain never advances and the emitted mask depends on
-  //    the "<= upper" chain alone. The simulator has no functional semantics for
-  //    row ops, so nothing downstream could have caught it.
+  //  * the range-scan step's 4 WAS a timing skeleton rather than a working
+  //    sequence -- expandRangeScan's second per-bit command wrote C_0 into the
+  //    (!DCC1, T1) group, driving the ">= lower" accumulator to 1 every
+  //    iteration so that chain never advanced, and no step read the bounds at
+  //    all. It is now the same five-command sequence as here, written in that
+  //    player's row groups, so the 5 below is a reference again rather than a
+  //    reminder.
   if (backend != PudBackend::Simdram)
     return 0;
   switch (kind) {
@@ -1126,7 +1188,7 @@ unsigned mlir::bits::getReferenceCommands(PudBackend backend, RowOpKind kind) {
   case RowOpKind::RangeScan01:
   case RowOpKind::RangeScan10:
   case RowOpKind::RangeScan11:
-    return 4;                             // timing skeleton, see above
+    return 5;                             // expandRangeScan, per bit
   case RowOpKind::ScanFold:
     return 0;   // the simulator folds over its own row groups, not as a step
   default:

@@ -891,9 +891,13 @@ LogicalResult RowBinder::bindOp(Operation *op) {
     }
     if (auto step = dyn_cast<RowScanStepOp>(op)) {
       // Both chains stay in their cells for the whole scan; the template names
-      // them, so neither result is ever placed anywhere else.
+      // them, so neither result is ever placed anywhere else. The "<= upper"
+      // chain is kept on its cell's complementing contact -- the step's two
+      // majorities then read the same value rather than a value and its
+      // complement, which no third cell was free to supply. See
+      // buildRangeScanStep.
       rows[step.getGeOut()] = RowLoc::controlRow(ControlRow::DCC0);
-      rows[step.getLeOut()] = RowLoc::controlRow(ControlRow::DCC1);
+      rows[step.getLeOut()] = RowLoc::controlRow(ControlRow::DCC1N);
       return success();
     }
     if (auto sub = dyn_cast<RowSubOp>(op)) {
@@ -1583,8 +1587,12 @@ LogicalResult ScheduleEmitter::emit(ArrayRef<Operation *> ops,
         ge = fold.getGe();
         le = fold.getLe();
       }
+      // The "<= upper" chain is kept complemented, on its cell's other
+      // contact, so that both of a step's majorities read the value rather than
+      // one of them its complement -- staging it anywhere else would turn the
+      // cell over once a bit for nothing. See buildRangeScanStep.
       if (ge && (failed(stageInto(builder, loc, ge, ControlRow::DCC0, map)) ||
-                 failed(stageInto(builder, loc, le, ControlRow::DCC1, map))))
+                 failed(stageInto(builder, loc, le, ControlRow::DCC1N, map))))
         return op.emitError() << "a range scan's chain is not in a row the "
                                  "scan step can be given it from";
 

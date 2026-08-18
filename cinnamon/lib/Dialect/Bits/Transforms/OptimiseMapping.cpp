@@ -443,11 +443,11 @@ static int64_t getComputeLatency(Operation *op) {
       return *c;
     return (prada ? 10 : 7) * width;
   }
-  // BitWeaving range scan: per scanned bit plane, load the plane, write one
-  // branch-dependent selector row and advance each of the two comparison
-  // chains by one majority -- 4 commands on SIMDRAM, 6 on PRADA (which needs
-  // ~v rebuilt and both operands staged per bit), plus chain seeding and mask
-  // finalisation. Priced off the INPUT width -- the result is a one-bit mask,
+  // BitWeaving range scan: per scanned bit plane, put the plane in the two rows
+  // the chains read it from, write a branch-dependent selector row for each and
+  // advance both comparison chains by one majority -- 5 commands on SIMDRAM, 6
+  // on PRADA (which needs ~v rebuilt and both operands staged per bit), plus
+  // chain seeding and mask finalisation. Priced off the INPUT width -- the result is a one-bit mask,
   // so the result width says nothing about the work. The scanned constants do
   // not appear: every branch of the per-bit case analysis emits the same
   // command count.
@@ -455,7 +455,7 @@ static int64_t getComputeLatency(Operation *op) {
     int64_t L = getSliceBitwidth(scan.getInput());
     if (auto c = limeRecipeCost(bits::getRecipeForRangeScan(L)))
       return *c;
-    return prada ? 6 * L + 6 : 4 * L + 5;
+    return prada ? 6 * L + 6 : 5 * L + 5;
   }
   // Bit-serial min/max = compare then select. The comparator is one majority
   // gate per bit (3 commands on either substrate) and a 3-majority mux selects
