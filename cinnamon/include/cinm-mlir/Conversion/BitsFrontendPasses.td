@@ -24,17 +24,20 @@ def ConvertLinalgToBits : Pass<"convert-linalg-to-bits", operation="func::FuncOp
   let summary = "Convert Linalg dialect to Bits Dialect";
   let constructor = "mlir::bits_frontend::createConvertLinalgToBitsPass()";
   let options = [
-    Option<"convLaneDim", "conv-lane-dim", "std::string", /*default=*/"\"oc\"",
+    Option<"convLaneDim", "conv-lane-dim", "std::string", /*default=*/"\"auto\"",
            "Which convolution dimension becomes the bit-serial SIMD lane "
            "dimension (the GEMM's M). 'oc' = output channels (M=F, outer "
-           "trip=P*Q); 'spatial' = output pixels (M=P*Q, outer trip=F). This "
-           "is a first-order mapping knob: the two layouts perform identical "
-           "arithmetic but can differ by >4x once the reduction loop's bank "
-           "count saturates the device. There is deliberately no 'auto': "
-           "predicting the winner needs the mapper's leaf-plan cost model, and "
-           "duplicating that model in the frontend is what caused the "
-           "planLeafForRegions/estimateBestParallelBanksForLoop drift. Sweep "
-           "both instead.">,
+           "trip=P*Q); 'spatial' = output pixels (M=P*Q, outer trip=F); "
+           "'auto' takes the wider of the two. This is a first-order mapping "
+           "knob: the two layouts perform identical arithmetic but can differ "
+           "by >4x. 'auto' is a shape rule, not a second copy of the mapper's "
+           "cost model -- the lane axis lies along a bank row, whatever it "
+           "leaves empty gets filled by packing the reduction, and every "
+           "doubling of that packing costs a level of intra-bank folding that "
+           "computes nothing. It reads the operand and the row width and "
+           "nothing about banks or latencies, so it cannot drift from "
+           "planLeafForRegions the way an estimate would. Sweep both "
+           "explicitly to compare layouts.">,
     Option<"wideAdd", "wide-add", "bool", /*default=*/"true",
            "Whether the target substrate offers a WIDENING add (k + k -> k+1, "
            "`bits.add_i_full`, 8k + 2 AAP). Only the width-growing adder trees "

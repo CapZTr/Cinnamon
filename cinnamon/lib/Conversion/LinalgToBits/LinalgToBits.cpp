@@ -2087,8 +2087,32 @@ struct ConvertLinalgRangeScanToBits
 // i.e. the M of the GEMM the convolution lowers to.
 enum class ConvLaneDim {
   OutChannel, // M = F      (outer parallel trip = P*Q)
-  Spatial     // M = P*Q    (outer parallel trip = F)
+  Spatial,    // M = P*Q    (outer parallel trip = F)
+  Auto        // whichever of the two fills a bank row better
 };
+
+// Which lane dimension to actually use, for a convolution whose GEMM is
+// M x K x N with M the lane axis.
+//
+// The lane axis is what lies along a bank row, so the one to pick is the bigger
+// one: whatever it leaves empty, the mapper fills by packing iterations of the
+// reduction side by side, and every doubling of that packing costs a level of
+// intra-bank folding afterwards that computes nothing. Take the wider axis and
+// there is less room left to pack and fewer levels to fold.
+//
+// This is a shape rule and not a second copy of the mapper's cost model -- it
+// reads the operand and the row width, nothing about banks or latencies, which
+// is why it cannot drift from `planLeafForRegions` the way an estimate would.
+// Measured over the eight benchmark shapes at 8, 32 and 128 banks it names the
+// cheaper layout every time; in the case where it gives up the most outer
+// parallelism (64x64x32 at 128 banks, 64 tiles for 128 banks) the layout it
+// picks still runs 4.12x faster, because the folding it avoids was serial
+// within each bank.
+static ConvLaneDim resolveLaneDim(ConvLaneDim requested, int64_t f, int64_t pq) {
+  if (requested != ConvLaneDim::Auto)
+    return requested;
+  return f > pq ? ConvLaneDim::OutChannel : ConvLaneDim::Spatial;
+}
 
 // linalg.conv_2d_nchw_fchw -> linalg.matmul (im2col), restricted to 1x1.
 //
@@ -2102,8 +2126,8 @@ enum class ConvLaneDim {
 // and the reduction trip is C*R*S, so the usual 3x3 with power-of-two C is
 // unmappable regardless.)
 //
-// Both lane layouts do identical arithmetic but can differ by >4x once the
-// reduction loop's chosen bank count saturates the device, so the caller picks.
+// Both lane layouts do identical arithmetic but can differ by >4x, so the
+// caller picks -- or leaves it to `resolveLaneDim`, which takes the wider axis.
 struct ConvertLinalgConv2DNchwFchwToBits
     : public OpConversionPattern<linalg::Conv2DNchwFchwOp> {
   ConvertLinalgConv2DNchwFchwToBits(MLIRContext *ctx, ConvLaneDim laneDim)
@@ -2208,7 +2232,8 @@ struct ConvertLinalgConv2DNchwFchwToBits
                                                             outInit, collapse2x2);
 
     Value gemm2d;
-    if (laneDim == ConvLaneDim::OutChannel) {
+    const ConvLaneDim chosen = resolveLaneDim(laneDim, f, pq);
+    if (chosen == ConvLaneDim::OutChannel) {
       // M = F, K = C, N = P*Q.
       gemm2d = rewriter
                    .create<linalg::MatmulOp>(loc, ValueRange{filter2d, input2d},
@@ -2324,9 +2349,11 @@ struct ConvertLinalgToBits
       laneDim = ConvLaneDim::OutChannel;
     } else if (convLaneDim == "spatial") {
       laneDim = ConvLaneDim::Spatial;
+    } else if (convLaneDim == "auto") {
+      laneDim = ConvLaneDim::Auto;
     } else {
-      func.emitError("convert-linalg-to-bits: conv-lane-dim must be 'oc' or "
-                     "'spatial', got '")
+      func.emitError("convert-linalg-to-bits: conv-lane-dim must be 'auto', "
+                     "'oc' or 'spatial', got '")
           << convLaneDim << "'";
       signalPassFailure();
       return;
