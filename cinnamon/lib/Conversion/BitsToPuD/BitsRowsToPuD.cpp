@@ -43,6 +43,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "cinm-mlir/Conversion/BitsToPuD/BitsToPuD.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "cinm-mlir/Dialect/Bits/Codegen/RowOpLibrary.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
@@ -2054,6 +2055,76 @@ LogicalResult emitFold(OpBuilder &builder, Location loc, RowOpEmitter &emitter,
   return success();
 }
 
+/// An upper bound on the value `v` can take, or nothing if it cannot be bounded.
+///
+/// Everything a row index is built from here is non-negative and has constant
+/// bounds -- constants, additions and multiplications of them, and the
+/// induction variables of `scf.for`s whose bounds are constants -- so a bound
+/// is a walk over that arithmetic.
+static std::optional<int64_t> upperBoundOf(Value v) {
+  if (!v)
+    return 0;
+  if (auto cast = v.getDefiningOp<arith::IndexCastOp>())
+    return upperBoundOf(cast.getIn());
+  if (auto c = v.getDefiningOp<arith::ConstantIntOp>())
+    return c.value();
+  if (auto c = v.getDefiningOp<arith::ConstantIndexOp>())
+    return c.value();
+  if (auto add = v.getDefiningOp<arith::AddIOp>()) {
+    auto a = upperBoundOf(add.getLhs()), b = upperBoundOf(add.getRhs());
+    if (a && b)
+      return *a + *b;
+    return std::nullopt;
+  }
+  if (auto mul = v.getDefiningOp<arith::MulIOp>()) {
+    auto a = upperBoundOf(mul.getLhs()), b = upperBoundOf(mul.getRhs());
+    if (a && b)
+      return *a * *b;
+    return std::nullopt;
+  }
+  // The induction variable of a loop with a constant bound: its largest value
+  // is one step short of that bound.
+  if (auto arg = dyn_cast<BlockArgument>(v)) {
+    if (auto forOp = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp())) {
+      if (arg == forOp.getInductionVar()) {
+        auto hi = upperBoundOf(forOp.getUpperBound());
+        if (hi)
+          return *hi > 0 ? *hi - 1 : 0;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+/// How deep the row space of `func` has to be: one past the highest row any
+/// `pud.get_row` in it can name.
+///
+/// This reads the emitted IR rather than counting what was handed out. The two
+/// are not the same -- a run is reserved as `rows * copies` but an address adds
+/// an offset and a row index on top of the pass term, and rows are also built
+/// straight from a loop variable in the reduction tree's copies, which never
+/// went through the allocator at all. Counting allocations left the row space
+/// too shallow, and a kernel whose addresses run past it is given an arena it
+/// writes off the end of, or names a row past its channel and reaches the next
+/// controller. Reading the addresses cannot be bypassed by a new way of
+/// building one.
+static std::optional<int64_t> rowSpaceDepth(func::FuncOp func) {
+  int64_t depth = 0;
+  bool unbounded = false;
+  func.walk([&](pud::GetRowOp row) {
+    auto hi = upperBoundOf(row.getRowID());
+    if (!hi) {
+      unbounded = true;
+      return WalkResult::interrupt();
+    }
+    depth = std::max(depth, *hi + 1);
+    return WalkResult::advance();
+  });
+  if (unbounded)
+    return std::nullopt;
+  return depth;
+}
+
 /// Issues everything that happens after a bank has run all its waves.
 ///
 /// First the packed lanes are folded within each bank, then the banks fold into
@@ -2439,7 +2510,21 @@ struct ConvertBitsRowsToPuD
     // cost. Saying so here turns what would otherwise be an assertion failing
     // deep inside a simulated run into a number that can be compared against
     // the machine.
+    // How deep the row space has to be. Read off the addresses that were built,
+    // not off what the allocator handed out: taking the allocator's figure is
+    // what let bnn_i1 at 128 banks be given an arena it wrote off the end of,
+    // and popcount on HBM at 32 banks name a row past its channel and reach the
+    // next controller. If some address cannot be bounded the allocator's figure
+    // is all there is, and it is a floor either way.
     int64_t dataRows = allocator.rowsAllocated(layoutBank);
+    if (auto depth = rowSpaceDepth(func))
+      dataRows = std::max(dataRows, *depth);
+    else
+      func.emitWarning() << "a row address could not be bounded, so the row "
+                            "space is only as deep as the rows handed out ("
+                         << dataRows
+                         << "); a kernel whose addresses run past that will "
+                            "write outside the arena it is given";
     int64_t reserved = pud::controlRowCount();
     int64_t subarrayRows = rowsPerSubarray;
     if (subarrayRows > 0 && reserved + dataRows > subarrayRows) {
