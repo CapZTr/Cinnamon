@@ -214,12 +214,21 @@ Value rowAddress(OpBuilder &builder, Location loc, const RowSpace &space,
       builder.create<arith::ConstantIntOp>(loc, space.rowStride, 64);
   Value channelSpan =
       builder.create<arith::ConstantIntOp>(loc, space.channelSize, 64);
+  // The channel term is a separate step so that it can leave the loop when the
+  // channel does not change in it. Folded into one offset it cannot: the sum
+  // also holds the row and the bank, so the loop keeps an add it does not
+  // need, and with the channel counted out by a loop rather than a constant
+  // that add is the difference between six instructions a row op and ten.
+  Value channelBase = builder.create<LLVM::GEPOp>(
+      loc, ptrType, builder.getI8Type(), base,
+      ArrayRef<LLVM::GEPArg>{
+          LLVM::GEPArg(builder.create<arith::MulIOp>(loc, channel, channelSpan))},
+      /*inbounds=*/true);
   Value offset = builder.create<arith::AddIOp>(
-      loc, builder.create<arith::MulIOp>(loc, channel, channelSpan),
-      builder.create<arith::AddIOp>(
-          loc, builder.create<arith::MulIOp>(loc, rowInSpace, period),
-          builder.create<arith::MulIOp>(loc, bank, stride)));
-  return builder.create<LLVM::GEPOp>(loc, ptrType, builder.getI8Type(), base,
+      loc, builder.create<arith::MulIOp>(loc, rowInSpace, period),
+      builder.create<arith::MulIOp>(loc, bank, stride));
+  return builder.create<LLVM::GEPOp>(loc, ptrType, builder.getI8Type(),
+                                     channelBase,
                                      ArrayRef<LLVM::GEPArg>{LLVM::GEPArg(offset)},
                                      /*inbounds=*/true);
 }

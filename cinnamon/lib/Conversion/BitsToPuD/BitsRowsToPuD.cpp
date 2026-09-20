@@ -1047,27 +1047,64 @@ public:
                        const RowLoc &dst, const RowLoc &src, IRMapping &map) {
     Value step = builder.create<arith::ConstantIndexOp>(loc, 1);
     int64_t perChannel = std::max<int64_t>(1, geometry.banksPerChannel);
-    for (auto [from, to] : bankRanges()) {
+    SmallVector<std::pair<int64_t, int64_t>> ranges = bankRanges();
+
+    auto emitOne = [&](OpBuilder &b, Location bodyLoc, const BankCoord &coord) {
+      Value dstAddr = materialise(b, bodyLoc, dst, coord, map);
+      if (isAp) {
+        b.create<pud::APOp>(bodyLoc, dstAddr, pud::Backend::Simdram);
+      } else {
+        Value srcAddr = materialise(b, bodyLoc, src, coord, map);
+        b.create<pud::AAPOp>(bodyLoc, srcAddr, dstAddr, pud::Backend::Simdram);
+      }
+    };
+
+    // Every channel running the same banks is the shape a bank group spread
+    // over whole channels always has, and then the channel is a loop variable
+    // rather than another copy of the loop. It has to be one or the other: the
+    // channel is a term of every address, and counting flat banks and dividing
+    // would put a division and a multiply by the channel's span in the
+    // innermost loop of the kernel. Nesting it outside pays neither -- the
+    // channel term is loop-invariant in the bank loop -- and issues the banks
+    // in the same order the copies did, one channel's after another's, so the
+    // commands are the same commands. What changes is only how much code says
+    // them: a kernel on four channels was four copies of every row-op
+    // instruction, which took popcount's inner loops from 34 kB to 138 kB and
+    // out of a 32 kB instruction cache, and cost more than the misses' own
+    // latency because each miss is a DRAM read into the controller that is
+    // running the row ops.
+    if (std::optional<ChannelSlice> slice = channelSlice(ranges)) {
+      Value cLb =
+          builder.create<arith::ConstantIndexOp>(loc, slice->firstChannel);
+      Value cUb = builder.create<arith::ConstantIndexOp>(
+          loc, slice->firstChannel + slice->channels);
+      Value lb = builder.create<arith::ConstantIndexOp>(loc, slice->lb);
+      Value ub = builder.create<arith::ConstantIndexOp>(loc, slice->ub);
+      builder.create<scf::ForOp>(
+          loc, cLb, cUb, step, ValueRange{},
+          [&](OpBuilder &b, Location chLoc, Value channelIv, ValueRange) {
+            b.create<scf::ForOp>(
+                chLoc, lb, ub, step, ValueRange{},
+                [&](OpBuilder &bb, Location bodyLoc, Value iv, ValueRange) {
+                  emitOne(bb, bodyLoc,
+                          bankInChannel(bb, bodyLoc, channelIv, iv));
+                  bb.create<scf::YieldOp>(bodyLoc);
+                });
+            b.create<scf::YieldOp>(chLoc);
+          });
+      return;
+    }
+
+    for (auto [from, to] : ranges) {
       // A range is within one channel, so the channel is a constant here and
-      // the loop counts the banks of it. Counting flat banks instead and
-      // dividing would put a division and a multiply by the channel's span in
-      // the innermost loop of the kernel, on a machine wide enough for the
-      // division not to fold -- which is every machine this is for.
+      // the loop counts the banks of it.
       int64_t channel = from / perChannel;
       Value lb = builder.create<arith::ConstantIndexOp>(loc, from - channel * perChannel);
       Value ub = builder.create<arith::ConstantIndexOp>(loc, to - channel * perChannel);
       builder.create<scf::ForOp>(
           loc, lb, ub, step, ValueRange{},
           [&](OpBuilder &b, Location bodyLoc, Value iv, ValueRange) {
-            BankCoord coord = bankInChannel(b, bodyLoc, channel, iv);
-            Value dstAddr = materialise(b, bodyLoc, dst, coord, map);
-            if (isAp) {
-              b.create<pud::APOp>(bodyLoc, dstAddr, pud::Backend::Simdram);
-            } else {
-              Value srcAddr = materialise(b, bodyLoc, src, coord, map);
-              b.create<pud::AAPOp>(bodyLoc, srcAddr, dstAddr,
-                                   pud::Backend::Simdram);
-            }
+            emitOne(b, bodyLoc, bankInChannel(b, bodyLoc, channel, iv));
             b.create<scf::YieldOp>(bodyLoc);
           });
     }
@@ -1186,6 +1223,46 @@ private:
         ranges.push_back({bank, bank + 1});
     }
     return ranges;
+  }
+
+  /// The k consecutive channels a set of ranges runs the same banks of.
+  ///
+  /// A bank group laid over whole channels comes out of `bankRanges` as one
+  /// range per channel, all with the same banks in them; that is the shape a
+  /// single loop nest can say, and anything else keeps a loop of its own.
+  struct ChannelSlice {
+    int64_t firstChannel;
+    int64_t channels;
+    int64_t lb;
+    int64_t ub;
+  };
+
+  std::optional<ChannelSlice>
+  channelSlice(ArrayRef<std::pair<int64_t, int64_t>> ranges) const {
+    if (ranges.size() < 2)
+      return std::nullopt;
+    int64_t perChannel = std::max<int64_t>(1, geometry.banksPerChannel);
+    int64_t first = ranges.front().first / perChannel;
+    int64_t lb = ranges.front().first - first * perChannel;
+    int64_t ub = ranges.front().second - first * perChannel;
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      int64_t channel = ranges[i].first / perChannel;
+      if (channel != first + (int64_t)i ||
+          ranges[i].first - channel * perChannel != lb ||
+          ranges[i].second - channel * perChannel != ub)
+        return std::nullopt;
+    }
+    return ChannelSlice{first, (int64_t)ranges.size(), lb, ub};
+  }
+
+  /// The same bank, in whichever channel a loop is counting out.
+  BankCoord bankInChannel(OpBuilder &b, Location loc, Value channel, Value iv) {
+    BankCoord coord;
+    coord.channel = b.create<arith::IndexCastOp>(loc, b.getI64Type(), channel);
+    coord.bank = b.create<arith::IndexCastOp>(loc, b.getI64Type(), iv);
+    coord.rank = b.create<arith::ConstantIntOp>(loc, 0, 64);
+    coord.subarray = b.create<arith::ConstantIntOp>(loc, 0, 64);
+    return coord;
   }
 
   /// A bank counted out within a channel that is known here.
