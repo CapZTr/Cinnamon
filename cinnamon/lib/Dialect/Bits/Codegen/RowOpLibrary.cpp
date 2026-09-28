@@ -1,13 +1,16 @@
 //===- RowOpLibrary.cpp - row-op primitives compiled by lime --------------===//
 
 #include "cinm-mlir/Dialect/Bits/Codegen/RowOpLibrary.h"
+#include "PrimitiveFile.h"
 
 #include "eggmock.hpp"
 #include "gp.h"
+#include "mockturtle/algorithms/cleanup.hpp"
 #include "mockturtle/networks/mig.hpp"
 #include "utils.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -271,6 +274,7 @@ LoopCarry getLoopCarry(RowOpKind kind) {
   }
   return lc;
 }
+
 
 /// Command counts a correctly hinted template must hit. A miss means a hint did
 /// not take effect, which would silently cost commands on every bit of every
@@ -976,10 +980,36 @@ std::optional<RowOpTemplate> getHandWrittenTemplate(PudBackend backend,
 //===----------------------------------------------------------------------===//
 
 bool compileTemplate(RowOpKind kind, RowOpTemplate &out) {
-  MIG mig = buildMig(kind);
-  preoptimize(mig);
+  // A definition from --pud-primitives replaces the built-in network and its
+  // hints. The copy matters: a network shares its storage with the one it was
+  // copied from, and preoptimize rewrites in place.
+  const PrimitiveDefinition *def = lookupFilePrimitive(kind);
+  MIG mig = def ? mockturtle::cleanup_dangling(def->mig) : buildMig(kind);
+  if (def) {
+    // The primitive's meaning is fixed -- it is what the substrate check
+    // compares against -- so the file's inputs and outputs have to line up.
+    MIG builtin = buildMig(kind);
+    if (mig.num_pis() != builtin.num_pis() || mig.num_pos() != builtin.num_pos())
+      llvm::report_fatal_error(
+          llvm::Twine("--pud-primitives=") + primitiveFilePath() + ": @" +
+          getRowOpName(kind) + " takes " + llvm::Twine(mig.num_pis()) +
+          " inputs and gives " + llvm::Twine(mig.num_pos()) +
+          " outputs; the primitive has " + llvm::Twine(builtin.num_pis()) +
+          " and " + llvm::Twine(builtin.num_pos()));
+  }
+  if (!def || def->preoptimize)
+    preoptimize(mig);
+  out.fromFile = def != nullptr;
 
-  LoopCarry lc = getLoopCarry(kind);
+  LoopCarry lc;
+  if (def) {
+    for (const PrimitiveHint &h : def->inputs)
+      lc.inputs.push_back({h.index, h.cellType, h.cellIndex});
+    for (const PrimitiveHint &h : def->outputs)
+      lc.outputs.push_back({h.index, h.cellType, h.cellIndex});
+  } else {
+    lc = getLoopCarry(kind);
+  }
   program_holder prog;
   compiler_settings settings{};
   settings.rewriting = rewriting_strategy::none;
@@ -1040,7 +1070,24 @@ bool compileTemplate(RowOpKind kind, RowOpTemplate &out) {
     out.outputBindings.push_back(
         resolver.resolve(prog.output_cells()[i], false));
 
-  if (auto required = getRequiredCommands(kind)) {
+  if (def) {
+    // The file's own count is the requirement; the built-in one is only
+    // reported, since a different network is exactly what a file is for.
+    auto builtin = getRequiredCommands(kind);
+    if (def->commands && out.totalCommands() != *def->commands)
+      llvm::report_fatal_error(llvm::Twine("row-op template '") +
+                               getRowOpName(kind) + "' from " +
+                               primitiveFilePath() + " compiled to " +
+                               llvm::Twine(out.totalCommands()) +
+                               " commands; the file requires " +
+                               llvm::Twine(*def->commands));
+    if (!def->commands && builtin && out.totalCommands() != *builtin)
+      llvm::errs() << "warning: row-op template '" << getRowOpName(kind)
+                   << "' from " << primitiveFilePath()
+                   << " compiled to " << out.totalCommands()
+                   << " commands; the built-in definition takes " << *builtin
+                   << "\n";
+  } else if (auto required = getRequiredCommands(kind)) {
     if (out.totalCommands() != *required) {
       std::string msg;
       llvm::raw_string_ostream os(msg);
@@ -1224,7 +1271,11 @@ const RowOpTemplate *RowOpLibrary::getTemplate(PudBackend backend,
     return &entry.tmpl;
   entry.compiled = true;
 
-  if (auto handWritten = getHandWrittenTemplate(backend, kind)) {
+  // A file definition is a request to compile that network, so it takes the
+  // place of a hand-written sequence as well as of the built-in network.
+  bool fromFile = lookupFilePrimitive(kind) != nullptr;
+  if (auto handWritten =
+          fromFile ? std::nullopt : getHandWrittenTemplate(backend, kind)) {
     entry.tmpl = std::move(*handWritten);
     entry.tmpl.handWritten = true;
     for (const RowOpInstr &instr : entry.tmpl.instrs)
@@ -1252,6 +1303,16 @@ const RowOpTemplate *RowOpLibrary::getTemplate(PudBackend backend,
   // the model too is what earns the model the right to vouch for a sequence lime
   // did not compile, so a disagreement here is reported rather than acted on.
   entry.tmpl.simulated = simulate(kind, entry.tmpl);
+  // lime proved the sequence equivalent to the file's network; the model is
+  // what says whether that network is the primitive. One that is not would be
+  // priced and emitted as though it were, so it is refused outright.
+  if (fromFile && !entry.tmpl.simulated)
+    llvm::report_fatal_error(llvm::Twine("row-op template '") +
+                             getRowOpName(kind) + "' from " +
+                             primitiveFilePath() +
+                             " does not compute " + getRowOpName(kind) +
+                             " on the model of the substrate: the network in "
+                             "the file is not that primitive");
   return &entry.tmpl;
 }
 
@@ -1318,7 +1379,8 @@ std::string RowOpLibrary::renderSanityTable(PudBackend backend) {
       delta = (diff > 0 ? "+" : "") + std::to_string(diff);
     }
     pad(os, delta, 8, false);
-    pad(os, tmpl->handWritten ? "hand" : "lime", 9, false);
+    pad(os, tmpl->handWritten ? "hand" : tmpl->fromFile ? "file" : "lime", 9,
+        false);
     // What actually stands behind the sequence: lime's SAT equivalence check, the
     // exhaustive run on the substrate model, or both.
     std::string proof;

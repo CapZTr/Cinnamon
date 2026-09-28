@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "cinm-mlir/Dialect/Bits/Codegen/RowOpLibrary.h"
+#include "../../lib/Dialect/Bits/Codegen/PrimitiveFile.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
@@ -72,9 +73,12 @@ int main(int argc, char **argv) {
       backendOpt = arg.str();
     else if (arg == "--recipes")
       recipesOpt = true;
+    else if (arg.consume_front("--pud-primitives="))
+      setPrimitiveFilePath(arg);
     else {
       llvm::errs() << "usage: " << argv[0]
-                   << " [--backend=simdram|prada|fcdram] [--recipes]\n";
+                   << " [--backend=simdram|prada|fcdram] [--recipes]"
+                      " [--pud-primitives=<file>]\n";
       return 1;
     }
   }

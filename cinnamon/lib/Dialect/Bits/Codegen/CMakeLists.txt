@@ -1,5 +1,6 @@
 add_mlir_dialect_library(BitsCodegen
   NetworkBuilder.cpp
+  PrimitiveFile.cpp
   RowOpLibrary.cpp
 
   DEPENDS
@@ -7,7 +8,10 @@ add_mlir_dialect_library(BitsCodegen
 
   LINK_LIBS PUBLIC
     MLIRIR
+    MLIRParser
     MLIRFuncDialect
+    MLIRArithDialect
+    BitsIR
     mockturtle
     lime_base
 )

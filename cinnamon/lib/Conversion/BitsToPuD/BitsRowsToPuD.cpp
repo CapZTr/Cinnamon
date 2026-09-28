@@ -1837,9 +1837,19 @@ LogicalResult ScheduleEmitter::emit(ArrayRef<Operation *> ops,
                << getBackendName(backend)
                << "'; lime has no architecture definition for it";
       if (failed(emitter.emitTemplate(builder, loc, *tmpl, use->inputs,
-                                      use->outputs, map)))
-        return op.emitError() << "could not instantiate the "
-                              << getRowOpName(use->kind) << " template";
+                                      use->outputs, map))) {
+        auto diag = op.emitError() << "could not instantiate the "
+                                   << getRowOpName(use->kind) << " template";
+        // The emitter hands a loop-carried value over in the cell the built-in
+        // definition keeps it in, so a file network has to keep it there too.
+        if (tmpl->fromFile)
+          diag.attachNote()
+              << "this template comes from --pud-primitives; a value this op "
+                 "carries from one bit to the next has to stay in the cell the "
+                 "built-in definition keeps it in (row_add: pud.resident = "
+                 "\"DCC1\" on the carry-in and the carry-out)";
+        return diag;
+      }
       continue;
     }
 

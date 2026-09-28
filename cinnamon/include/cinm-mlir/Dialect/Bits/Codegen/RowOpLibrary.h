@@ -172,6 +172,12 @@ struct RowOpTemplate {
   /// hand-written template is only ever accepted when `simulated` holds.
   bool handWritten = false;
 
+  /// Set when the network lime compiled came from the file named by
+  /// --pud-primitives rather than from the built-in definition. Such a template
+  /// is only ever accepted when `simulated` holds: the file says what network
+  /// to compile, not what the primitive means.
+  bool fromFile = false;
+
   /// Whether running the sequence on a model of the substrate reproduced the
   /// primitive's truth table over every input assignment. This is what a
   /// hand-written template stands on; it is also run over lime's templates,
