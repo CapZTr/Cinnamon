@@ -10,3 +10,8 @@
 /gurobi.log
 /.clangd
 *.patch
+
+# Written by the tutorial notebooks when they run
+/tutorial/artifacts/
+.ipynb_checkpoints/
+__pycache__/

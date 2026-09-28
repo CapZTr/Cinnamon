@@ -1,0 +1,11 @@
+#!/bin/sh
+# gcc 4.8 against Ubuntu 14.04's C library, for the static binaries gem5 runs.
+#
+# A static binary from a current toolchain does not get past its first
+# instructions under this gem5's syscall emulation, so kernels are linked the
+# way MIMDRAM's own microbenchmarks always were. The 14.04 /usr is copied into
+# the image whole (see the Dockerfile); gcc finds its own passes relative to
+# where it is, and --sysroot/-B point it at that C library and those binutils.
+T=${PUD_TRUSTY:-/opt/trusty}
+export LD_LIBRARY_PATH=$T/usr/lib/x86_64-linux-gnu:$T/usr/lib
+exec "$T/usr/bin/gcc-4.8" --sysroot="$T" -B"$T/usr/bin/" "$@"

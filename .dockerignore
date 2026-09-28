@@ -1,0 +1,24 @@
+# Local builds and toolchains: rebuilt inside the image, and their CMake caches
+# carry host paths.
+llvm/
+cinnamon/build/
+cinnamon/build-*/
+cinnamon/extern/*/target/
+.venv/
+.cache/
+**/__pycache__/
+
+# Notebook and simulator state: generated when the notebooks run.
+tutorial/artifacts/
+**/.ipynb_checkpoints/
+m5out/
+.ipython/
+.jupyter/
+.local/
+
+# Editor and local environment.
+.vscode/
+.idea/
+.env
+gurobi.log
+*.lic

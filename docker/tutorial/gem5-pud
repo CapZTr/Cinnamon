@@ -1,0 +1,8 @@
+#!/bin/sh
+# MIMDRAM's gem5 (X86_PUD), built on Ubuntu 14.04: its libraries and the
+# Python 2.7 it embeds come from the same 14.04 /usr as pud-gcc. They are set
+# here only, since exported they would sit under everything else in the image.
+T=${PUD_TRUSTY:-/opt/trusty}
+export LD_LIBRARY_PATH=$T/usr/lib/x86_64-linux-gnu:$T/usr/lib
+export PYTHONHOME=$T/usr
+exec "${MIMDRAM_ROOT:-$HOME/third-party/MIMDRAM}/gem5/build/X86_PUD/gem5.opt" "$@"
