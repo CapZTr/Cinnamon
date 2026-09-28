@@ -7,8 +7,8 @@ Everything here concerns two repositories and nothing else:
 
 | repo | branch | commit | role |
 |---|---|---|---|
-| **Cinnamon** | `pud-codegen` | `cdc0e69` | the compiler, and the kernels it is measured on |
-| **MIMDRAM** | `pud-codegen` | `acbeaf7` | the guest runtime, the ISA extension, and gem5 |
+| **Cinnamon** | `pud-codegen` | `104f182` | the compiler, and the kernels it is measured on |
+| **MIMDRAM** | `pud-codegen` | `4385f03` | the guest runtime, the ISA extension, and gem5 |
 
 Both branches are pushed and are what you should check out. Their bases,
 Cinnamon `simdram-cpp-20` and MIMDRAM `main`, are the paper's versions and are
@@ -560,8 +560,17 @@ docker exec mimdram awk '/Begin Simulation Statistics/{b++} b==1{
 ```
 
 ```
-16512 row ops, 28.711 us
+16512 row ops, 28.887 us
 ```
+
+That is with the runtime that registers its arena (MIMDRAM `4385f03`, section 7).
+Before it, the same kernel measured 28.711 us. The schedule is the same 16512
+operations and they end within 18 ns of each other; what moved is the start of
+the window. The runtime grew by one call, the kernel linked after it moved 32
+bytes, and whether one load misses the cache just before the first row op
+changed with it. The same binary gives the same number with the effect on or
+off, so this is layout, not the memory model -- the same sensitivity the
+alignment flag in section 4 is about.
 
 **Expect the makespan to wobble by a few parts in ten thousand, and do not
 chase it.** The row-op count is exact and reproducible; the makespan is
@@ -619,6 +628,14 @@ mismatch is a build error rather than a wild pointer at run time.
 **4. The order of the 18 control rows.** The compiler enumerates them; the
 runtime lays them out first, in that order, with the data rows after. The
 enumeration in `pud_runtime.c` must match the compiler's, and today it does.
+
+**5. Where the rows start, told to gem5.** `pud_init` calls `m5_pud_arena` (m5
+op `0x56`) with the arena, the period, the row stride and the channel size.
+gem5 translates the address once (`sim/pseudo_inst.cc`) and keeps it in
+`mem/pud_arena.{hh,cc}`, which also holds the table of which physical rows each
+of the 18 names drives -- SIMDRAM's groups, as the compiler has them. That is
+what lets a row op act on the rows and not only take the time. A program that
+does not register gets no effect, exactly as before.
 
 ---
 
@@ -929,17 +946,19 @@ copy list in full inside the row loop; past one channel it now loops over it
 
 **No compiled kernel has ever been checked for numerical correctness.** It is
 verified as a cost model — the right commands, in the right order, at the right
-times — and nothing more. The reason is structural: gem5 models a row
-operation's *timing* and not its *effect*. `ROWAND`, `ROWOR`, `ROWXOR`,
-`ROWCOPY` and majority are implemented functionally in
-`src/mem/abstract_mem.cc`, but **`ROWAAP` — the one thing this path emits — is
-an empty stub marked TODO**. The driver reflects this: `pud_main.c` loads no
-operands and checks no results, and runs the kernel twice on the grounds that
-"row ops have no functional semantics in the memory model, so a second run is
-the same run".
+times — and nothing more.
 
-Treat a compiled kernel as a schedule that executes, not as a program that
-produces answers.
+Half of what stood in the way is done. gem5 used to model a row operation's
+*timing* and not its *effect*: `ROWAAP`, the one thing this path emits, was an
+empty stub. It now does what the compiler's substrate model says, a row wide
+(MIMDRAM `4385f03`), and `pud_selftest.c` checks that on the primitives the
+compiler emits — every bit of and, or, not, maj3, xor, xnor and the full adder,
+in two channels, on DDR4 and HBM3.
+
+What is missing is a kernel's data: `pud_main.c` still loads no operands and
+checks no results, because nothing yet knows where a tensor element ends up
+(section 7, item 1). Until that exists, treat a compiled kernel as a schedule
+that executes, not as a program whose answers anyone has looked at.
 
 ---
 
@@ -947,7 +966,16 @@ produces answers.
 
 **1. Make a compiled kernel compute the right answer.** Three steps, in order:
 
-- **Correct the control-row table on the trace player's side first.** The
+- **Correct the control-row table** — done differently from what was planned
+  here, in `4385f03`. The effect does not read the trace player's table: it has
+  its own, in `mem/pud_arena.cc`, written from the compiler's
+  (`getSimdramGroups`), so the groups that decide an answer are the
+  compiler's. The player's table and `mimdram.h` keep Ambit's, and with them
+  the player's sequences and the legacy microbenchmarks keep the names they
+  were written against. The warning at the end of this section is therefore
+  moot. What follows is the plan as it was.
+
+  *Correct the control-row table on the trace player's side first.* The
   compiler and the guest runtime already use SIMDRAM's row groups — the ones in
   Figure 6 of the final published SIMDRAM paper, which redefined them relative
   to the arXiv version. `gem5/src/mem/rowop_trace_player.hh` and
@@ -960,7 +988,14 @@ produces answers.
   Ambit's groups. Leave them: the player is a cost oracle and is not worth
   converting into a correctness oracle. Correctness should be validated on the
   compiled path only.
-- **Implement the effect.** The compiler already contains the substrate model
+- **Implement the effect** — done for AP, AAP and in-channel copies, in
+  `4385f03`; see section 3, item 5. The 8192-byte assumption is gone for those
+  three. Not done: a cross-channel copy (`ROW_RD_STREAM`/`ROW_WR_STREAM`) still
+  moves no data, so a reduction that folds across channels gets the wrong
+  answer — its two halves reach two controllers with nothing ordering one
+  after the other. The legacy primitives keep `ROW_SIZE`.
+
+  *As planned:* The compiler already contains the substrate model
   this needs — four compute rows, two dual-contact cells, majority on activation
   — proved against thirteen machine-checked sequences. gem5 needs the same model
   a row wide instead of a bit wide: bitwise over 64-bit words, with
