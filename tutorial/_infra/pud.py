@@ -190,7 +190,7 @@ class Mapping:
 
 
 def map_banks(bits: Path, tag: str, banks: int, mem: str = "ddr",
-              trace: bool = False) -> Mapping:
+              trace: bool = False, flags: tuple[str, ...] = ()) -> Mapping:
     """Step 2: the ILP chooses how loops spread over banks.
 
     With `trace`, the pass also writes the CIMTRACE file the trace player
@@ -201,7 +201,7 @@ def map_banks(bits: Path, tag: str, banks: int, mem: str = "ddr",
     opts = f"num-banks={banks} mem-type={mem} emit-trace={'true' if trace else 'false'}"
     if trace_path:
         opts += f" trace-path={trace_path}"
-    r = run([cinm_opt(), bits, f"--bits-opt-mapping={opts}", "-o", out])
+    r = run([cinm_opt(), *flags, bits, f"--bits-opt-mapping={opts}", "-o", out])
     _check_gurobi(r.stderr, r.stdout)
     log = r.stdout + r.stderr
     obj = re.search(r"Best objective ([-+0-9.e]+)", log)
@@ -242,17 +242,18 @@ def mapping_attrs(mapped: Path) -> list[dict]:
     return loops
 
 
-def expand_rows(mapped: Path, tag: str) -> Path:
+def expand_rows(mapped: Path, tag: str, flags: tuple[str, ...] = ()) -> Path:
     """Step 3: slice operations become loops over single rows."""
     out = artifact(f"{tag}_3_rows.mlir")
-    run([cinm_opt(), mapped, "--bits-pattern-apply", "-o", out])
+    run([cinm_opt(), *flags, mapped, "--bits-pattern-apply", "-o", out])
     return out
 
 
-def to_pud(rows: Path, tag: str, resident: bool = True) -> Path:
+def to_pud(rows: Path, tag: str, resident: bool = True,
+           flags: tuple[str, ...] = ()) -> Path:
     """Step 4: row operations become DRAM commands (AAP/AP), bank by bank."""
     out = artifact(f"{tag}_4_pud.mlir")
-    run([cinm_opt(), rows,
+    run([cinm_opt(), *flags, rows,
          f"--convert-bits-rows-to-pud=operand-per-wave={1 if resident else 0}",
          "-o", out])
     return out
@@ -373,23 +374,29 @@ class Kernel:
 
 
 def compile_kernel(name: str, banks: int, mem: str = "ddr",
-                   trace: bool = False) -> Kernel:
+                   trace: bool = False, flags: tuple[str, ...] = (),
+                   tag: str | None = None) -> Kernel:
     """All of steps 1 to 7 for a limon_benchmark kernel.
 
     A kernel whose operand does not fit in a subarray at this bank count is
     built with its waves sharing rows -- a faithful model of the schedule's
     cost, but not a program -- exactly as compile_pud_binary.sh falls back.
+
+    `flags` are cinm-opt options every stage has to see, such as
+    --pud-primitives: the mapping prices a primitive, the expansion and the
+    emitter use it, and they have to agree. `tag` names the artifacts.
     """
-    tag = f"{name}_{mem}_{banks}"
+    tag = tag or f"{name}_{mem}_{banks}"
+    flags = tuple(flags)
     bits = to_bits(kernel(name), tag)
-    mapping = map_banks(bits, tag, banks, mem, trace=trace)
-    rows = expand_rows(mapping.path, tag)
+    mapping = map_banks(bits, tag, banks, mem, trace=trace, flags=flags)
+    rows = expand_rows(mapping.path, tag, flags=flags)
     resident = True
     try:
-        pud = to_pud(rows, tag, resident=True)
+        pud = to_pud(rows, tag, resident=True, flags=flags)
     except RuntimeError:
         resident = False
-        pud = to_pud(rows, tag, resident=False)
+        pud = to_pud(rows, tag, resident=False, flags=flags)
     llvm_mlir = to_llvm_dialect(pud, tag)
     obj = to_object(llvm_mlir, tag, banks, mem)
     exe = link(obj, pud, tag)
@@ -459,3 +466,75 @@ def replay(trace: Path, mem: str = "ddr") -> Stats:
     ops = int(sum(x for k, x in v.items() if k.endswith("rowOpCount")))
     return Stats(ops, v.get("system.player.rowOpMakespan", 0.0) / 1e6,
                  r.seconds, out)
+
+# --------------------------------------------------------------------------
+# Primitives, and a model of what an approximate addition computes
+# --------------------------------------------------------------------------
+
+def primitive_table(flags: tuple[str, ...] = (), names: tuple[str, ...] = ()) -> str:
+    """rowop-sanity's table and sequences, for these options.
+
+    With `names`, only those primitives' rows of the table and their sequences.
+    """
+    extra = [f for f in flags if f.startswith("--pud-primitives=")]
+    out = run([rowop_sanity(), *extra]).stdout
+    if not names:
+        return out
+    lines = out.splitlines()
+    keep = [l for l in lines if l.startswith("primitive")][:1]
+    keep += [l for l in lines if l.split() and l.split()[0] in names]
+    for name in names:
+        if f"{name}:" in lines:
+            i = lines.index(f"{name}:")
+            j = next((k for k in range(i + 1, len(lines)) if not lines[k].strip()),
+                     len(lines))
+            keep += [""] + lines[i:j]
+    return "\n".join(keep)
+
+
+def network_function(path: Path, primitive: str):
+    """The function a primitive's network in `path` computes, on integers.
+
+    It evaluates the same MLIR the compiler reads -- bits.maj, bits.not and the
+    constant rows -- bitwise, so it works on whole words (or numpy arrays) at a
+    time: bit i of the result is the network applied to bit i of the operands.
+    """
+    text = Path(path).read_text()
+    m = re.search(rf"func\.func @{primitive}\((.*?)\)\s*->.*?\{{(.*?)\n\}}",
+                  text, re.S)
+    if not m:
+        raise ValueError(f"no @{primitive} in {path}")
+    args = re.findall(r"(%\w+)\s*:", m.group(1))
+    body = m.group(2)
+
+    def f(*operands, mask=(1 << 64) - 1):
+        env = dict(zip(args, operands))
+        for line in body.splitlines():
+            line = line.strip()
+            if (d := re.match(r"(%\w+)\s*=\s*bits\.maj\s+(%\w+),\s*(%\w+),\s*(%\w+)", line)):
+                x, y, z = (env[v] for v in d.group(2, 3, 4))
+                env[d.group(1)] = (x & y) | (x & z) | (y & z)
+            elif (d := re.match(r"(%\w+)\s*=\s*bits\.not\s+(%\w+)", line)):
+                env[d.group(1)] = ~env[d.group(2)] & mask
+            elif (d := re.match(r"(%\w+)\s*=\s*bits\.create_all_zero_row", line)):
+                env[d.group(1)] = 0 * operands[0]
+            elif (d := re.match(r"(%\w+)\s*=\s*bits\.create_all_one_row", line)):
+                env[d.group(1)] = 0 * operands[0] + mask
+            elif (d := re.match(r"return\s+(.*?)\s*:", line)):
+                outs = [env[v.strip()] for v in d.group(1).split(",")]
+                return outs[0] if len(outs) == 1 else tuple(outs)
+        raise ValueError(f"@{primitive} in {path} does not return")
+    return f
+
+
+def approx_add(a, b, width: int, low_bits: int, cell):
+    """What --pud-approx-add-low-bits computes, as the compiler expands it.
+
+    Bits [0, low_bits) are `cell` applied bitwise to the operands' low bits;
+    bits [low_bits, width) are the exact sum of the high parts with carry 0.
+    Works on Python ints and on numpy integer arrays.
+    """
+    low_mask = (1 << low_bits) - 1
+    high = ((a >> low_bits) + (b >> low_bits)) << low_bits
+    low = cell(a & low_mask, b & low_mask, mask=low_mask) & low_mask
+    return (high | low) & ((1 << width) - 1)

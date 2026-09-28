@@ -12,6 +12,7 @@ instruction, and MIMDRAM's gem5 runs it on a processor and a DRAM model together
 | `03_bank_sweep` | 8 → 64 banks: the mapping, the speed-up, and the second channel |
 | `04_compiled_vs_trace` | the compiled program against the paper's trace-driven simulation |
 | `05_reduction` | `gemv`: how partial results from 64 banks are combined |
+| `06_primitives_and_approximate_add` | redefine a primitive in MLIR (`--pud-primitives`); an approximate adder (`--pud-approx-add-low-bits`) and its cost against its error |
 
 Each gem5 run takes seconds to a few minutes and under 300 MB of memory.
 
@@ -63,7 +64,7 @@ Test inside the image before pushing, in notebook order:
 ```sh
 docker run --rm -v /path/to/gurobi.lic:/home/jovyan/gurobi.lic:ro \
   cinnamon-pud-tutorial:esweek bash -c 'cd ~/tutorial/notebooks && \
-  for nb in 00_intro 01_vadd_pipeline 02_vadd_run 03_bank_sweep 04_compiled_vs_trace 05_reduction; do
+  for nb in 00_intro 01_vadd_pipeline 02_vadd_run 03_bank_sweep 04_compiled_vs_trace 05_reduction 06_primitives_and_approximate_add; do
     jupyter nbconvert --to notebook --execute --ExecutePreprocessor.timeout=1200 \
       --output /tmp/$nb.out.ipynb $nb.ipynb >/tmp/$nb.log 2>&1 \
       && echo "OK   $nb" || { echo "FAIL $nb"; tail -15 /tmp/$nb.log; }
