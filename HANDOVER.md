@@ -916,8 +916,9 @@ committed instructions retiring at IPC 2 with nothing stalling; raise the clock
 and the compiled path meets the player exactly, because the memory is simply
 faster than a 2 GHz core can feed it once there is more than one channel of it.
 And **instruction-cache pressure**, which was the compiler's own doing and is
-largely fixed (section 4); what is left of it is the reduction tree, which still
-writes out its copy list in full inside the row loop instead of looping over it.
+largely fixed (section 4). The last of it was the reduction tree writing out its
+copy list in full inside the row loop; past one channel it now loops over it
+(section 7, item 2).
 
 > Re-checked on 2026-09-22, both ends. Six configurations rebuilt from the
 > committed tree come out **byte-identical** to the binaries the matrix was
@@ -979,9 +980,29 @@ produces answers.
 Then a correctness suite on deliberately small shapes, kept separate from the
 140-configuration matrix — small shapes for correctness, the matrix for cost.
 
-**2. Take the rest of the host cost out**, which now means making the reduction
-tree loop over its copy list. The acceptance test is the matrix: row-op counts
-must stay equal in all 140, and no single-channel configuration may regress.
+**2. Take the rest of the host cost out** — done in code (`104f182`), not yet
+accepted on the whole matrix. The reduction tree's copies are split into runs
+that step both ends together, and runs that repeat across channels become one
+loop nest over channels and banks. Within one channel they stay written out:
+looping them there made gemv at 32 banks 0.65% slower, the same trade the
+alignment flag in section 4 runs into.
+
+Where it stands against the acceptance test — row-op counts equal in all 140,
+no single-channel configuration slower:
+
+- 100 of the 140 binaries do not change at all; only the four kernels that
+  reduce across banks (bnn_dot, conv1x1_relu, gemv, knn_l2) do.
+- Of those, the 20 single-channel binaries are **byte-identical** to before,
+  so they cannot regress.
+- The 20 multi-channel ones change. Measured so far: gemv, DDR4, 128 banks,
+  494751 row ops either way, 992.244 → 977.258 us (−1.5%). An earlier version
+  that also looped within a channel kept the row-op count in every one of the
+  nine multi-channel configurations it finished and moved their makespans
+  between −2.1% and +0.07%; the remaining multi-channel ones have not been run
+  on the final version.
+
+What is left is simulating those 20. Run them a few at a time: sixteen gem5
+processes at once took down a 27 GB machine.
 
 **3. Widen the coverage.** Only a fourteen-kernel set has been through this
 path. GEMM never has — and it is also the one kernel the trace player cannot
