@@ -1122,11 +1122,20 @@ public:
   /// starting the next row lets those transfers overlap; doing one edge's whole
   /// run first would leave every other bank waiting, and would hold two of them
   /// busy for long enough that the rank could not be refreshed in between.
+  ///
+  /// Within a row, edges that repeat across channels are counted out by loops
+  /// rather than written out one by one. A level of the tree is the same
+  /// pairing repeated along the banks and again in every channel, and written
+  /// out it made the row loop as long as the level: at 128 banks, 64 copies'
+  /// worth of address arithmetic between one row and the next, read in once
+  /// per row. `copyBlocks` finds the loops the list is made of, and they issue
+  /// it in the order it was given.
   void emitCopies(OpBuilder &builder, Location loc,
                   ArrayRef<std::pair<int64_t, int64_t>> edges, int64_t srcRun,
                   int64_t dstRun, int64_t rows) {
     if (edges.empty() || rows <= 0)
       return;
+    SmallVector<CopyBlock> blocks = copyBlocks(edges);
     Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
     Value count = builder.create<arith::ConstantIndexOp>(loc, rows);
     Value step = builder.create<arith::ConstantIndexOp>(loc, 1);
@@ -1135,39 +1144,159 @@ public:
         [&](OpBuilder &b, Location bodyLoc, Value iv, ValueRange) {
           Value row =
               b.create<arith::IndexCastOp>(bodyLoc, b.getI64Type(), iv);
-          auto rowIn = [&](int64_t bank, int64_t run) {
-            BankCoord coord = decomposeBank(b, bodyLoc, bank);
-            Value base = b.create<arith::ConstantIntOp>(bodyLoc, run, 64);
-            return b.create<pud::GetRowOp>(
-                bodyLoc, pud::RowType::get(b.getContext(), kDataGroup),
-                coord.channel, coord.rank, coord.bank, coord.subarray,
-                b.create<arith::AddIOp>(bodyLoc, base, row));
-          };
-          int64_t perChannel = std::max<int64_t>(1, geometry.banksPerChannel);
-          int64_t total = std::max<int64_t>(1, geometry.totalBanks);
-          auto channelOf = [&](int64_t bank) {
-            return (((bank % total) + total) % total) / perChannel;
-          };
-          for (auto [srcBank, dstBank] : edges) {
-            Value src = rowIn(srcBank, srcRun);
-            Value dst = rowIn(dstBank, dstRun);
-            // One controller owns both ends, or neither owns both. A copy
-            // within a channel is the one command it looks like; across
-            // channels neither controller can reach the other's row, so it is
-            // the row out of one and the row into the other, each addressed to
-            // the controller that owns it. This is the expansion the trace
-            // player has always replayed a cross-channel copy as.
-            if (channelOf(srcBank) == channelOf(dstBank)) {
-              b.create<pud::RowCopyOp>(bodyLoc, src, dst,
-                                       pud::Backend::Simdram);
-            } else {
-              b.create<pud::RowStreamOp>(bodyLoc, src, /*out=*/true,
-                                         pud::Backend::Simdram);
-              b.create<pud::RowStreamOp>(bodyLoc, dst, /*out=*/false,
-                                         pud::Backend::Simdram);
-            }
-          }
+          for (const CopyBlock &block : blocks)
+            emitCopyBlock(b, bodyLoc, block, row, srcRun, dstRun);
           b.create<scf::YieldOp>(bodyLoc);
+        });
+  }
+
+  /// Copies that one loop nest issues: in each of `channels` consecutive
+  /// channel pairs, `count` edges whose ends both step `step` banks at a time.
+  struct CopyBlock {
+    int64_t srcChannel;
+    int64_t dstChannel;
+    int64_t channels;
+    int64_t srcBank;
+    int64_t dstBank;
+    int64_t count;
+    int64_t step;
+  };
+
+  /// Splits `edges`, in order, into the loop nests that issue them.
+  ///
+  /// First into runs -- consecutive edges that stay in one channel at each end
+  /// and step both ends by the same number of banks -- and then runs that are
+  /// the previous one a channel further on, at both ends, into one nest with a
+  /// loop over channels. Only neighbours are merged, so issuing the blocks in
+  /// order issues the edges in the order they came.
+  SmallVector<CopyBlock>
+  copyBlocks(ArrayRef<std::pair<int64_t, int64_t>> edges) const {
+    int64_t perChannel = std::max<int64_t>(1, geometry.banksPerChannel);
+    int64_t total = std::max<int64_t>(1, geometry.totalBanks);
+    auto split = [&](int64_t bank) {
+      int64_t flat = ((bank % total) + total) % total;
+      return std::make_pair(flat / perChannel, flat % perChannel);
+    };
+
+    SmallVector<CopyBlock> runs;
+    for (auto [src, dst] : edges) {
+      auto [srcChannel, srcBank] = split(src);
+      auto [dstChannel, dstBank] = split(dst);
+      if (!runs.empty()) {
+        CopyBlock &run = runs.back();
+        int64_t step = run.count == 1 ? srcBank - run.srcBank : run.step;
+        if (run.srcChannel == srcChannel && run.dstChannel == dstChannel &&
+            step != 0 && srcBank == run.srcBank + run.count * step &&
+            dstBank == run.dstBank + run.count * step) {
+          run.step = step;
+          ++run.count;
+          continue;
+        }
+      }
+      runs.push_back(
+          {srcChannel, dstChannel, 1, srcBank, dstBank, /*count=*/1, /*step=*/1});
+    }
+
+    SmallVector<CopyBlock> merged;
+    for (const CopyBlock &run : runs) {
+      if (!merged.empty()) {
+        CopyBlock &block = merged.back();
+        if (run.srcChannel == block.srcChannel + block.channels &&
+            run.dstChannel == block.dstChannel + block.channels &&
+            run.srcBank == block.srcBank && run.dstBank == block.dstBank &&
+            run.count == block.count && run.step == block.step) {
+          ++block.channels;
+          continue;
+        }
+      }
+      merged.push_back(run);
+    }
+
+    // Only a block that repeats across channels is worth a loop. Within one
+    // channel a level is at most a channel's worth of copies, which stays in
+    // the instruction cache written out, and there a loop only adds its own
+    // count and branch to every copy: gemv at 32 banks, one channel, took
+    // 0.65% longer with its copies counted out. Past a channel the level is
+    // what outgrows the cache, and the loop is what pays. It is the same split
+    // `emitAcrossBanks` makes for its bank ranges.
+    SmallVector<CopyBlock> blocks;
+    for (const CopyBlock &block : merged) {
+      if (block.channels > 1 || block.count == 1) {
+        blocks.push_back(block);
+        continue;
+      }
+      for (int64_t i = 0; i < block.count; ++i)
+        blocks.push_back({block.srcChannel, block.dstChannel, 1,
+                          block.srcBank + i * block.step,
+                          block.dstBank + i * block.step, 1, 1});
+    }
+    return blocks;
+  }
+
+  /// Issues one row of every edge in `block`.
+  void emitCopyBlock(OpBuilder &builder, Location loc, const CopyBlock &block,
+                     Value row, int64_t srcRun, int64_t dstRun) {
+    auto rowIn = [&](OpBuilder &b, Location l, Value channel, Value bank,
+                     int64_t run) {
+      Value zero = b.create<arith::ConstantIntOp>(l, 0, 64);
+      Value base = b.create<arith::ConstantIntOp>(l, run, 64);
+      return b.create<pud::GetRowOp>(
+          l, pud::RowType::get(b.getContext(), kDataGroup), channel, zero,
+          bank, zero, b.create<arith::AddIOp>(l, base, row));
+    };
+    // `offset` is the channel pair counted out, `index` the edge within it;
+    // either is null when there is only one.
+    auto emitEdge = [&](OpBuilder &b, Location l, Value offset, Value index) {
+      auto at = [&](int64_t start, Value iv, int64_t scale) -> Value {
+        Value value = b.create<arith::ConstantIntOp>(l, start, 64);
+        if (!iv)
+          return value;
+        Value i = b.create<arith::IndexCastOp>(l, b.getI64Type(), iv);
+        if (scale != 1)
+          i = b.create<arith::MulIOp>(
+              l, i, b.create<arith::ConstantIntOp>(l, scale, 64));
+        return b.create<arith::AddIOp>(l, value, i);
+      };
+      Value src = rowIn(b, l, at(block.srcChannel, offset, 1),
+                        at(block.srcBank, index, block.step), srcRun);
+      Value dst = rowIn(b, l, at(block.dstChannel, offset, 1),
+                        at(block.dstBank, index, block.step), dstRun);
+      // One controller owns both ends, or neither owns both. A copy within a
+      // channel is the one command it looks like; across channels neither
+      // controller can reach the other's row, so it is the row out of one and
+      // the row into the other, each addressed to the controller that owns it.
+      // This is the expansion the trace player has always replayed a
+      // cross-channel copy as. The channels of a block move together, so which
+      // it is holds for the whole block.
+      if (block.srcChannel == block.dstChannel) {
+        b.create<pud::RowCopyOp>(l, src, dst, pud::Backend::Simdram);
+      } else {
+        b.create<pud::RowStreamOp>(l, src, /*out=*/true, pud::Backend::Simdram);
+        b.create<pud::RowStreamOp>(l, dst, /*out=*/false,
+                                   pud::Backend::Simdram);
+      }
+    };
+    auto overEdges = [&](OpBuilder &b, Location l, Value offset) {
+      if (block.count == 1)
+        return emitEdge(b, l, offset, Value());
+      b.create<scf::ForOp>(
+          l, b.create<arith::ConstantIndexOp>(l, 0),
+          b.create<arith::ConstantIndexOp>(l, block.count),
+          b.create<arith::ConstantIndexOp>(l, 1), ValueRange{},
+          [&](OpBuilder &inner, Location innerLoc, Value iv, ValueRange) {
+            emitEdge(inner, innerLoc, offset, iv);
+            inner.create<scf::YieldOp>(innerLoc);
+          });
+    };
+    if (block.channels == 1)
+      return overEdges(builder, loc, Value());
+    builder.create<scf::ForOp>(
+        loc, builder.create<arith::ConstantIndexOp>(loc, 0),
+        builder.create<arith::ConstantIndexOp>(loc, block.channels),
+        builder.create<arith::ConstantIndexOp>(loc, 1), ValueRange{},
+        [&](OpBuilder &b, Location l, Value iv, ValueRange) {
+          overEdges(b, l, iv);
+          b.create<scf::YieldOp>(l);
         });
   }
 
@@ -1273,21 +1402,6 @@ private:
     coord.bank = b.create<arith::IndexCastOp>(loc, b.getI64Type(), iv);
     // Ranks and subarrays are part of the coordinate; nothing distributes over
     // them yet, so every address takes the first of each.
-    coord.rank = b.create<arith::ConstantIntOp>(loc, 0, 64);
-    coord.subarray = b.create<arith::ConstantIntOp>(loc, 0, 64);
-    return coord;
-  }
-
-  /// The same split for a bank that is known here rather than counted out by a
-  /// loop -- the ends of a copy, which name one bank each.
-  BankCoord decomposeBank(OpBuilder &b, Location loc, int64_t bank) {
-    int64_t total = std::max<int64_t>(1, geometry.totalBanks);
-    int64_t flat = ((bank % total) + total) % total;
-    BankCoord coord;
-    coord.channel = b.create<arith::ConstantIntOp>(
-        loc, flat / geometry.banksPerChannel, 64);
-    coord.bank = b.create<arith::ConstantIntOp>(
-        loc, flat % geometry.banksPerChannel, 64);
     coord.rank = b.create<arith::ConstantIntOp>(loc, 0, 64);
     coord.subarray = b.create<arith::ConstantIntOp>(loc, 0, 64);
     return coord;
