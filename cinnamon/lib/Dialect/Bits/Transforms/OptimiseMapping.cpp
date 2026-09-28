@@ -156,6 +156,8 @@ static bool kWideAdd = false;
 // behaves as it always has; the pud code generation path turns it off, since it
 // wants the mapping annotations without a large trace landing on a shared path.
 static bool kEmitTrace = true;
+// Where that binary goes (pass option trace-path).
+static std::string kTracePath;
 // Intra-bank lane-fold copy: one AAP per bit-plane row, matching how the
 // gem5 RowOpTracePlayer replays src==dst ROW_COPY records (same-subarray
 // RowClone FPM path, tRAS+tWLOV+tRP per row). NOTE this is a deliberate
@@ -1449,8 +1451,7 @@ static void dumpFlattenedEventSequence(func::FuncOp func) {
   uint64_t totalRecords = 0;
   int64_t  lastEndTime  = 0;
  
-  const char *tracePath =
-      "/home/tianruiz/papers/cimdram/traces/trace.bin";
+  const char *tracePath = kTracePath.c_str();
   FILE *traceFp = std::fopen(tracePath, "wb");
   if (!traceFp) {
     llvm::errs() << "error: cannot open trace file: " << tracePath << "\n";
@@ -2953,6 +2954,7 @@ struct BitsOptimiseMappingPass
       return;
     }
     kEmitTrace = emitTrace;
+    kTracePath = tracePath;
     kWideAdd = wideAdd;
     kNumBanks = numBanks;
 

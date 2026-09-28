@@ -67,6 +67,11 @@ def BitsOptmiseMappingPass : Pass<"bits-opt-mapping", "func::FuncOp"> {
            "path. Transitional: once simulation is entered through generated "
            "code rather than the trace player, this format has no consumer "
            "left.">,
+    Option<"tracePath", "trace-path", "std::string",
+           /*default=*/"\"/home/tianruiz/papers/cimdram/traces/trace.bin\"",
+           "Where emit-trace writes the CIMTRACE binary. The default is the "
+           "path the paper's scripts read; anything that is not on that "
+           "machine, a tutorial image for one, says where it wants it.">,
     Option<"wideAdd", "wide-add", "bool", /*default=*/"false",
            "Emit every plain bits.add_i as a WIDENING add (trace kind "
            "OP_ADDI_WIDE): one extra row-op stores the carry-out, so the sum "
