@@ -116,7 +116,15 @@ endif()
 
 add_subdirectory(include)
 add_subdirectory(lib)
-add_subdirectory(test)
+# The regression tests run through LLVM's FileCheck, not and count. An LLVM
+# build tree has them; an installed LLVM has them only with LLVM_INSTALL_UTILS,
+# which a distribution rarely sets. Without them the compiler still builds.
+if (TARGET FileCheck AND TARGET not AND TARGET count)
+    add_subdirectory(test)
+else()
+    message(STATUS "LLVM's FileCheck/not/count are not available: "
+                   "check-cinm-mlir is not built")
+endif()
 add_subdirectory(tools)
 
 if (TORCH_MLIR_DIR)
