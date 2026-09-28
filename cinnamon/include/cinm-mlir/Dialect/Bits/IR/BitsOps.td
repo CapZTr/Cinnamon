@@ -409,6 +409,29 @@ def RowOrOp : Bits_Op<"row_or", [Pure]> {
       "`->` qualified(type($result))";
 }
 
+def RowAddApproxOp : Bits_Op<"row_add_approx", [Pure]> {
+  let summary = "One bit of an approximate addition, with no carry";
+  let description = [{
+    The cell an approximate adder computes its low bits with: a function of
+    the two operand bits alone, so no carry ripples through them. Which
+    function is the `row_add_approx` primitive's network -- a | b, the
+    lower-part OR adder, unless --pud-primitives redefines it. Produced by
+    --bits-pattern-apply for the low bits of an addition when
+    --pud-approx-add-low-bits is set.
+  }];
+  let arguments = (ins
+    BitRowType:$lhs,
+    BitRowType:$rhs
+  );
+  let results = (outs
+    BitRowType:$result
+  );
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` "
+      "qualified(type($lhs)) `,` qualified(type($rhs)) "
+      "`->` qualified(type($result))";
+}
+
 def XOrOp : Bits_Op<"xor", [Pure]> {
   let summary = "Bit-serial XOR of two slice operands";
   let description = [{}];

@@ -6,6 +6,7 @@
 #include "eggmock.hpp"
 #include "gp.h"
 #include "mockturtle/algorithms/cleanup.hpp"
+#include "mockturtle/algorithms/simulation.hpp"
 #include "mockturtle/networks/mig.hpp"
 #include "utils.h"
 
@@ -230,6 +231,10 @@ MIG buildMig(RowOpKind kind) {
     return buildRangeScan(true, true);
   case RowOpKind::ScanFold:
     return buildAnd();
+  case RowOpKind::ApproxAdd:
+    // The lower-part OR adder: a | b, four commands where a full adder takes
+    // eight. Its error is the carries it never produces.
+    return buildOr();
   case RowOpKind::NUM_KINDS:
     break;
   }
@@ -590,6 +595,16 @@ private:
   std::map<std::pair<int, int>, bool> data;
 };
 
+/// The outputs `mig` gives for `in`, or none if the arity does not match.
+llvm::SmallVector<bool, 2> evaluate(const MIG &mig, llvm::ArrayRef<bool> in) {
+  if (in.size() != mig.num_pis())
+    return {};
+  std::vector<bool> pis(in.begin(), in.end());
+  mockturtle::default_simulator<bool> sim(pis);
+  std::vector<bool> outs = mockturtle::simulate<bool>(mig, sim);
+  return llvm::SmallVector<bool, 2>(outs.begin(), outs.end());
+}
+
 /// What each primitive computes, spelled the same way its MIG builder above
 /// spells it. This is the reference the model checks a sequence against, so it
 /// deliberately restates the majority expressions rather than the arithmetic
@@ -641,6 +656,13 @@ llvm::SmallVector<bool, 2> expectedOutputs(RowOpKind kind,
     return {maj(in[0], !in[1], in[2])};
   case RowOpKind::Select:
     return {maj(maj(in[2], in[0], false), maj(!in[2], in[1], false), true)};
+  case RowOpKind::ApproxAdd: {
+    // An approximate cell means whatever its network computes, so that is the
+    // reference: the check still proves the sequence is that network on the
+    // substrate, it just cannot say the network is a good approximation.
+    const PrimitiveDefinition *def = lookupFilePrimitive(kind);
+    return evaluate(def ? def->mig : buildMig(kind), in);
+  }
   case RowOpKind::NUM_KINDS:
     break;
   }
@@ -1010,6 +1032,50 @@ bool compileTemplate(RowOpKind kind, RowOpTemplate &out) {
   } else {
     lc = getLoopCarry(kind);
   }
+
+  // A network with no gates -- every output an input, its complement, or a
+  // constant -- has nothing for lime to schedule, and lime does not survive
+  // being asked. It is a copy per output, written here: AAP from the input or
+  // the constant row, or through a dual-contact cell for a complement. Only
+  // without hints: a pinned value is lime's to place.
+  if (mig.num_gates() == 0 && lc.inputs.empty() && lc.outputs.empty()) {
+    out.numInputs = mig.num_pis();
+    out.numOutputs = mig.num_pos();
+    for (unsigned i = 0; i < out.numInputs; ++i)
+      out.inputBindings.push_back(RowOperand::input(static_cast<int>(i)));
+    bool ok = true;
+    mig.foreach_po([&](MIG::signal f, uint32_t i) {
+      RowOperand dst = RowOperand::output(static_cast<int>(i));
+      auto node = mig.get_node(f);
+      bool inverted = mig.is_complemented(f);
+      auto copy = [&](RowOperand src, RowOperand to) {
+        RowOpInstr instr;
+        instr.src = src;
+        instr.dst = to;
+        out.instrs.push_back(instr);
+        out.numAAP++;
+      };
+      if (mig.is_constant(node)) {
+        bool value = mig.constant_value(node) != inverted;
+        copy(RowOperand::control(value ? ControlRow::C_1 : ControlRow::C_0), dst);
+      } else if (mig.is_pi(node)) {
+        RowOperand in = RowOperand::input(static_cast<int>(mig.pi_index(node)));
+        if (!inverted) {
+          copy(in, dst);
+        } else {
+          copy(in, RowOperand::control(ControlRow::DCC0));
+          copy(RowOperand::control(ControlRow::DCC0N), dst);
+        }
+      } else {
+        ok = false;
+      }
+      out.outputBindings.push_back(dst);
+    });
+    // Nothing proved it but the substrate check, which the caller runs.
+    out.validated = false;
+    return ok;
+  }
+
   program_holder prog;
   compiler_settings settings{};
   settings.rewriting = rewriting_strategy::none;
@@ -1164,6 +1230,7 @@ llvm::StringRef mlir::bits::getRowOpName(RowOpKind kind) {
   case RowOpKind::RangeScan10: return "row_scan_10";
   case RowOpKind::RangeScan11: return "row_scan_11";
   case RowOpKind::ScanFold: return "row_scan_fold";
+  case RowOpKind::ApproxAdd: return "row_add_approx";
   case RowOpKind::NUM_KINDS: break;
   }
   llvm_unreachable("unhandled row-op kind");
@@ -1418,6 +1485,22 @@ RowOpRecipe::totalCommands(PudBackend backend) const {
     total += static_cast<int64_t>(cost->total()) * step.count;
   }
   return total;
+}
+
+std::optional<RowOpRecipe>
+mlir::bits::getRecipeForApproxAdd(int64_t width, int64_t lowBits) {
+  if (width <= 0 || lowBits < 0)
+    return std::nullopt;
+  lowBits = std::min(lowBits, width);
+  RowOpRecipe recipe;
+  if (lowBits > 0)
+    recipe.steps.push_back({RowOpKind::ApproxAdd, lowBits});
+  if (width > lowBits) {
+    recipe.steps.push_back({RowOpKind::FullAdd, width - lowBits});
+    // the exact part's carry is seeded to zero, as a whole addition's is
+    recipe.fixedAAP = 1;
+  }
+  return recipe;
 }
 
 std::optional<RowOpRecipe> mlir::bits::getRecipeForAdd(int64_t width,

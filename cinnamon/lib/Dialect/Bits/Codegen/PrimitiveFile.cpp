@@ -61,6 +61,17 @@ llvm::cl::opt<std::string> clPrimitives(
         "`pud.commands = N` requires N commands. See PrimitiveFile.cpp."),
     llvm::cl::value_desc("file"), llvm::cl::init(""));
 
+llvm::cl::opt<unsigned> clApproxAddLowBits(
+    "pud-approx-add-low-bits",
+    llvm::cl::desc(
+        "Compute the lowest N bits of every plain addition with the "
+        "approximate cell (the row_add_approx primitive: a | b unless "
+        "--pud-primitives redefines it) instead of the full adder. No carry "
+        "ripples through them; the exact part above starts with carry 0. "
+        "Reductions and multiplications stay exact. Pass it to every cinm-opt "
+        "run of a kernel: the mapping prices it and the expansion emits it."),
+    llvm::cl::value_desc("N"), llvm::cl::init(0));
+
 [[noreturn]] void fail(const llvm::Twine &msg) {
   llvm::report_fatal_error(llvm::Twine("--pud-primitives=") + clPrimitives +
                            ": " + msg);
@@ -177,3 +188,5 @@ llvm::StringRef mlir::bits::primitiveFilePath() { return clPrimitives; }
 void mlir::bits::setPrimitiveFilePath(llvm::StringRef path) {
   clPrimitives = path.str();
 }
+
+unsigned mlir::bits::getApproxAddLowBits() { return clApproxAddLowBits; }

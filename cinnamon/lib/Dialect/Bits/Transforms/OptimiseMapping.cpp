@@ -383,6 +383,14 @@ static int64_t getComputeLatency(Operation *op) {
     // With wide-add on, this op is emitted as the widening add and must be
     // priced as one: the carry-out store is one extra row-op.
     int64_t width = getSliceBitwidth(add.getResult());
+    // An approximate addition is priced as the expansion emits it: the low
+    // bits by the approximate cell, the rest by the carry chain. A reduction's
+    // folds stay exact, so they keep the exact price.
+    if (bits::getApproxAddLowBits() > 0 && !kWideAdd &&
+        !op->hasAttr("bits.is_reduce_op"))
+      if (auto c = limeRecipeCost(bits::getRecipeForApproxAdd(
+              width, bits::getApproxAddLowBits())))
+        return *c;
     if (auto c = limeRecipeCost(bits::getRecipeForAdd(width, kWideAdd)))
       return *c;
     int64_t perBit = prada ? 6 : 8;

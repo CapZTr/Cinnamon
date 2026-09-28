@@ -1,3 +1,4 @@
+#include "cinm-mlir/Dialect/Bits/Codegen/RowOpLibrary.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsOps.h"
 #include "cinm-mlir/Dialect/Bits/IR/BitsTypes.h"
 #include "cinm-mlir/Dialect/Bits/Transforms/Passes.h"
@@ -99,10 +100,10 @@ static ExtOperand peelExtensions(Value v) {
 /// An operand with nothing extended contributes no cut, so an expansion whose
 /// operands are all stored gets exactly the one loop it always got.
 static SmallVector<int64_t> segmentBounds(ArrayRef<ExtOperand> operands,
-                                          int64_t width) {
-  SmallVector<int64_t> bounds{0, width};
+                                          int64_t width, int64_t start = 0) {
+  SmallVector<int64_t> bounds{start, width};
   for (const ExtOperand &operand : operands)
-    if (operand.realRows > 0 && operand.realRows < width)
+    if (operand.realRows > start && operand.realRows < width)
       bounds.push_back(operand.realRows);
   llvm::sort(bounds);
   bounds.erase(llvm::unique(bounds), bounds.end());
@@ -140,13 +141,16 @@ static Value rowAt(OpBuilder &builder, Location loc, Type rowType,
 /// to the next is already in the cell the next one reads it from, so only the
 /// first piece pays a seed, exactly as an uncut loop does.
 ///
+/// The chain covers bits [start, width); an approximate addition starts it
+/// above the bits its approximate cell has already written.
+///
 /// Returns the result slice and the carry that fell out of the top.
 template <typename EmitStep>
 static std::pair<Value, Value>
 buildCarryChain(PatternRewriter &rewriter, Location loc, Operation *from,
                 SliceType resType, Value lhsSlice, Value rhsSlice,
                 int64_t width, Value initSlice, Value initCarry,
-                EmitStep emitStep) {
+                EmitStep emitStep, int64_t start = 0) {
   auto rowType =
       BitRowType::get(rewriter.getContext(), resType.getVectorLength());
   Value vecLenVal = rewriter.create<arith::ConstantIntOp>(
@@ -154,7 +158,7 @@ buildCarryChain(PatternRewriter &rewriter, Location loc, Operation *from,
 
   ExtOperand lhs = peelExtensions(lhsSlice);
   ExtOperand rhs = peelExtensions(rhsSlice);
-  SmallVector<int64_t> bounds = segmentBounds({lhs, rhs}, width);
+  SmallVector<int64_t> bounds = segmentBounds({lhs, rhs}, width, start);
 
   Value lhsPad, rhsPad;
   if (lhs.realRows < width)
@@ -164,6 +168,8 @@ buildCarryChain(PatternRewriter &rewriter, Location loc, Operation *from,
 
   Value c1Index = rewriter.create<arith::ConstantIndexOp>(loc, 1);
   Value slice = initSlice, carry = initCarry;
+  if (start >= width)
+    return {slice, carry};
   for (size_t s = 0; s + 1 < bounds.size(); ++s) {
     const int64_t lo = bounds[s];
     Value lbIndex = rewriter.create<arith::ConstantIndexOp>(loc, lo);
@@ -193,6 +199,54 @@ buildCarryChain(PatternRewriter &rewriter, Location loc, Operation *from,
 }
 
 //===----------------------------------------------------------------------===//
+
+/// The low bits of an approximate addition: bits [0, lowBits), each the
+/// approximate cell of the two operand rows and nothing else -- no carry is
+/// read or produced, which is the whole saving.
+static Value buildApproxLowBits(PatternRewriter &rewriter, Location loc,
+                                Operation *from, SliceType resType,
+                                Value lhsSlice, Value rhsSlice,
+                                int64_t lowBits, Value initSlice) {
+  auto rowType =
+      BitRowType::get(rewriter.getContext(), resType.getVectorLength());
+  Value vecLenVal = rewriter.create<arith::ConstantIntOp>(
+      loc, resType.getVectorLength(), 64);
+  ExtOperand lhs = peelExtensions(lhsSlice);
+  ExtOperand rhs = peelExtensions(rhsSlice);
+  SmallVector<int64_t> bounds = segmentBounds({lhs, rhs}, lowBits);
+  Value lhsPad, rhsPad;
+  if (lhs.realRows < lowBits)
+    lhsPad = padRow(rewriter, loc, rowType, lhs, vecLenVal);
+  if (rhs.realRows < lowBits)
+    rhsPad = padRow(rewriter, loc, rowType, rhs, vecLenVal);
+
+  Value c1Index = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+  Value slice = initSlice;
+  for (size_t s = 0; s + 1 < bounds.size(); ++s) {
+    const int64_t lo = bounds[s];
+    auto loop = rewriter.create<scf::ForOp>(
+        loc, rewriter.create<arith::ConstantIndexOp>(loc, lo),
+        rewriter.create<arith::ConstantIndexOp>(loc, bounds[s + 1]), c1Index,
+        ValueRange{slice},
+        [&](OpBuilder &builder, Location bodyLoc, Value iv,
+            ValueRange iterArgs) {
+          Value ivI64 = builder.create<arith::IndexCastOp>(
+              bodyLoc, builder.getI64Type(), iv);
+          Value lhsRow =
+              rowAt(builder, bodyLoc, rowType, lhs, ivI64, lo, lhsPad);
+          Value rhsRow =
+              rowAt(builder, bodyLoc, rowType, rhs, ivI64, lo, rhsPad);
+          Value cell =
+              builder.create<RowAddApproxOp>(bodyLoc, rowType, lhsRow, rhsRow);
+          Value updated = builder.create<InsertRowOp>(bodyLoc, resType,
+                                                      iterArgs[0], cell, ivI64);
+          builder.create<scf::YieldOp>(bodyLoc, updated);
+        });
+    carryReduceMark(from, loop.getOperation());
+    slice = loop.getResult(0);
+  }
+  return slice;
+}
 
 template <typename SliceOp, typename RowOp>
 struct RowWiseLogicPattern : public OpRewritePattern<SliceOp> {
@@ -277,6 +331,17 @@ struct AddIPattern : public OpRewritePattern<AddIOp> {
     Value resSlice =
         rewriter.create<CreateSliceOp>(loc, sliceType, bitwidthVal, vecLenVal);
 
+    // With --pud-approx-add-low-bits, the low bits are the approximate cell
+    // and the carry chain starts above them, at zero. Only a plain addition: a
+    // reduction's folds and a multiplier's accumulations stay exact, as the
+    // mapping prices them.
+    int64_t lowBits = 0;
+    if (!op->hasAttr(kReduceAttrName))
+      lowBits = std::min<int64_t>(getApproxAddLowBits(), bitwidth);
+    if (lowBits > 0)
+      resSlice = buildApproxLowBits(rewriter, loc, op, sliceType, lhsSlice,
+                                    rhsSlice, lowBits, resSlice);
+
     auto [sum, carry] = buildCarryChain(
         rewriter, loc, op, sliceType, lhsSlice, rhsSlice, bitwidth, resSlice,
         carryRow,
@@ -290,7 +355,8 @@ struct AddIPattern : public OpRewritePattern<AddIOp> {
           // whole difference between 8 commands a bit and 9.
           rowAdd->setAttr(kCarryAttrName, builder.getStringAttr(kCarryResident));
           return std::make_pair(rowAdd.getSum(), rowAdd.getCout());
-        });
+        },
+        lowBits);
     (void)carry; // a truncating add drops what fell off the top
 
     rewriter.replaceOp(op, sum);

@@ -506,6 +506,7 @@ private:
 /// Whether an op computes on rows, i.e. becomes a template instantiation.
 bool isRowOp(Operation *op) {
   return isa<RowAddOp, RowSubOp, RowAndOp, RowOrOp, RowXOrOp, RowXNorOp,
+             RowAddApproxOp,
              RowScanStepOp, RowScanFoldOp, RowGreaterStepOp, RowSelectOp,
              MajOp, NotOp>(op);
 }
@@ -1631,6 +1632,8 @@ FailureOr<TemplateUse> describeRowOp(Operation *op, const RowBinder &binder) {
     use.kind = RowOpKind::And;
   else if (isa<RowOrOp>(op))
     use.kind = RowOpKind::Or;
+  else if (isa<RowAddApproxOp>(op))
+    use.kind = RowOpKind::ApproxAdd;
   else if (isa<RowXOrOp>(op))
     use.kind = RowOpKind::Xor;
   else if (isa<RowXNorOp>(op))

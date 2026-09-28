@@ -242,11 +242,20 @@ enum class RowOpKind {
   /// general three-input majority does not know and would pay a command to
   /// restate.
   ScanFold,
+  /// One low bit of an approximate addition: out = f(a, b), no carry in or
+  /// out. The function is the network's -- a | b built in, or whatever
+  /// --pud-primitives defines -- so the network is also what it is checked
+  /// against.
+  ApproxAdd,
 
   NUM_KINDS,
 };
 
 llvm::StringRef getRowOpName(RowOpKind kind);
+
+/// How many low bits of every plain addition the approximate cell computes
+/// (--pud-approx-add-low-bits); 0 when additions are exact.
+unsigned getApproxAddLowBits();
 
 /// The range-scan step for a given (lower[j], upper[j]) bit pair.
 RowOpKind getRangeScanKind(bool lowerBit, bool upperBit);
@@ -335,6 +344,11 @@ struct RowOpRecipe {
 /// Returns nullopt for ops with no row-level expansion, which the caller prices
 /// with its fallback.
 std::optional<RowOpRecipe> getRecipeForAdd(int64_t width, bool widening);
+/// A plain addition whose `lowBits` lowest bits are computed by the
+/// approximate cell and the rest by the full adder, the carry starting at zero
+/// where the exact part starts.
+std::optional<RowOpRecipe> getRecipeForApproxAdd(int64_t width,
+                                                 int64_t lowBits);
 std::optional<RowOpRecipe> getRecipeForSub(int64_t width);
 std::optional<RowOpRecipe> getRecipeForMul(int64_t lhsWidth, int64_t rhsWidth);
 std::optional<RowOpRecipe> getRecipeForAnd(int64_t width, bool maskedZero);
