@@ -111,17 +111,48 @@ def artifact(name: str) -> Path:
     return ARTIFACTS / name
 
 
-def show(path: Path, lines: int = 40, grep: str | None = None) -> None:
-    """Prints the start of a file, or only the lines matching `grep`."""
-    text = Path(path).read_text().splitlines()
-    if grep:
-        text = [l for l in text if re.search(grep, l)]
-    print(f"--- {Path(path).relative_to(ROOT)} "
-          f"({len(Path(path).read_text().splitlines())} lines) ---")
-    for l in text[:lines]:
-        print(l)
-    if len(text) > lines:
-        print(f"... {len(text) - lines} more")
+def _notebook() -> bool:
+    try:
+        from IPython import get_ipython
+        return get_ipython() is not None and "IPKernelApp" in get_ipython().config
+    except ImportError:
+        return False
+
+
+def show_code(text: str, language: str = "llvm") -> None:
+    """Shows code highlighted in a notebook, and as plain text elsewhere.
+
+    MLIR is highlighted as LLVM IR: Pygments has no MLIR lexer, and LLVM's
+    covers what MLIR shares with it -- %values, types, comments, constants.
+    """
+    if _notebook():
+        from IPython.display import Code, display
+        display(Code(text, language=language))
+    else:
+        print(text)
+
+
+def show(path: Path, lines: int = 40, grep: str | None = None,
+         language: str = "llvm") -> None:
+    """An excerpt of a file the compiler wrote, and a link to all of it.
+
+    The excerpt is the first `lines` lines, or with `grep` the first `lines`
+    lines matching it -- the ones a step is about. The link opens the whole
+    file in JupyterLab.
+    """
+    path = Path(path)
+    all_lines = path.read_text().splitlines()
+    picked = [l for l in all_lines if re.search(grep, l)] if grep else all_lines
+    excerpt = "\n".join(picked[:lines])
+    what = (f"{min(lines, len(picked))} of {len(picked)} lines matching `{grep}`"
+            if grep else f"first {min(lines, len(all_lines))} lines")
+    if _notebook():
+        from IPython.display import Markdown, display
+        link = os.path.relpath(path, Path.cwd())
+        display(Markdown(f"[`{path.name}`]({link}) — {len(all_lines)} lines; {what}"))
+    else:
+        print(f"--- {path.relative_to(ROOT)} ({len(all_lines)} lines; {what}) ---")
+    show_code(excerpt, language)
 
 
 # --------------------------------------------------------------------------
@@ -201,7 +232,16 @@ def map_banks(bits: Path, tag: str, banks: int, mem: str = "ddr",
     opts = f"num-banks={banks} mem-type={mem} emit-trace={'true' if trace else 'false'}"
     if trace_path:
         opts += f" trace-path={trace_path}"
-    r = run([cinm_opt(), *flags, bits, f"--bits-opt-mapping={opts}", "-o", out])
+    # An academic WLS licence allows a couple of sessions at once, and a
+    # session counts for a while after the process that opened it has ended,
+    # so compiling many configurations back to back can find them all taken.
+    # That clears by itself; wait for it rather than fail.
+    for attempt in range(8):
+        r = run([cinm_opt(), *flags, bits, f"--bits-opt-mapping={opts}", "-o", out])
+        if "Too many sessions" not in r.stdout + r.stderr:
+            break
+        print(f"(Gurobi: all licence sessions in use; retrying in 30 s)")
+        time.sleep(30)
     _check_gurobi(r.stderr, r.stdout)
     log = r.stdout + r.stderr
     obj = re.search(r"Best objective ([-+0-9.e]+)", log)
@@ -538,3 +578,75 @@ def approx_add(a, b, width: int, low_bits: int, cell):
     high = ((a >> low_bits) + (b >> low_bits)) << low_bits
     low = cell(a & low_mask, b & low_mask, mask=low_mask) & low_mask
     return (high | low) & ((1 << width) - 1)
+
+
+# --------------------------------------------------------------------------
+# lime on its own: circuits written with mockturtle, compiled from the shell
+# --------------------------------------------------------------------------
+
+def lime_export() -> str:
+    """lime's command-line compiler, lime_program_export."""
+    return _tool("LIME_EXPORT",
+                 ROOT / "cinnamon" / "build" / "extern" / "lime" / "lime_program_export",
+                 "lime_program_export")
+
+
+MOCKTURTLE = ROOT / "cinnamon" / "extern" / "lime" / "eggmock" / "mockturtle"
+
+
+def compile_mockturtle(src: Path, exe: Path) -> Result:
+    """Compiles a C++ program that uses mockturtle's headers.
+
+    mockturtle is header-only for what a small circuit needs -- networks,
+    generators, the Verilog and dot writers -- so this is one compiler call
+    with its include paths and nothing to link.
+    """
+    includes = [MOCKTURTLE / "include"] + [MOCKTURTLE / "lib" / d for d in
+                ("kitty", "lorina", "fmt", "parallel_hashmap", "rang")]
+    return run(["clang++", "-std=c++20", "-O1", "-DFMT_HEADER_ONLY",
+                *[f"-I{i}" for i in includes], src, "-o", exe])
+
+
+@dataclass
+class LimeProgram:
+    """What lime_program_export printed for one compilation."""
+    args: list[str]
+    program: str
+    instructions: int
+    cells: int
+    cost: float
+    validated: bool
+    seconds: float
+
+
+def lime(circuit: str | Path, arch: str = "simdram", mode: str = "exhaustive",
+         candidates: str = "all", rewriting: str = "none", size_factor: int = 0,
+         convention: str | None = None) -> LimeProgram:
+    """Compiles a circuit with lime_program_export.
+
+    `circuit` is a file (.verilog, .aig or .pla) or one of lime's built-in
+    circuits (fa, fs, mux, gt, eq, relu, abs, minmax, csa42, ...). The other
+    arguments are the tool's, in its order.
+    """
+    args = [str(circuit), arch, mode, candidates, rewriting, str(size_factor)]
+    if convention:
+        args.append(convention)
+    r = run([lime_export(), *args])
+    keep = [l for l in r.stdout.splitlines()
+            if re.match(r"(cell_types|input_cells|output_cells|instr \d+):", l)]
+    m = re.search(r"SUMMARY\tnum_instr=(\d+)\tnum_cells=(\d+)\tcost=([\d.]+)"
+                  r"\tvalidated=(\d)", r.stdout)
+    if not m:
+        raise RuntimeError(f"lime printed no summary:\n{r.stdout[-2000:]}")
+    return LimeProgram(args, "\n".join(keep), int(m.group(1)), int(m.group(2)),
+                       float(m.group(3)), m.group(4) == "1", r.seconds)
+
+
+def draw(dot: Path) -> None:
+    """Draws a Graphviz file in the notebook (and says where it is otherwise)."""
+    svg = run(["dot", "-Tsvg", dot]).stdout
+    if _notebook():
+        from IPython.display import SVG, display
+        display(SVG(svg))
+    else:
+        print(f"[{Path(dot).name}: {len(svg)} bytes of SVG]")
