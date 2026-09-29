@@ -86,6 +86,11 @@ COPY --from=gem5 /usr /opt/trusty/usr
 COPY --from=gem5 --chown=${NB_UID} /export/MIMDRAM ${HOME}/third-party/MIMDRAM
 COPY docker/tutorial/pud-gcc docker/tutorial/gem5-pud /usr/local/bin/
 
+# Graphviz draws the circuits of the lime notebook. Here rather than with the
+# other packages, so that adding it did not rebuild LLVM.
+RUN apt-get update && apt-get install -y --no-install-recommends graphviz \
+ && rm -rf /var/lib/apt/lists/*
+
 # The compiler's sources first and the rest of the repository after it, so that
 # editing a notebook does not rebuild cinm-opt.
 COPY --chown=${NB_UID} cinnamon ${HOME}/cinnamon
@@ -93,7 +98,9 @@ USER ${NB_USER}
 WORKDIR ${HOME}
 
 # cinm-opt. Rust (for the lime and eggmock crates) is installed, used and
-# removed in this one step, and only the binaries are kept of the build tree.
+# removed in this one step. Of the build tree only the binaries are kept, and
+# lime's shared library and its command-line compiler, lime_program_export,
+# where their RUNPATH looks for the library.
 RUN export RUSTUP_HOME=/tmp/rustup CARGO_HOME=/tmp/cargo \
  && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path \
  && export PATH=/tmp/cargo/bin:$PATH \
@@ -102,8 +109,12 @@ RUN export RUSTUP_HOME=/tmp/rustup CARGO_HOME=/tmp/cargo \
       -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLLVM_USE_LINKER=lld \
       -DLLVM_DIR=/opt/llvm/lib/cmake/llvm -DMLIR_DIR=/opt/llvm/lib/cmake/mlir \
       -DCINM_BUILD_GPU_SUPPORT=OFF -DUPMEM_DIR=OFF -DTORCH_MLIR_DIR=OFF \
- && ninja -C cinnamon/build -j "${JOBS}" cinm-opt rowop-sanity \
+ && ninja -C cinnamon/build -j "${JOBS}" cinm-opt rowop-sanity lime_program_export \
+ && mkdir /tmp/lime \
+ && mv cinnamon/build/extern/lime/liblime_rs.so cinnamon/build/extern/lime/lime_program_export /tmp/lime/ \
  && find cinnamon/build -mindepth 1 -maxdepth 1 ! -name bin -exec rm -rf {} + \
+ && mkdir -p cinnamon/build/extern/lime \
+ && mv /tmp/lime/* cinnamon/build/extern/lime/ && rmdir /tmp/lime \
  && rm -rf /tmp/rustup /tmp/cargo
 
 # Jupyter (required by Binder) and what the notebooks plot with.
@@ -118,5 +129,5 @@ COPY --chown=${NB_UID} . ${HOME}
 ENV CINM_ROOT=${HOME} \
     MIMDRAM_ROOT=${HOME}/third-party/MIMDRAM \
     VIRTUAL_ENV=${HOME}/.venv \
-    PATH=${HOME}/.venv/bin:${HOME}/cinnamon/build/bin:/opt/llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PATH=${HOME}/.venv/bin:${HOME}/cinnamon/build/bin:${HOME}/cinnamon/build/extern/lime:/opt/llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     LD_LIBRARY_PATH=/opt/llvm/lib:/opt/gurobi1300/linux64/lib
